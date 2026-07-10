@@ -28,7 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-10-sso-import-4"
+ADAPTER_BUILD = "2026-07-10-sso-import-5"
 
 YESCAPTCHA_KEY = (
     os.environ.get("GROK2API_YESCAPTCHA_KEY")
@@ -510,6 +510,39 @@ def _run_registration(
             except Exception as recover_err:  # noqa: BLE001
                 print(f"[grok-build-auth] SSO recover failed: {recover_err}")
 
+        # Current xAI create_account often returns only RSC chunks + CF cookies,
+        # with no set-cookie JWT chain. Fall back to password CreateSession and
+        # treat the returned session JWT as the sso cookie for sso_to_auth_json.
+        if not sso:
+            update(
+                "fetching_sso",
+                f"RSC has no sso chain; CreateSession password fallback [{ADAPTER_BUILD}]",
+            )
+            try:
+                # Fresh turnstile for sign-in page improves CreateSession success.
+                signin_url = "https://accounts.x.ai/sign-in?redirect=grok-com"
+                try:
+                    signin_turnstile = solver.solve_turnstile(
+                        website_url=signin_url,
+                        website_key=sitekey,
+                        premium=True,
+                        fallback_non_premium=True,
+                    )
+                except Exception:
+                    signin_turnstile = turnstile
+                sso = client.obtain_session_via_password(
+                    email=email,
+                    password=password,
+                    turnstile_token=signin_turnstile,
+                    referer=signin_url,
+                )
+                print(
+                    f"[grok-build-auth] CreateSession fallback sso="
+                    f"{(sso[:60] if sso else None)}"
+                )
+            except Exception as cs_err:  # noqa: BLE001
+                print(f"[grok-build-auth] CreateSession fallback failed: {cs_err}")
+
         print(f"[grok-build-auth] fetch_sso_token result: {sso[:60] if sso else None}")
         sess["sso"] = sso
         session_cookies = extract_cookies_from_auth_client(client)
@@ -529,11 +562,11 @@ def _run_registration(
                 f"set_cookies={len(sc)}; "
                 f"cookie_keys={sorted((session_cookies or {}).keys())}; "
                 f"body_preview={rsc_preview!r}. "
-                "Account step likely succeeded, but sso cookie chain failed. "
-                "Need access to auth.x.ai / auth.grokusercontent.com / grok.com."
+                "Account step likely succeeded, but neither RSC set-cookie chain "
+                "nor CreateSession password fallback produced an sso cookie."
             )
 
-        # Required path: SSO cookie -> sso_to_auth_json device flow -> auth.json
+        # Required path: SSO/session JWT -> sso_to_auth_json device flow -> auth.json
         update(
             "importing",
             f"SSO obtained; converting via sso_to_auth_json [{ADAPTER_BUILD}]",

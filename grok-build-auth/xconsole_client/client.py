@@ -867,5 +867,117 @@ class XConsoleAuthClient:
             save_sso(token, email=email, password=password, output_dir=output_dir)
         return token
 
+    def obtain_session_via_password(
+        self,
+        *,
+        email: str,
+        password: str,
+        turnstile_token: str,
+        referer: str | None = None,
+    ) -> Optional[str]:
+        """Fallback when create_account returns no SSO cookie chain.
+
+        Current xAI deployments often return a pure RSC flight body without an
+        inline set-cookie JWT. In that case we can still log in with the just
+        created email/password via AuthManagement/CreateSession and treat the
+        returned session JWT as the ``sso`` cookie value for sso_to_auth_json.
+        """
+        from .oauth_protocol import (
+            CREATE_SESSION_RPC,
+            encode_create_session_request,
+            _grpc_headers,
+            _parse_grpc_error,
+        )
+
+        email_n = (email or "").strip().lower()
+        password_n = password or ""
+        if not email_n or not password_n or not turnstile_token:
+            return None
+
+        ref = (referer or C.SIGNIN_URL or (C.ACCOUNTS_ORIGIN + "/sign-in")).strip()
+        # Warm sign-in page so CF cookies settle.
+        try:
+            self._request(
+                "GET",
+                ref,
+                headers={
+                    **self._base_headers(),
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "sec-fetch-site": "same-origin",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-dest": "document",
+                    "referer": C.ACCOUNTS_ORIGIN + "/",
+                },
+            )
+        except Exception:
+            pass
+
+        body = encode_create_session_request(
+            email_n,
+            password_n,
+            turnstile_token=turnstile_token,
+            castle_request_token="",
+        )
+        framed = grpcweb.frame_request(body)
+        headers = _grpc_headers(ref)
+        headers.update(self._base_headers())
+        headers["content-length"] = str(len(framed))
+        status, hdrs, set_cookies, raw = self._request(
+            "POST", CREATE_SESSION_RPC, headers=headers, body=framed
+        )
+        if self.debug:
+            print(
+                f"  [sso] CreateSession HTTP {status} "
+                f"set_cookies={len(set_cookies or [])} body_len={len(raw or b'')}"
+            )
+
+        # Prefer any sso set by response cookies first.
+        from .sso import parse_sso_from_set_cookies
+
+        token = parse_sso_from_set_cookies(set_cookies or []) or self._read_sso_from_jar()
+        if token:
+            return token
+
+        # Parse session JWT from gRPC body and treat it as sso.
+        try:
+            parsed = grpcweb.parse_response(raw or b"")
+        except Exception:
+            parsed = {"messages": [], "trailers": {}, "grpc_status": None}
+        grpc_status = parsed.get("grpc_status")
+        if grpc_status is None:
+            try:
+                grpc_status, _msg = _parse_grpc_error(hdrs or {}, raw or b"")
+            except Exception:
+                grpc_status = None
+        fields = parsed["messages"][0] if parsed.get("messages") else []
+        session_jwt = None
+        for f in fields:
+            if f.get("type") == "string":
+                val = str(f.get("value") or "")
+                if val.startswith("eyJ") and val.count(".") >= 2:
+                    session_jwt = val
+                    break
+        if self.debug:
+            print(
+                f"  [sso] CreateSession grpc_status={grpc_status} "
+                f"fields={len(fields)} jwt={'yes' if session_jwt else 'no'}"
+            )
+        if session_jwt:
+            # Seed cookie jar for subsequent hops.
+            try:
+                jar = self._t.cookies
+                for domain in (".x.ai", "accounts.x.ai", ".grok.com", "grok.com"):
+                    try:
+                        jar.set("sso", session_jwt, domain=domain)
+                    except Exception:
+                        try:
+                            jar.set("sso", session_jwt)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            return session_jwt
+        return self._read_sso_from_jar()
+
     def close(self):
         self._t.close()
