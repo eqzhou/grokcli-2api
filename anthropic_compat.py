@@ -841,6 +841,32 @@ class AnthropicStreamAssembler:
             self._thinking_index = None
         return events
 
+    @staticmethod
+    def _merge_name(current: str, incoming: str) -> str:
+        """Avoid `web_searchweb_search` when proxies re-send full names."""
+        cur = (current or "").strip()
+        name = (incoming or "").strip()
+        if not name:
+            return cur
+        if not cur:
+            return name
+        if name == cur or cur.startswith(name):
+            return cur
+        if name.startswith(cur):
+            return name
+        return name
+
+    @staticmethod
+    def _coerce_args_piece(raw: Any) -> str:
+        if raw is None:
+            return ""
+        if isinstance(raw, str):
+            return raw
+        try:
+            return json.dumps(raw, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(raw)
+
     def feed(
         self,
         *,
@@ -902,26 +928,39 @@ class AnthropicStreamAssembler:
                     }
                 state = self._tools[oi]
                 fn = raw.get("function") if isinstance(raw.get("function"), dict) else {}
-                if raw.get("id"):
+                # Keep tool id stable once set (tool_result matching depends on it)
+                if raw.get("id") and not state.get("id"):
                     state["id"] = raw["id"]
+                elif raw.get("id") and not str(state.get("id") or "").startswith("toolu_"):
+                    # already have a real id — ignore later rewrites
+                    pass
+                elif raw.get("id") and str(state.get("id") or "").startswith("toolu_"):
+                    # upgrade synthetic id to real upstream id
+                    state["id"] = raw["id"]
+
                 if (fn or {}).get("name"):
-                    state["name"] = (state.get("name") or "") + str(fn["name"])
+                    state["name"] = self._merge_name(
+                        state.get("name") or "", str(fn["name"])
+                    )
                 if raw.get("name"):
-                    state["name"] = (state.get("name") or "") + str(raw["name"])
+                    state["name"] = self._merge_name(
+                        state.get("name") or "", str(raw["name"])
+                    )
 
                 args_piece = None
                 if isinstance(fn, dict) and fn.get("arguments") is not None:
-                    args_piece = str(fn["arguments"])
+                    args_piece = self._coerce_args_piece(fn.get("arguments"))
                 elif raw.get("arguments") is not None:
-                    args_piece = str(raw["arguments"])
+                    args_piece = self._coerce_args_piece(raw.get("arguments"))
+                elif raw.get("input") is not None:
+                    args_piece = self._coerce_args_piece(raw.get("input"))
                 if args_piece:
                     state["args"] += args_piece
 
-                if (
-                    not state["started"]
-                    and state.get("name")
-                    and args_piece is not None
-                ):
+                # Start tool_use as soon as we know the name (args may arrive later).
+                # Waiting for first args_piece caused intermittent client hangs when
+                # upstream sent name-only first chunk then stalled / finished.
+                if not state["started"] and state.get("name"):
                     state["started"] = True
                     events.append(
                         anthropic_stream_block_start_tool(
@@ -970,7 +1009,7 @@ class AnthropicStreamAssembler:
                     anthropic_stream_block_start_tool(
                         state["block_index"],
                         tool_id=state["id"],
-                        name=state.get("name") or "tool",
+                        name=(state.get("name") or "tool").strip() or "tool",
                     )
                 )
                 if state.get("args"):
@@ -983,10 +1022,42 @@ class AnthropicStreamAssembler:
                             )
                         )
                         self._output_chars += len(remaining)
+                else:
+                    # Emit empty object so clients can parse tool input
+                    events.append(
+                        anthropic_stream_input_json_delta(state["block_index"], "{}")
+                    )
+                    state["args"] = "{}"
+                    state["args_sent"] = 2
+                    self._output_chars += 2
+            else:
+                # If tool started but no args streamed, ensure valid JSON object
+                if not (state.get("args") or "").strip():
+                    events.append(
+                        anthropic_stream_input_json_delta(state["block_index"], "{}")
+                    )
+                    state["args"] = "{}"
+                    state["args_sent"] = 2
+                    self._output_chars += 2
+                else:
+                    sent = int(state.get("args_sent") or 0)
+                    remaining = state["args"][sent:]
+                    if remaining:
+                        events.append(
+                            anthropic_stream_input_json_delta(
+                                state["block_index"], remaining
+                            )
+                        )
+                        self._output_chars += len(remaining)
+                        state["args_sent"] = len(state["args"])
             if state.get("started"):
                 events.append(anthropic_stream_block_stop(state["block_index"]))
+        # Upstream often finishes with stop even when tools were emitted.
+        effective_finish = finish_reason
+        if self._saw_tool and effective_finish in (None, "stop", "end_turn", ""):
+            effective_finish = "tool_calls"
         stop = map_finish_to_stop_reason(
-            finish_reason, has_tool_calls=self._saw_tool
+            effective_finish, has_tool_calls=self._saw_tool
         )
 
         # Prefer real upstream usage (OpenAI prompt/completion tokens)

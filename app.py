@@ -101,6 +101,17 @@ def _on_startup() -> None:
             print("  model health: disabled or not started")
     except Exception as e:  # noqa: BLE001
         print(f"  (model health failed: {e})")
+    # Registration engine is optional — never block API startup.
+    try:
+        import grok_build_adapter
+
+        st = grok_build_adapter.registration_available()
+        if st.get("available"):
+            print("  registration: grok-build-auth/xconsole_client ready")
+        else:
+            print(f"  registration: unavailable ({st.get('error')})")
+    except Exception as e:  # noqa: BLE001
+        print(f"  registration: unavailable ({e})")
 
 
 app = FastAPI(
@@ -643,6 +654,65 @@ def _extract_delta_text(chunk: dict[str, Any]) -> tuple[str, str]:
     return content, reasoning
 
 
+def _coerce_tool_arguments(raw: Any) -> str:
+    """Normalize tool arguments to the OpenAI streaming string form."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    try:
+        return json.dumps(raw, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(raw)
+
+
+def _merge_tool_name(current: str, incoming: str) -> str:
+    """
+    Merge function names from streamed deltas without double-append corruption.
+
+    OpenAI usually sends the full name once. Some proxies re-send the full name
+    on later chunks; always-append would produce `web_searchweb_search` and break
+    tool dispatch intermittently.
+    """
+    cur = (current or "").strip()
+    name = (incoming or "").strip()
+    if not name:
+        return cur
+    if not cur:
+        return name
+    if name == cur:
+        return cur
+    if name.startswith(cur):
+        # progressive expansion (rare) or full name after prefix
+        return name
+    if cur.startswith(name):
+        # ignore shorter re-send / fragment
+        return cur
+    # Different name on same index — prefer the newer complete token
+    return name
+
+
+def _legacy_function_call_to_tool_calls(function_call: Any) -> list[dict[str, Any]] | None:
+    """Map deprecated OpenAI `function_call` into tool_calls deltas."""
+    if not isinstance(function_call, dict):
+        return None
+    name = function_call.get("name")
+    args = function_call.get("arguments")
+    if name is None and args is None:
+        return None
+    return [
+        {
+            "index": 0,
+            "id": function_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": str(name or ""),
+                "arguments": _coerce_tool_arguments(args),
+            },
+        }
+    ]
+
+
 def _extract_delta_parts(
     chunk: dict[str, Any],
 ) -> tuple[str, str, list[Any] | None]:
@@ -658,6 +728,13 @@ def _extract_delta_parts(
         msg = c0.get("message") or {}
         if isinstance(delta.get("content"), str):
             content += delta["content"]
+        elif isinstance(delta.get("content"), list):
+            # rare content-part array
+            for part in delta["content"]:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    content += part["text"]
+                elif isinstance(part, str):
+                    content += part
         if isinstance(msg.get("content"), str) and not content:
             content += msg["content"]
         for key in ("reasoning_content", "reasoning", "thinking"):
@@ -677,7 +754,21 @@ def _extract_delta_parts(
                     continue
                 item = dict(tc)
                 item.setdefault("index", i)
+                # ensure arguments are strings for streaming clients
+                fn = item.get("function")
+                if isinstance(fn, dict) and fn.get("arguments") is not None and not isinstance(
+                    fn.get("arguments"), str
+                ):
+                    fn = dict(fn)
+                    fn["arguments"] = _coerce_tool_arguments(fn.get("arguments"))
+                    item["function"] = fn
                 tool_calls.append(item)
+        else:
+            # legacy function_call on delta or message
+            fc = delta.get("function_call")
+            if not isinstance(fc, dict):
+                fc = msg.get("function_call")
+            tool_calls = _legacy_function_call_to_tool_calls(fc)
 
     if not content:
         for key in ("content", "text", "output_text"):
@@ -708,29 +799,31 @@ def _merge_tool_call_delta(
             }
         entry = acc[idx]
         if raw.get("id"):
-            entry["id"] = raw["id"]
+            # lock id once set to keep tool_result matching stable
+            if not entry.get("id"):
+                entry["id"] = raw["id"]
         if raw.get("type"):
             entry["type"] = raw["type"]
         fn = raw.get("function")
         if isinstance(fn, dict):
             if fn.get("name"):
-                entry["function"]["name"] = (
-                    entry["function"].get("name") or ""
-                ) + str(fn["name"])
+                entry["function"]["name"] = _merge_tool_name(
+                    entry["function"].get("name") or "", str(fn["name"])
+                )
             if fn.get("arguments") is not None:
                 entry["function"]["arguments"] = (
                     entry["function"].get("arguments") or ""
-                ) + str(fn["arguments"])
+                ) + _coerce_tool_arguments(fn.get("arguments"))
         # some upstreams put name/arguments at top level
         elif raw.get("name") or raw.get("arguments") is not None:
             if raw.get("name"):
-                entry["function"]["name"] = (
-                    entry["function"].get("name") or ""
-                ) + str(raw["name"])
+                entry["function"]["name"] = _merge_tool_name(
+                    entry["function"].get("name") or "", str(raw["name"])
+                )
             if raw.get("arguments") is not None:
                 entry["function"]["arguments"] = (
                     entry["function"].get("arguments") or ""
-                ) + str(raw["arguments"])
+                ) + _coerce_tool_arguments(raw.get("arguments"))
 
 
 def _finalize_tool_calls(
@@ -748,12 +841,34 @@ def _finalize_tool_calls(
         if not entry.get("id"):
             entry["id"] = f"call_{uuid.uuid4().hex[:24]}"
         entry.setdefault("type", "function")
+        args = fn.get("arguments")
+        if args is None:
+            args = ""
+        elif not isinstance(args, str):
+            args = _coerce_tool_arguments(args)
+        # Empty / whitespace-only args → valid empty JSON object for tool runners
+        if isinstance(args, str) and not args.strip():
+            args = "{}"
         entry["function"] = {
-            "name": fn.get("name") or "",
-            "arguments": fn.get("arguments") if fn.get("arguments") is not None else "",
+            "name": (fn.get("name") or "").strip(),
+            "arguments": args,
         }
+        if not entry["function"]["name"]:
+            # nameless tool call is unusable — drop rather than break clients
+            continue
         out.append(entry)
     return out or None
+
+
+def _normalize_stream_finish_reason(
+    finish: str | None, *, saw_tool_calls: bool
+) -> str | None:
+    """Force tool_calls finish when tools were streamed (upstream often says stop)."""
+    if finish is None:
+        return "tool_calls" if saw_tool_calls else None
+    if saw_tool_calls and finish in ("stop", "end_turn", ""):
+        return "tool_calls"
+    return finish
 
 
 # ── routes ──────────────────────────────────────────────────────────────────
@@ -1031,7 +1146,9 @@ async def _stream_proxy_with_failover(
         headers = upstream_headers(creds.token, model)
         finished = False
         saw_tool_calls = False
+        held_finish: str | None = None
         stream_started = False  # True once any content has been sent to client
+        client_gone = False
         usage: dict[str, Any] | None = None
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -1094,11 +1211,18 @@ async def _stream_proxy_with_failover(
                     ctype = (resp.headers.get("content-type") or "").lower()
                     if "text/event-stream" in ctype or "stream" in ctype:
                         async for line in _aiter_sse_lines_with_keepalive(resp):
-                            if await client_disconnected():
-                                return
+                            # Soft disconnect check: keep draining so we can still
+                            # emit a terminal finish/tool_calls frame when possible.
+                            # Hard-abort only after repeated disconnect signals.
+                            try:
+                                if await client_disconnected():
+                                    client_gone = True
+                            except Exception:
+                                client_gone = True
                             if line is None:
                                 # idle keepalive for newapi / reverse proxies
-                                yield _sse_keepalive()
+                                if not client_gone:
+                                    yield _sse_keepalive()
                                 continue
                             parsed = _parse_sse_line(line)
                             if parsed is None:
@@ -1136,6 +1260,16 @@ async def _stream_proxy_with_failover(
                                 stream_started = True
                                 if finish:
                                     finished = True
+                                    held_finish = finish
+                                # Always normalize tool finish; many upstreams
+                                # emit finish_reason=stop even with tool_calls.
+                                emit_finish = _normalize_stream_finish_reason(
+                                    finish, saw_tool_calls=saw_tool_calls
+                                ) if finish else None
+                                if client_gone:
+                                    # Client already left — still accumulate so
+                                    # we can log/finish cleanly, but stop yielding.
+                                    continue
                                 yield _sse_chunk(
                                     chat_id=chat_id,
                                     model=model,
@@ -1143,7 +1277,7 @@ async def _stream_proxy_with_failover(
                                     content=content if content else None,
                                     reasoning=reasoning if reasoning else None,
                                     tool_calls=tool_calls,
-                                    finish_reason=finish,
+                                    finish_reason=emit_finish,
                                 )
                     else:
                         raw = await resp.aread()
@@ -1198,10 +1332,11 @@ async def _stream_proxy_with_failover(
                             emit_tc = tool_calls or msg_tool_calls
                             if emit_tc:
                                 saw_tool_calls = True
-                                if finish_reason in (None, "stop"):
-                                    finish_reason = "tool_calls"
                                 if isinstance(emit_tc, list):
                                     _merge_tool_call_delta(tool_acc, emit_tc)
+                            finish_reason = _normalize_stream_finish_reason(
+                                finish_reason, saw_tool_calls=saw_tool_calls
+                            ) or ("tool_calls" if saw_tool_calls else "stop")
                             if content:
                                 content_parts.append(content)
                             if reasoning:
@@ -1244,15 +1379,32 @@ async def _stream_proxy_with_failover(
                                 finish_reason=finish_reason,
                             )
                             finished = True
+                            held_finish = finish_reason
 
             final_tc = _finalize_tool_calls(tool_acc)
-            if not finished:
+            if final_tc:
+                saw_tool_calls = True
+            terminal_finish = _normalize_stream_finish_reason(
+                held_finish if finished else None,
+                saw_tool_calls=saw_tool_calls,
+            ) or ("tool_calls" if saw_tool_calls else "stop")
+            if not finished and not client_gone:
                 yield _sse_chunk(
                     chat_id=chat_id,
                     model=model,
                     created=created,
-                    finish_reason="tool_calls" if saw_tool_calls else "stop",
+                    finish_reason=terminal_finish,
                 )
+            elif finished and saw_tool_calls and held_finish in (None, "stop", "end_turn", ""):
+                # Upstream finished with stop despite tools — emit a corrective
+                # finish frame so secondary relays/tool runners don't hang.
+                if not client_gone:
+                    yield _sse_chunk(
+                        chat_id=chat_id,
+                        model=model,
+                        created=created,
+                        finish_reason="tool_calls",
+                    )
             # OpenAI-compatible final usage chunk (empty choices) for sub2api/newapi
             norm_usage = _usage_from_body_and_output(
                 body,
@@ -1261,14 +1413,15 @@ async def _stream_proxy_with_failover(
                 tool_calls=final_tc,
                 usage=usage,
             )
-            yield _sse_chunk(
-                chat_id=chat_id,
-                model=model,
-                created=created,
-                usage=norm_usage,
-                include_choices=False,
-            )
-            yield "data: [DONE]\n\n"
+            if not client_gone:
+                yield _sse_chunk(
+                    chat_id=chat_id,
+                    model=model,
+                    created=created,
+                    usage=norm_usage,
+                    include_choices=False,
+                )
+                yield "data: [DONE]\n\n"
             return
         except asyncio.CancelledError:
             return
@@ -1685,12 +1838,17 @@ async def _stream_anthropic_with_failover(
                     stream_started = True
 
                     ctype = (resp.headers.get("content-type") or "").lower()
+                    client_gone = False
                     if "text/event-stream" in ctype or "stream" in ctype:
                         async for line in _aiter_sse_lines_with_keepalive(resp):
-                            if await client_disconnected():
-                                return
+                            try:
+                                if await client_disconnected():
+                                    client_gone = True
+                            except Exception:
+                                client_gone = True
                             if line is None:
-                                yield anth.anthropic_stream_ping()
+                                if not client_gone:
+                                    yield anth.anthropic_stream_ping()
                                 continue
                             parsed = _parse_sse_line(line)
                             if parsed is None:
@@ -1723,7 +1881,8 @@ async def _stream_anthropic_with_failover(
                                     reasoning=reasoning or None,
                                     tool_calls=tool_calls,
                                 ):
-                                    yield ev
+                                    if not client_gone:
+                                        yield ev
                             if finish:
                                 # Capture finish but keep reading — usage often
                                 # arrives on a subsequent empty-choices chunk.
@@ -1733,10 +1892,18 @@ async def _stream_anthropic_with_failover(
                         fr = held_finish or (
                             "tool_calls" if assembler._saw_tool else "stop"
                         )
+                        if assembler._saw_tool and fr in (
+                            None,
+                            "stop",
+                            "end_turn",
+                            "",
+                        ):
+                            fr = "tool_calls"
                         for ev in assembler.finish(
                             fr, usage=usage, input_tokens=prompt_est
                         ):
-                            yield ev
+                            if not client_gone:
+                                yield ev
                         return
                     else:
                         raw = await resp.aread()
@@ -1770,6 +1937,13 @@ async def _stream_anthropic_with_failover(
                                     msg.get("tool_calls"), list
                                 ):
                                     tool_calls = msg["tool_calls"]
+                                # legacy function_call
+                                if not tool_calls and isinstance(
+                                    msg.get("function_call"), dict
+                                ):
+                                    tool_calls = _legacy_function_call_to_tool_calls(
+                                        msg.get("function_call")
+                                    )
                                 finish_reason = (
                                     ch0.get("finish_reason") or finish_reason
                                 )
@@ -1780,6 +1954,13 @@ async def _stream_anthropic_with_failover(
                                     tool_calls=tool_calls,
                                 ):
                                     yield ev
+                            if tool_calls and finish_reason in (
+                                None,
+                                "stop",
+                                "end_turn",
+                                "",
+                            ):
+                                finish_reason = "tool_calls"
                             for ev in assembler.finish(
                                 finish_reason,
                                 usage=usage,

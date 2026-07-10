@@ -15,13 +15,22 @@ import account_pool
 import accounts
 import apikeys
 import conversation_affinity
-import grok_build_adapter
 import model_health
 import quota
 import token_maintainer
 from auth import AuthError, load_credentials
 import config as _config
 import sso_to_auth_json as sso_import
+
+# Optional: registration adapter (needs grok-build-auth submodule + deps).
+# Never hard-fail process import if submodule is missing.
+try:
+    import grok_build_adapter
+except Exception as _gba_import_err:  # noqa: BLE001
+    grok_build_adapter = None  # type: ignore[assignment]
+    _GBA_IMPORT_ERROR = str(_gba_import_err)
+else:
+    _GBA_IMPORT_ERROR = None
 from config import (
     CLI_VERSION,
     DEFAULT_MODEL,
@@ -547,6 +556,30 @@ async def import_sso(
     }
 
 
+def _require_grok_build_adapter():
+    if grok_build_adapter is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "注册机模块不可用: "
+                f"{_GBA_IMPORT_ERROR or 'grok_build_adapter import failed'}. "
+                "请执行: git submodule update --init --recursive && "
+                "pip install -r requirements.txt"
+            ),
+        )
+    # Validate xconsole_client lazily so main API can still start.
+    probe = getattr(grok_build_adapter, "registration_available", None)
+    if callable(probe):
+        st = probe()
+        if not st.get("available"):
+            raise HTTPException(
+                status_code=503,
+                detail=st.get("error")
+                or "grok-build-auth/xconsole_client 不可用，请初始化子模块并安装依赖",
+            )
+    return grok_build_adapter
+
+
 @router.post("/accounts/register-email")
 async def start_email_registration(
     body: EmailRegistrationBody,
@@ -555,8 +588,9 @@ async def start_email_registration(
 ):
     """Start grok-build-auth powered x.ai registration + Build OAuth import."""
     require_admin(request, x_admin_token)
+    gba = _require_grok_build_adapter()
     try:
-        result = grok_build_adapter.start_registration(
+        result = gba.start_registration(
             yescaptcha_key=body.yescaptcha_key,
             proxy=body.proxy,
             moemail_api_key=body.api_key,
@@ -597,6 +631,8 @@ async def list_email_registration_sessions(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
+    if grok_build_adapter is None:
+        return {"sessions": [], "error": _GBA_IMPORT_ERROR}
     return grok_build_adapter.list_registration_sessions()
 
 
@@ -608,7 +644,8 @@ async def get_email_registration_session(
     include_auth_json: int = 0,
 ):
     require_admin(request, x_admin_token)
-    result = grok_build_adapter.get_registration_session(
+    gba = _require_grok_build_adapter()
+    result = gba.get_registration_session(
         session_id,
         include_auth_json=bool(include_auth_json),
     )
