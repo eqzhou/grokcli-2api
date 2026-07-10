@@ -3,11 +3,12 @@
 Flow:
   1) MoeMail creates temporary email
   2) DrissionPage browser automates x.ai signup and extracts sso cookie
-  3) sso_to_auth_json converts sso -> access/refresh tokens
-  4) accounts.import_auth_payload writes into project auth.json
+  3) sso_to_auth_json builds auth.json entry (access/refresh)
+  4) accounts.import_auth_payload imports that JSON into the local pool immediately
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -19,7 +20,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 VENDOR_DIR = ROOT / "vendors" / "grok-register"
-ADAPTER_BUILD = "2026-07-10-grok-register-1"
+ADAPTER_BUILD = "2026-07-10-grok-register-2"
 
 _sessions: dict[str, dict[str, Any]] = {}
 _lock = threading.RLock()
@@ -266,45 +267,90 @@ def _run_one(
             password=password or None,
             sso=(sso[:24] + "...") if sso else None,
             status="importing",
-            message="SSO obtained; converting via sso_to_auth_json",
+            message="SSO obtained; converting to auth.json and importing",
         )
         if not sso:
             raise RuntimeError("browser registration finished without sso cookie")
 
+        # Persist raw sso immediately for debugging / re-import.
+        try:
+            out_file.write_text(sso + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
         import accounts
         import sso_to_auth_json as sso_import
 
+        # SSO cookie -> token JSON (device flow) -> auth entry JSON -> import
         token = sso_import.sso_to_token(sso)
-        if not token or not token.get("access_token"):
+        if not token or not (token.get("access_token") or token.get("key")):
             raise RuntimeError(
-                "SSO obtained but sso_to_auth_json conversion failed "
+                "SSO obtained but conversion to token JSON failed "
                 "(device verify/approve/token poll)"
             )
-        _key, entry = sso_import.token_to_auth_entry(token, email=email)
-        import_result = accounts.import_auth_payload(
-            {
-                "key": entry["key"],
-                "auth_mode": entry.get("auth_mode", "oidc"),
-                "email": entry.get("email") or email,
-                "refresh_token": entry.get("refresh_token", ""),
-                "expires_at": entry.get("expires_at"),
-                "oidc_issuer": entry.get("oidc_issuer", "https://auth.x.ai"),
-                "oidc_client_id": entry.get("oidc_client_id", ""),
-            },
-            merge=True,
-        )
+
+        auth_key, entry = sso_import.token_to_auth_entry(token, email=email)
+        if email and not entry.get("email"):
+            entry["email"] = email
+        # Keep a full auth.json-shaped object so import_auth_payload can ingest it
+        # the same way as manual "import JSON".
+        auth_json_obj = {auth_key: entry}
+        try:
+            auth_json_path = out_dir / f"{sid}.auth.json"
+            auth_json_path.write_text(
+                json.dumps(auth_json_obj, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[register_runner] write auth json file failed: {e}")
+
+        # Prefer the shared helper that already wraps import_auth_payload.
+        try:
+            imported_label = sso_import.import_into_project_auth(entry)
+            import_result = {
+                "ok": True,
+                "imported": [imported_label] if imported_label else [auth_key],
+                "auth_file": str(getattr(accounts, "AUTH_FILE", ROOT / "data" / "auth.json")),
+            }
+        except Exception:
+            # Fallback: import full auth.json object directly.
+            import_result = accounts.import_auth_payload(auth_json_obj, merge=True)
+            if not import_result.get("ok"):
+                # Last fallback: single-entry payload.
+                import_result = accounts.import_auth_payload(
+                    {
+                        "key": entry.get("key"),
+                        "auth_mode": entry.get("auth_mode", "oidc"),
+                        "email": entry.get("email") or email,
+                        "refresh_token": entry.get("refresh_token", ""),
+                        "expires_at": entry.get("expires_at"),
+                        "oidc_issuer": entry.get("oidc_issuer", "https://auth.x.ai"),
+                        "oidc_client_id": entry.get("oidc_client_id", ""),
+                    },
+                    merge=True,
+                )
         if not import_result.get("ok"):
             raise RuntimeError(
-                f"SSO json import failed: {import_result.get('error') or 'unknown'}"
+                f"auth.json import failed: {import_result.get('error') or 'unknown'}"
             )
 
+        imported = import_result.get("imported") or []
         _update(
             sid,
             status="imported",
-            auth_json=import_result,
+            auth_json={
+                "ok": True,
+                "imported": imported,
+                "entry": {
+                    "email": entry.get("email") or email,
+                    "user_id": entry.get("user_id"),
+                    "has_refresh_token": bool(entry.get("refresh_token")),
+                    "expires_at": entry.get("expires_at"),
+                },
+            },
             message=(
-                f"imported via sso_to_auth_json "
-                f"({len(import_result.get('imported') or [])} account(s)) "
+                f"imported auth.json directly "
+                f"({len(imported) if isinstance(imported, list) else 1} account) "
                 f"[{ADAPTER_BUILD}]"
             ),
             error=None,
