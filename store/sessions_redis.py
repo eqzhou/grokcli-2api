@@ -79,12 +79,31 @@ def device_list() -> list[tuple[str, dict[str, Any]]]:
 def reg_sess_put(session_id: str, sess: dict[str, Any], *, ttl: int = REG_TTL) -> None:
     if not redis_enabled():
         return
-    clean = {
-        k: v
-        for k, v in sess.items()
-        if k not in ("_client", "_oauth_client") and not callable(v)
-    }
-    set_json(_reg_sess_key(session_id), clean, ttl)
+    # Never mirror process-local handles (_receiver / clients) — they break
+    # json.dumps and leave other workers unable to observe progress.
+    clean: dict[str, Any] = {}
+    for k, v in (sess or {}).items():
+        if not isinstance(k, str):
+            continue
+        if k.startswith("_") or k in ("_client", "_oauth_client", "_receiver"):
+            continue
+        if callable(v):
+            continue
+        clean[k] = v
+    try:
+        set_json(_reg_sess_key(session_id), clean, ttl)
+    except (TypeError, ValueError):
+        # Last resort: drop any remaining non-JSON values.
+        safe = {}
+        for k, v in clean.items():
+            try:
+                import json as _json
+
+                _json.dumps(v)
+                safe[k] = v
+            except Exception:
+                continue
+        set_json(_reg_sess_key(session_id), safe, ttl)
 
 
 def reg_sess_get(session_id: str) -> dict[str, Any] | None:

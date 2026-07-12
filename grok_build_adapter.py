@@ -84,6 +84,38 @@ def _reg_redis() -> bool:
         return False
 
 
+class _RegCancelled(Exception):
+    """Cooperative cancel for in-flight registration workers."""
+
+
+_TERMINAL_STATUSES = frozenset(
+    {
+        "imported",
+        "success",
+        "completed",
+        "error",
+        "failed",
+        "expired",
+        "protocol_error",
+        "protocol_blocked",
+        "cancelled",
+        "stopped",
+    }
+)
+
+
+def _is_cancel_status(status: str | None) -> bool:
+    return str(status or "").lower() in ("cancelled", "stopped", "stopping")
+
+
+def _session_cancel_requested(sess: dict[str, Any] | None) -> bool:
+    if not isinstance(sess, dict):
+        return False
+    if sess.get("cancel_requested"):
+        return True
+    return _is_cancel_status(sess.get("status"))
+
+
 def _mirror_reg_sess(sid: str, sess: dict[str, Any] | None) -> None:
     if not _reg_redis() or not sid:
         return
@@ -93,7 +125,13 @@ def _mirror_reg_sess(sid: str, sess: dict[str, Any] | None) -> None:
         if sess is None:
             sessions_redis.reg_sess_delete(sid)
         else:
-            sessions_redis.reg_sess_put(sid, sess)
+            # Always strip process-local fields before Redis write.
+            payload = {
+                k: v
+                for k, v in sess.items()
+                if isinstance(k, str) and not k.startswith("_") and not callable(v)
+            }
+            sessions_redis.reg_sess_put(sid, payload)
     except Exception:
         pass
 
@@ -694,6 +732,20 @@ def start_registration(
         fail_n = 0
 
         def _job(i: int) -> dict[str, Any]:
+            # Honour batch-level stop before creating more mailboxes.
+            with _lock:
+                b0 = _batches.get(batch_id) or {}
+                if b0.get("cancel_requested") or str(b0.get("status") or "").lower() in (
+                    "stopping",
+                    "cancelled",
+                    "stopped",
+                ):
+                    return {
+                        "ok": False,
+                        "id": None,
+                        "status": "cancelled",
+                        "error": "cancelled before start",
+                    }
             # Small per-slot stagger only (not cumulative across the whole batch).
             delay = (stagger / 1000.0) * ((i - 1) % max(1, workers))
             prepared = _prepare_registration_session(
@@ -713,7 +765,25 @@ def start_registration(
                 return prepared
             sid = str(prepared.get("id") or "")
             with _lock:
+                # Re-check cancel after prepare (user may stop mid-queue).
+                b1 = _batches.get(batch_id) or {}
                 sess = _sessions.get(sid) or {}
+                if b1.get("cancel_requested") or sess.get("cancel_requested"):
+                    if sid in _sessions:
+                        _sessions[sid]["status"] = "cancelled"
+                        _sessions[sid]["message"] = "cancelled before worker start"
+                        _sessions[sid]["error"] = "cancelled"
+                        _sessions[sid]["cancel_requested"] = True
+                        _sessions[sid]["updated_at"] = _now()
+                        _sessions[sid].pop("_receiver", None)
+                        _mirror_reg_sess(sid, _sessions[sid])
+                    return {
+                        "ok": False,
+                        "id": sid,
+                        "status": "cancelled",
+                        "error": "cancelled",
+                        "email": sess.get("email"),
+                    }
                 receiver = sess.get("_receiver")
                 if sid in _sessions:
                     _sessions[sid]["status"] = "started"
@@ -841,23 +911,85 @@ def _run_registration(
     proxy: str,
     receiver: Any,
 ) -> None:
-    sess = _sessions.get(sid)
+    with _lock:
+        sess = _sessions.get(sid)
+    if not sess:
+        # Another worker may hold the durable copy; still try to load.
+        sess = _load_reg_sess(sid)
     if not sess:
         return
+    # Re-bind process-local map so later progress stays readable on this worker.
+    with _lock:
+        _sessions[sid] = sess
+
+    def _refresh_cancel_from_redis() -> None:
+        """Pull cancel_requested from Redis so multi-worker stop works."""
+        if not _reg_redis():
+            return
+        try:
+            from store import sessions_redis
+
+            remote = sessions_redis.reg_sess_get(sid)
+            if not isinstance(remote, dict):
+                return
+            if not (
+                remote.get("cancel_requested")
+                or _is_cancel_status(remote.get("status"))
+            ):
+                return
+            with _lock:
+                cur = _sessions.get(sid) or sess
+                cur["cancel_requested"] = True
+                # Keep local progress status unless already terminal/stopping.
+                if str(cur.get("status") or "").lower() not in _TERMINAL_STATUSES:
+                    if str(remote.get("status") or "").lower() in (
+                        "stopping",
+                        "cancelled",
+                        "stopped",
+                    ):
+                        cur["status"] = remote.get("status") or "stopping"
+                        if remote.get("message"):
+                            cur["message"] = remote.get("message")
+                _sessions[sid] = cur
+        except Exception:
+            pass
 
     def update(status: str, message: str, **kwargs: Any) -> None:
-        sess["status"] = status
-        sess["message"] = message
-        sess["updated_at"] = _now()
-        sess.update(kwargs)
-        _mirror_reg_sess(sid, sess)
+        _refresh_cancel_from_redis()
+        with _lock:
+            cur = _sessions.get(sid) or sess
+            # Do not overwrite a terminal cancel with intermediate progress.
+            if _session_cancel_requested(cur) and status not in (
+                "cancelled",
+                "stopped",
+                "error",
+                "imported",
+            ):
+                raise _RegCancelled(cur.get("message") or "cancelled by user")
+            cur["status"] = status
+            cur["message"] = message
+            cur["updated_at"] = _now()
+            cur.update(kwargs)
+            _sessions[sid] = cur
+            _mirror_reg_sess(sid, cur)
+
+    def _check_cancel() -> None:
+        _refresh_cancel_from_redis()
+        with _lock:
+            cur = _sessions.get(sid) or sess
+        if _session_cancel_requested(cur):
+            raise _RegCancelled(cur.get("message") or "cancelled by user")
 
     email = str(sess.get("email") or "").strip().lower()
-    password = sess["password"]
+    password = sess.get("password") or ""
+    if not password:
+        update("error", "missing password for registration session", error="missing password")
+        return
     sess["email"] = email
     client = None
 
     try:
+        _check_cancel()
         ensure_xconsole()
         from xconsole_client import (
             XConsoleAuthClient,
@@ -874,12 +1006,14 @@ def _run_registration(
         from config import UPSTREAM_BASE
 
         update("registering", "visiting signup page")
+        _check_cancel()
         client = XConsoleAuthClient(
             debug=True,
             proxy=proxy or "",
             signup_url="https://accounts.x.ai/sign-up?redirect=grok-com",
         )
         client.visit_home()
+        _check_cancel()
         client.load_signup_page()
 
         sitekey = (
@@ -935,6 +1069,7 @@ def _run_registration(
             auto_fallback = True
 
         def _turnstile_progress(msg: str) -> None:
+            _check_cancel()
             update("solving_turnstile", f"Turnstile: {msg}")
 
         solver = YesCaptchaSolver(
@@ -961,6 +1096,7 @@ def _run_registration(
         # was single-use after the slow captcha step.
         solver_label = "本地过盾" if provider == "local" else "YesCaptcha"
         update("solving_turnstile", f"solving Turnstile via {solver_label} (before email code)")
+        _check_cancel()
         try:
             turnstile = solver.solve_turnstile(
                 website_url=website_url,
@@ -968,7 +1104,10 @@ def _run_registration(
                 premium=True,
                 fallback_non_premium=True,
             )
+        except _RegCancelled:
+            raise
         except Exception as captcha_err:
+            _check_cancel()
             alt_url = "https://accounts.x.ai/sign-up?redirect=cloud-console"
             if website_url.rstrip("/") == alt_url.rstrip("/"):
                 alt_url = "https://accounts.x.ai/sign-up?redirect=grok-com"
@@ -984,11 +1123,13 @@ def _run_registration(
             )
         if not turnstile:
             raise RuntimeError("YesCaptcha returned empty Turnstile token")
+        _check_cancel()
 
         # Password can be validated any time before create; do it while warm.
         client.validate_password(email, password)
 
         update("registering", "sending email validation code")
+        _check_cancel()
         send_res = client.create_email_validation_code(email)
         if hasattr(send_res, "ok") and send_res.ok is False:
             print(
@@ -998,7 +1139,23 @@ def _run_registration(
             )
 
         update("waiting_email", "waiting for xAI verification code")
-        code = receiver.wait_for_code(timeout=120)
+        # Poll mailbox in short slices so cancel is responsive during the wait.
+        code = None
+        mail_deadline = time.time() + 120.0
+        while time.time() < mail_deadline:
+            _check_cancel()
+            try:
+                # Prefer short wait if receiver supports timeout kw; fall back once.
+                code = receiver.wait_for_code(timeout=min(8.0, max(1.0, mail_deadline - time.time())))
+            except TypeError:
+                code = receiver.wait_for_code(timeout=120)
+                break
+            except Exception:
+                code = None
+            if code:
+                break
+        if not code:
+            raise RuntimeError("email verification code timeout")
         code = str(code or "").strip().upper().replace(" ", "").replace("-", "")
         if len(code) != 6:
             raise RuntimeError(
@@ -1417,17 +1574,151 @@ def _run_registration(
             f"[{ADAPTER_BUILD}]",
             imported_account_ids=imported_ids,
             imported_accounts=imported_accounts,
-            probe=sess["probe"],
+            probe=sess.get("probe"),
         )
         return
+    except _RegCancelled as exc:
+        with _lock:
+            cur = _sessions.get(sid) or sess
+            cur["status"] = "cancelled"
+            cur["message"] = str(exc) or "cancelled by user"
+            cur["error"] = "cancelled"
+            cur["cancel_requested"] = True
+            cur["updated_at"] = _now()
+            _sessions[sid] = cur
+            _mirror_reg_sess(sid, cur)
+        return
     except Exception as exc:  # noqa: BLE001
-        update("error", f"failed: {exc}", error=str(exc))
+        try:
+            update("error", f"failed: {exc}", error=str(exc))
+        except _RegCancelled:
+            with _lock:
+                cur = _sessions.get(sid) or sess
+                cur["status"] = "cancelled"
+                cur["message"] = "cancelled by user"
+                cur["error"] = "cancelled"
+                cur["cancel_requested"] = True
+                cur["updated_at"] = _now()
+                _sessions[sid] = cur
+                _mirror_reg_sess(sid, cur)
     finally:
         if client is not None:
             try:
                 client.close()
             except Exception:
                 pass
+        with _lock:
+            if sid in _sessions:
+                _sessions[sid].pop("_receiver", None)
+                _sessions[sid].pop("_client", None)
+
+
+def stop_registration_session(session_id: str) -> dict[str, Any]:
+    """Request cooperative cancel for one registration session."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return {"ok": False, "error": "missing session id"}
+    sess = _load_reg_sess(sid)
+    if not sess:
+        return {"ok": False, "error": "registration session not found"}
+    st = str(sess.get("status") or "").lower()
+    if st in _TERMINAL_STATUSES:
+        return {
+            "ok": True,
+            "id": sid,
+            "status": st,
+            "already_terminal": True,
+            "message": sess.get("message") or st,
+        }
+    with _lock:
+        cur = _sessions.get(sid) or dict(sess)
+        cur["cancel_requested"] = True
+        cur["status"] = "stopping"
+        cur["message"] = "stop requested; waiting for worker to exit"
+        cur["updated_at"] = _now()
+        _sessions[sid] = cur
+        _mirror_reg_sess(sid, cur)
+        out = _compact_session(cur)
+    return {"ok": True, "id": sid, **out}
+
+
+def stop_registration_batch(batch_id: str) -> dict[str, Any]:
+    """Request cooperative cancel for every non-terminal session in a batch."""
+    bid = str(batch_id or "").strip()
+    if not bid:
+        return {"ok": False, "error": "missing batch id"}
+    batch = _load_reg_batch(bid)
+    if not batch:
+        return {"ok": False, "error": "registration batch not found"}
+    sids = list(batch.get("session_ids") or [])
+    stopped: list[str] = []
+    already: list[str] = []
+    missing: list[str] = []
+    for sid in sids:
+        r = stop_registration_session(str(sid))
+        if not r.get("ok"):
+            missing.append(str(sid))
+            continue
+        if r.get("already_terminal"):
+            already.append(str(sid))
+        else:
+            stopped.append(str(sid))
+    with _lock:
+        b = _batches.get(bid) or dict(batch)
+        b["cancel_requested"] = True
+        b["status"] = "stopping"
+        b["message"] = (
+            f"stop requested: stopping={len(stopped)} "
+            f"already_done={len(already)} missing={len(missing)}"
+        )
+        b["updated_at"] = _now()
+        _batches[bid] = b
+        _mirror_reg_batch(bid, dict(b))
+        out = dict(b)
+    return {
+        "ok": True,
+        "batch_id": bid,
+        "stopped": stopped,
+        "already_terminal": already,
+        "missing": missing,
+        "batch": out,
+    }
+
+
+def stop_all_active_registrations() -> dict[str, Any]:
+    """Stop every non-terminal registration session currently visible."""
+    listed = list_registration_sessions()
+    sessions = list(listed.get("sessions") or [])
+    stopped = []
+    already = []
+    for s in sessions:
+        sid = str(s.get("id") or "")
+        if not sid:
+            continue
+        r = stop_registration_session(sid)
+        if r.get("already_terminal"):
+            already.append(sid)
+        elif r.get("ok"):
+            stopped.append(sid)
+    # Also mark running batches as stopping.
+    for b in list(listed.get("batches") or []):
+        bid = str(b.get("id") or b.get("batch_id") or "")
+        if not bid:
+            continue
+        st = str(b.get("status") or b.get("batch_status") or "").lower()
+        if st in ("done", "partial", "error", "cancelled", "stopped"):
+            continue
+        try:
+            stop_registration_batch(bid)
+        except Exception:
+            pass
+    return {
+        "ok": True,
+        "stopped": stopped,
+        "already_terminal": already,
+        "stopped_count": len(stopped),
+        "already_count": len(already),
+    }
 
 
 def list_registration_sessions() -> dict[str, Any]:
@@ -1445,12 +1736,16 @@ def list_registration_sessions() -> dict[str, Any]:
                     if sid not in _sessions:
                         _sessions[sid] = remote
                     else:
-                        # Prefer newer updated_at
+                        # Prefer newer updated_at, but keep local process-only fields.
                         local = _sessions[sid]
-                        if float(remote.get("updated_at") or 0) > float(
+                        if float(remote.get("updated_at") or 0) >= float(
                             local.get("updated_at") or 0
                         ):
-                            _sessions[sid] = {**local, **remote}
+                            merged = {**local, **remote}
+                            for k, v in local.items():
+                                if isinstance(k, str) and k.startswith("_") and k not in remote:
+                                    merged[k] = v
+                            _sessions[sid] = merged
             for remote_b in sessions_redis.reg_batch_list():
                 bid = str(remote_b.get("id") or remote_b.get("batch_id") or "")
                 if not bid:
@@ -1458,23 +1753,52 @@ def list_registration_sessions() -> dict[str, Any]:
                 with _lock:
                     if bid not in _batches:
                         _batches[bid] = remote_b
+                    else:
+                        local_b = _batches[bid]
+                        if float(remote_b.get("updated_at") or 0) >= float(
+                            local_b.get("updated_at") or 0
+                        ):
+                            # Union session_ids so late workers don't drop early ones.
+                            ids = list(local_b.get("session_ids") or [])
+                            for x in remote_b.get("session_ids") or []:
+                                if x not in ids:
+                                    ids.append(x)
+                            merged_b = {**local_b, **remote_b, "session_ids": ids}
+                            _batches[bid] = merged_b
         except Exception:
             pass
     with _lock:
         sessions = [_compact_session(s) for s in _sessions.values()]
+        sessions.sort(
+            key=lambda s: float(s.get("updated_at") or s.get("created_at") or 0),
+            reverse=True,
+        )
         batches = []
         for b in _batches.values():
             sids = list(b.get("session_ids") or [])
             stats = _batch_stats(sids)
+            # If all sessions cancelled, surface batch as cancelled.
+            if sids and stats.get("running") == 0:
+                all_cancelled = True
+                for sid in sids:
+                    st = str((_load_reg_sess(sid) or {}).get("status") or "").lower()
+                    if st not in ("cancelled", "stopped"):
+                        all_cancelled = False
+                        break
+                if all_cancelled:
+                    stats["batch_status"] = "cancelled"
             batches.append({**b, **stats})
+        batches.sort(
+            key=lambda b: float(b.get("updated_at") or b.get("created_at") or 0),
+            reverse=True,
+        )
     return {
         "sessions": sessions,
         "batches": batches,
         "active": sum(
             1
             for s in sessions
-            if s.get("status")
-            not in ("imported", "error", "failed", "expired", "completed", "success")
+            if str(s.get("status") or "").lower() not in _TERMINAL_STATUSES
         ),
     }
 
@@ -1496,27 +1820,37 @@ def get_registration_session(
 
 
 def _batch_stats(session_ids: list[str]) -> dict[str, Any]:
-    imported = error = running = 0
+    imported = error = running = cancelled = 0
     for sid in session_ids:
         sess = _load_reg_sess(sid) or {}
-        st = str(sess.get("status") or "")
+        st = str(sess.get("status") or "").lower()
         if st in ("imported", "success", "completed"):
             imported += 1
+        elif st in ("cancelled", "stopped"):
+            cancelled += 1
         elif st in ("error", "failed", "expired", "protocol_error", "protocol_blocked"):
             error += 1
         else:
             running += 1
     total = len(session_ids)
-    done = imported + error
+    done = imported + error + cancelled
     status = "running"
     if total and done >= total:
-        status = "done" if error == 0 else ("partial" if imported else "error")
-    elif total and imported and error:
+        if cancelled and not imported and not error:
+            status = "cancelled"
+        elif error == 0 and cancelled == 0:
+            status = "done"
+        elif imported:
+            status = "partial"
+        else:
+            status = "error"
+    elif total and (imported or error or cancelled) and running:
         status = "running"
     return {
         "total": total,
         "imported": imported,
         "error": error,
+        "cancelled": cancelled,
         "running": running,
         "done": done,
         "batch_status": status,

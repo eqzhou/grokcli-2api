@@ -1532,6 +1532,77 @@ async def get_email_registration_session(
     return result
 
 
+@router.post("/accounts/register-email/sessions/{session_id}/stop")
+async def stop_email_registration_session(
+    session_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Cooperatively stop one registration session (in-flight worker exits ASAP)."""
+    require_admin(request, x_admin_token)
+    adapter = _require_register_adapter()
+    stopper = getattr(adapter, "stop_registration_session", None)
+    if not callable(stopper):
+        raise HTTPException(status_code=501, detail="stop API not available")
+    result = stopper(session_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "stop failed")
+    audit_log(
+        request,
+        action="register.session_stop",
+        summary=f"停止注册会话：{session_id}",
+        target_type="registration",
+        target_id=session_id,
+    )
+    return result
+
+
+@router.post("/accounts/register-email/batches/{batch_id}/stop")
+async def stop_email_registration_batch(
+    batch_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Stop all non-terminal sessions in a registration batch."""
+    require_admin(request, x_admin_token)
+    adapter = _require_register_adapter()
+    stopper = getattr(adapter, "stop_registration_batch", None)
+    if not callable(stopper):
+        raise HTTPException(status_code=501, detail="batch stop API not available")
+    result = stopper(batch_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "stop failed")
+    audit_log(
+        request,
+        action="register.batch_stop",
+        summary=f"停止注册批次：{batch_id}",
+        target_type="registration",
+        target_id=batch_id,
+    )
+    return result
+
+
+@router.post("/accounts/register-email/stop")
+async def stop_all_email_registrations(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Stop every active registration session currently visible."""
+    require_admin(request, x_admin_token)
+    adapter = _require_register_adapter()
+    stopper = getattr(adapter, "stop_all_active_registrations", None)
+    if not callable(stopper):
+        raise HTTPException(status_code=501, detail="stop-all API not available")
+    result = stopper()
+    audit_log(
+        request,
+        action="register.stop_all",
+        summary=f"停止全部注册：{result.get('stopped_count') or 0}",
+        target_type="registration",
+    )
+    return result
+
+
 @router.post("/accounts/import-file")
 async def import_account_file(
     request: Request,

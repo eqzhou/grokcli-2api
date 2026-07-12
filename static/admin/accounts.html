@@ -272,6 +272,7 @@
       <button class="g2a-btn g2a-btn-default" id="btn-save-reg">保存配置</button>
       <button class="g2a-btn g2a-btn-default" id="btn-test-reg-proxy">测试代理</button>
       <button class="g2a-btn g2a-btn-primary" id="btn-start-reg">开始注册</button>
+      <button class="g2a-btn g2a-btn-danger" id="btn-stop-reg" title="停止当前/全部进行中的注册会话">停止注册</button>
       <button class="g2a-btn g2a-btn-default" id="btn-refresh-reg">刷新进度</button>
     </div>
   </div>
@@ -310,7 +311,11 @@
   <div id="reg-session-box" class="g2a-subcard hidden" style="margin-top:12px" hidden>
     <div class="g2a-kv"><span>状态</span><span id="reg-status" class="g2a-tag">idle</span></div>
     <div class="g2a-kv"><span>会话</span><code id="reg-email" class="g2a-code-inline">—</code></div>
-    <p class="g2a-muted" style="margin:8px 0 4px">进度日志（成功/失败统计 · 入池后自动测活）</p>
+    <div class="g2a-actions" style="margin:8px 0 4px">
+      <button class="g2a-btn g2a-btn-danger g2a-btn-sm" id="btn-stop-reg-inline" type="button">停止当前注册</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-refresh-reg-inline" type="button">刷新</button>
+    </div>
+    <p class="g2a-muted" style="margin:8px 0 4px">进度日志（成功/失败统计 · 入池后自动测活；切换页面不会丢失）</p>
     <pre id="reg-log" class="g2a-log is-empty hidden" hidden>—</pre>
   </div>
 </section>
@@ -381,6 +386,6 @@
   <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.4d89734b73.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.bfabc2d674.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>
