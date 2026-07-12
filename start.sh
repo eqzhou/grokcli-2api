@@ -54,6 +54,8 @@ export GROK2API_TOKEN_MAINTAIN="${GROK2API_TOKEN_MAINTAIN:-1}"
 export GROK2API_REASONING_COMPAT="${GROK2API_REASONING_COMPAT:-off}"
 # Default multi-worker; auto-scale if unset is handled in config.py
 export GROK2API_WORKERS="${GROK2API_WORKERS:-}"
+# Production start: hot-reload OFF unless explicitly set (use ./dev.sh for reload).
+export GROK2API_RELOAD="${GROK2API_RELOAD:-0}"
 export GROK2API_STORE_BACKEND="${GROK2API_STORE_BACKEND:-hybrid}"
 export REDIS_URL="${REDIS_URL:-${GROK2API_REDIS_URL:-redis://127.0.0.1:6379/0}}"
 export DATABASE_URL="${DATABASE_URL:-${GROK2API_DATABASE_URL:-postgresql://grok2api:grok2api@127.0.0.1:5432/grok2api}}"

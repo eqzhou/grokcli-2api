@@ -51,16 +51,75 @@ def count_accounts() -> int:
     return int(row[0] or 0) if row else 0
 
 
+# Admin list sort keys → SQL ORDER BY (accounts a [LEFT JOIN account_pool ap]).
+# Default "newest" keeps freshly registered/imported accounts on page 1.
+_ACCOUNT_SORT_SQL: dict[str, str] = {
+    "newest": "a.updated_at DESC NULLS LAST, a.id DESC",
+    "oldest": "a.updated_at ASC NULLS LAST, a.id ASC",
+    "expires_desc": "a.expires_at DESC NULLS LAST, a.updated_at DESC",
+    "expires_asc": "a.expires_at ASC NULLS LAST, a.updated_at DESC",
+    "email_asc": "lower(COALESCE(a.email, '')) ASC, a.id ASC",
+    "email_desc": "lower(COALESCE(a.email, '')) DESC, a.id DESC",
+    "last_used_desc": "ap.last_used_at DESC NULLS LAST, a.updated_at DESC",
+    "last_used_asc": "ap.last_used_at ASC NULLS LAST, a.updated_at DESC",
+    "requests_desc": "COALESCE(ap.request_count, 0) DESC, a.updated_at DESC",
+    "cooldown_first": (
+        "(CASE WHEN ap.cooldown_until IS NOT NULL AND ap.cooldown_until > now() "
+        "THEN 0 ELSE 1 END) ASC, a.updated_at DESC"
+    ),
+    "disabled_first": (
+        "(CASE WHEN COALESCE(ap.enabled, true) = false "
+        "OR COALESCE(ap.disabled_for_quota, false) = true THEN 0 ELSE 1 END) ASC, "
+        "a.updated_at DESC"
+    ),
+}
+_ACCOUNT_SORT_ALIASES: dict[str, str] = {
+    "updated_desc": "newest",
+    "updated_asc": "oldest",
+    "new": "newest",
+    "old": "oldest",
+    "expiry_desc": "expires_desc",
+    "expiry_asc": "expires_asc",
+    "expire_desc": "expires_desc",
+    "expire_asc": "expires_asc",
+    "used_desc": "last_used_desc",
+    "used_asc": "last_used_asc",
+    "usage_desc": "requests_desc",
+    "cooldown": "cooldown_first",
+    "disabled": "disabled_first",
+}
+
+
+def normalize_account_sort(sort: str | None) -> str:
+    key = str(sort or "newest").strip().lower().replace("-", "_")
+    key = _ACCOUNT_SORT_ALIASES.get(key, key)
+    if key not in _ACCOUNT_SORT_SQL:
+        return "newest"
+    return key
+
+
 def list_account_summaries(
     *,
     q: str = "",
     page: int = 1,
     page_size: int = 25,
+    sort: str | None = None,
 ) -> dict[str, Any]:
     """Paged account list for admin UI without loading the full auth map.
 
     Returns admin-safe fields only (no full access/refresh tokens).
+    `sort` defaults to newest (updated_at DESC) so fresh registrations appear first.
     """
+    sort_key = normalize_account_sort(sort)
+    order_sql = _ACCOUNT_SORT_SQL[sort_key]
+    needs_pool = sort_key in (
+        "last_used_desc",
+        "last_used_asc",
+        "requests_desc",
+        "cooldown_first",
+        "disabled_first",
+    )
+
     if not enabled():
         return {
             "accounts": [],
@@ -69,6 +128,7 @@ def list_account_summaries(
             "page_size": page_size,
             "total_pages": 1,
             "q": q,
+            "sort": sort_key,
         }
 
     query = (q or "").strip().lower()
@@ -115,19 +175,28 @@ def list_account_summaries(
                 offset = (page_i - 1) * size_i
                 limit = size_i
 
-            sql = """
-                SELECT id, email, user_id, team_id, payload, expires_at
-                FROM accounts
-            """
+            if needs_pool:
+                sql = """
+                    SELECT a.id, a.email, a.user_id, a.team_id, a.payload, a.expires_at,
+                           a.updated_at
+                    FROM accounts a
+                    LEFT JOIN account_pool ap ON ap.account_id = a.id
+                """
+            else:
+                sql = """
+                    SELECT a.id, a.email, a.user_id, a.team_id, a.payload, a.expires_at,
+                           a.updated_at
+                    FROM accounts a
+                """
             params: list[Any] = []
             if like:
                 sql += """
-                    WHERE lower(COALESCE(email,'')) LIKE %s
-                       OR lower(id) LIKE %s
-                       OR lower(COALESCE(user_id,'')) LIKE %s
+                    WHERE lower(COALESCE(a.email,'')) LIKE %s
+                       OR lower(a.id) LIKE %s
+                       OR lower(COALESCE(a.user_id,'')) LIKE %s
                 """
                 params.extend([like, like, like])
-            sql += " ORDER BY expires_at DESC NULLS LAST, updated_at DESC"
+            sql += f" ORDER BY {order_sql}"
             if limit is not None:
                 sql += " LIMIT %s OFFSET %s"
                 params.extend([limit, offset])
@@ -165,6 +234,7 @@ def list_account_summaries(
             hint = "****"
         else:
             hint = ""
+        updated_at = _unix(r[6]) if len(r) > 6 else None
         accounts.append(
             {
                 "id": aid,
@@ -173,6 +243,7 @@ def list_account_summaries(
                 "team_id": r[3] or payload.get("team_id"),
                 "auth_mode": payload.get("auth_mode"),
                 "create_time": payload.get("create_time"),
+                "updated_at": updated_at,
                 "expires_at": exp,
                 "expired": expired,
                 "has_refresh_token": bool(payload.get("refresh_token")),
@@ -190,6 +261,7 @@ def list_account_summaries(
         "page_size": size_i,
         "total_pages": max(1, (total + size_i - 1) // size_i) if size_i else 1,
         "q": (q or "").strip(),
+        "sort": sort_key,
     }
 
 

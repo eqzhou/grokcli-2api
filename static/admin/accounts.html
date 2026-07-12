@@ -205,6 +205,19 @@
     <input id="acc-search" placeholder="搜索邮箱 / 账号 ID / 状态" />
     <button class="g2a-btn g2a-btn-default" id="btn-acc-search">搜索</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-search-clear">清除</button>
+    <select id="acc-sort" title="账号排序" style="min-width:10.5rem">
+      <option value="newest" selected>最新更新</option>
+      <option value="oldest">最早更新</option>
+      <option value="expires_desc">过期最晚</option>
+      <option value="expires_asc">过期最早</option>
+      <option value="last_used_desc">最近使用</option>
+      <option value="last_used_asc">最久未用</option>
+      <option value="requests_desc">请求最多</option>
+      <option value="email_asc">邮箱 A→Z</option>
+      <option value="email_desc">邮箱 Z→A</option>
+      <option value="cooldown_first">冷却优先</option>
+      <option value="disabled_first">禁用优先</option>
+    </select>
     <span class="g2a-spacer"></span>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-select-page">本页全选</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-select-all-filtered">筛选全选</button>
@@ -368,6 +381,6 @@
   <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.8a74db1e76.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.4d89734b73.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

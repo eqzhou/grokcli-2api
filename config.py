@@ -30,6 +30,26 @@ def _default_workers() -> int:
 
 # Uvicorn worker processes (high-concurrency default). Requires Redis + PostgreSQL.
 WORKERS = _default_workers()
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return (os.getenv(name, default) or default).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+# Dev hot-reload (uvicorn --reload). Production must keep this off.
+# When enabled, workers are forced to 1 (uvicorn cannot combine reload + multi-worker).
+RELOAD = _env_truthy("GROK2API_RELOAD", "0")
+# Comma-separated extra watch dirs (relative to app root or absolute). Empty = defaults.
+RELOAD_DIRS = (os.getenv("GROK2API_RELOAD_DIRS") or "").strip()
+# Comma-separated glob includes; empty = uvicorn defaults (*.py etc.).
+RELOAD_INCLUDES = (os.getenv("GROK2API_RELOAD_INCLUDES") or "").strip()
+# Comma-separated glob excludes (always ignore data/ and __pycache__ noise).
+RELOAD_EXCLUDES = (os.getenv("GROK2API_RELOAD_EXCLUDES") or "").strip()
 # Optional public origin for admin UI / API guide links on public deployments.
 # Leave empty to auto-detect:
 #   - admin/API responses use request Host / X-Forwarded-* first

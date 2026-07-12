@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.23"
+APP_VERSION = "1.9.24"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -4466,6 +4466,78 @@ def _open_admin_browser(url: str, delay: float = 1.2) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _reload_enabled() -> bool:
+    """Dev-only hot reload. Off by default; multi-worker production stays stable."""
+    try:
+        from config import RELOAD
+
+        return bool(RELOAD)
+    except Exception:
+        return (os.getenv("GROK2API_RELOAD") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+
+def _reload_kwargs() -> dict:
+    """Build uvicorn reload options (dirs / include / exclude globs)."""
+    root = Path(__file__).resolve().parent
+    try:
+        from config import RELOAD_DIRS, RELOAD_EXCLUDES, RELOAD_INCLUDES
+    except Exception:
+        RELOAD_DIRS = (os.getenv("GROK2API_RELOAD_DIRS") or "").strip()
+        RELOAD_INCLUDES = (os.getenv("GROK2API_RELOAD_INCLUDES") or "").strip()
+        RELOAD_EXCLUDES = (os.getenv("GROK2API_RELOAD_EXCLUDES") or "").strip()
+
+    def _split(raw: str) -> list[str]:
+        return [p.strip() for p in str(raw or "").split(",") if p.strip()]
+
+    dirs = _split(RELOAD_DIRS)
+    if not dirs:
+        # Watch code + admin UI sources; skip data/logs/venv noise.
+        dirs = [
+            str(root),
+            str(root / "store"),
+            str(root / "static" / "js"),
+            str(root / "static" / "admin"),
+            str(root / "grok-build-auth"),
+        ]
+    else:
+        resolved = []
+        for d in dirs:
+            p = Path(d)
+            if not p.is_absolute():
+                p = root / p
+            resolved.append(str(p))
+        dirs = resolved
+
+    includes = _split(RELOAD_INCLUDES) or [
+        "*.py",
+        "*.html",
+        "*.js",
+        "*.css",
+        "*.json",
+    ]
+    excludes = _split(RELOAD_EXCLUDES) or [
+        "*/__pycache__/*",
+        "*.pyc",
+        "*/.git/*",
+        "*/data/*",
+        "*/static/dist/*",
+        "*/turnstile-solver/logs/*",
+        "*/.venv/*",
+        "*/venv/*",
+    ]
+    return {
+        "reload": True,
+        "reload_dirs": dirs,
+        "reload_includes": includes,
+        "reload_excludes": excludes,
+    }
+
+
 def main() -> None:
     import socket
 
@@ -4475,7 +4547,12 @@ def main() -> None:
 
     host = _pick_listen_host()
     port = PORT
-    workers = max(2, int(WORKERS or 2))  # high-concurrency: never default to 1
+    reload_on = _reload_enabled()
+    # uvicorn cannot combine reload with multi-worker; force 1 worker in dev.
+    if reload_on:
+        workers = 1
+    else:
+        workers = max(2, int(WORKERS or 2))  # high-concurrency: never default to 1
     # On Linux servers / headless, don't auto-open browser by default
     default_open = "0" if (os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")) else "1"
     open_browser = os.getenv("GROK2API_OPEN_BROWSER", default_open) not in (
@@ -4524,7 +4601,8 @@ def main() -> None:
     else:
         link_base = f"http://{host}:{port}"
     print(f"grokcli-2api v{APP_VERSION} listening on http://{host}:{port}")
-    print(f"  workers:            {workers}")
+    print(f"  workers:            {workers}" + (" (forced by reload)" if reload_on else ""))
+    print(f"  hot-reload:         {'ON  (dev only)' if reload_on else 'off'}")
     print(f"  OpenAI base_url:    {link_base}/v1")
     print(f"  Anthropic messages: {link_base}/v1/messages")
     print(f"  Admin console:      {admin}")
@@ -4538,19 +4616,29 @@ def main() -> None:
     elif host in ("0.0.0.0", "::"):
         print("  Tip: set GROK2API_PUBLIC_BASE_URL=https://your.domain if auto-detect is wrong")
     print(f"  Upstream:           {UPSTREAM_BASE}")
-    print("  mode:               high-concurrency (multi-worker + Redis + PostgreSQL)")
-    print("  note:               only leader process runs token/model maintainers")
+    if reload_on:
+        print("  mode:               dev hot-reload (single worker + file watch)")
+        print("  note:               set GROK2API_RELOAD=0 for multi-worker production")
+    else:
+        print("  mode:               high-concurrency (multi-worker + Redis + PostgreSQL)")
+        print("  note:               only leader process runs token/model maintainers")
 
-    # Always multi-worker string import path.
-    uvicorn.run(
-        "app:app",
-        host=host,
-        port=port,
-        workers=workers,
-        reload=False,
-        limit_concurrency=int(os.getenv("GROK2API_LIMIT_CONCURRENCY", "2000") or 2000),
-        timeout_keep_alive=int(os.getenv("GROK2API_KEEPALIVE", "30") or 30),
-    )
+    run_kwargs: dict = {
+        "app": "app:app",
+        "host": host,
+        "port": port,
+        "workers": workers,
+        "limit_concurrency": int(os.getenv("GROK2API_LIMIT_CONCURRENCY", "2000") or 2000),
+        "timeout_keep_alive": int(os.getenv("GROK2API_KEEPALIVE", "30") or 30),
+    }
+    if reload_on:
+        run_kwargs.update(_reload_kwargs())
+        # workers must stay 1 when reload is on
+        run_kwargs["workers"] = 1
+    else:
+        run_kwargs["reload"] = False
+
+    uvicorn.run(**run_kwargs)
 
 
 if __name__ == "__main__":

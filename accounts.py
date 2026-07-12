@@ -729,6 +729,13 @@ def merge_normalized_accounts(
         write_auth_map(normalized)
         total = len(normalized)
 
+    try:
+        from account_pool import invalidate_pool_summary_cache
+
+        invalidate_pool_summary_cache()
+    except Exception:
+        pass
+
     imported = [
         {
             "id": aid,
@@ -952,23 +959,14 @@ def import_auth_payload(
                     "token_hint": _mask_token(nent.get("key")),
                 }
             )
-        # Ensure durable pool status rows exist (created by _upsert_one ON CONFLICT DO NOTHING).
+        # Pool row is created by _upsert_one (ON CONFLICT DO NOTHING). Always
+        # invalidate summary cache after registration/import — the old
+        # "if rid not in state: patch..." path never ran for new accounts
+        # because the pool row already exists, so totals stayed stale.
         try:
-            from settings_store import get_account_pool_state, patch_account_pool_meta
+            from account_pool import invalidate_pool_summary_cache
 
-            state = get_account_pool_state() or {}
-            for row in imported:
-                rid = str(row.get("id") or "")
-                if rid and rid not in state:
-                    patch_account_pool_meta(
-                        rid,
-                        {
-                            "enabled": True,
-                            "weight": 1,
-                            "pool_status": "normal",
-                            "cooldown_count": 0,
-                        },
-                    )
+            invalidate_pool_summary_cache()
         except Exception:
             pass
         # Best-effort local mirror for export/tools only (do not rewrite PG again —
@@ -1030,6 +1028,13 @@ def import_auth_payload(
         final = read_auth_map()
     except OSError as e:
         return {"ok": False, "error": f"write auth store failed: {e}"}
+
+    try:
+        from account_pool import invalidate_pool_summary_cache
+
+        invalidate_pool_summary_cache()
+    except Exception:
+        pass
 
     for k, e in normalized.items():
         actual_id = k

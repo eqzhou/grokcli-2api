@@ -757,6 +757,61 @@ async def delete_key(
     return {"ok": True}
 
 
+def _sort_account_rows(rows: list[dict], sort_key: str) -> list[dict]:
+    """In-memory sort for file-backend /accounts fallback (mirrors PG sort keys)."""
+    key = str(sort_key or "newest")
+
+    def _f(v, default=0.0):
+        try:
+            if v is None or v == "":
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    def _s(v):
+        return str(v or "").lower()
+
+    def sorter(row: dict):
+        p = row.get("_pool") or {}
+        exp = _f(row.get("expires_at"), 0.0)
+        upd = _f(row.get("updated_at") or row.get("create_time"), 0.0)
+        used = _f(p.get("last_used_at"), 0.0)
+        reqs = _f(p.get("request_count"), 0.0)
+        email = _s(row.get("email"))
+        rid = _s(row.get("id"))
+        in_cd = 0 if p.get("in_cooldown") else 1
+        disabled = 0 if (p.get("enabled") is False or p.get("disabled_for_quota")) else 1
+        if key == "oldest":
+            return (upd, rid)
+        if key == "expires_desc":
+            return (-exp, -upd)
+        if key == "expires_asc":
+            return (exp if exp else 1e18, -upd)
+        if key == "email_asc":
+            return (email, rid)
+        if key == "email_desc":
+            return (email, rid)  # reverse later
+        if key == "last_used_desc":
+            return (-used, -upd)
+        if key == "last_used_asc":
+            return (used if used else 1e18, -upd)
+        if key == "requests_desc":
+            return (-reqs, -upd)
+        if key == "cooldown_first":
+            return (in_cd, -upd)
+        if key == "disabled_first":
+            return (disabled, -upd)
+        # newest (default)
+        return (-upd, rid)
+
+    reverse = key == "email_desc"
+    try:
+        return sorted(rows, key=sorter, reverse=reverse)
+    except Exception:
+        return rows
+
+
 @router.get("/accounts")
 async def list_accounts_route(
     request: Request,
@@ -764,6 +819,7 @@ async def list_accounts_route(
     page: int = 1,
     page_size: int = 25,
     q: str = "",
+    sort: str = "newest",
     summary: bool = False,
 ):
     """List accounts with server-side SQL pagination (PostgreSQL path).
@@ -771,8 +827,17 @@ async def list_accounts_route(
     - default: paged rows for admin UI (fast first paint)
     - summary=1: counts only
     - page_size<=0 or page_size>=10000: return all summary rows (export/legacy)
+    - sort: newest|oldest|expires_desc|expires_asc|email_asc|email_desc|
+            last_used_desc|last_used_asc|requests_desc|cooldown_first|disabled_first
     """
     require_admin(request, x_admin_token)
+
+    try:
+        from store.accounts_pg import normalize_account_sort
+
+        sort_key = normalize_account_sort(sort)
+    except Exception:
+        sort_key = (sort or "newest").strip().lower() or "newest"
 
     if summary:
         status = accounts.account_status(include_accounts=False)
@@ -782,6 +847,7 @@ async def list_accounts_route(
         status["total"] = int(status.get("account_count") or 0)
         status["total_pages"] = 1
         status["q"] = (q or "").strip()
+        status["sort"] = sort_key
         return status
 
     # Fast path: page in PostgreSQL, attach pool meta only for current page.
@@ -792,7 +858,9 @@ async def list_accounts_route(
         import time as _time
 
         if pg_on():
-            paged = list_account_summaries(q=q, page=page, page_size=page_size)
+            paged = list_account_summaries(
+                q=q, page=page, page_size=page_size, sort=sort_key
+            )
             page_items = list(paged.get("accounts") or [])
             ids = [str(a.get("id")) for a in page_items if a.get("id")]
             pool_map = get_pool_meta_many(ids) if ids else {}
@@ -879,6 +947,7 @@ async def list_accounts_route(
                 "total": total,
                 "total_pages": paged.get("total_pages") or 1,
                 "q": (q or "").strip(),
+                "sort": paged.get("sort") or sort_key,
                 "paged": True,
                 "fast_path": True,
             }
@@ -939,6 +1008,8 @@ async def list_accounts_route(
                 filtered.append(arow)
         rows = filtered
 
+    rows = _sort_account_rows(rows, sort_key)
+
     total = len(rows)
     try:
         page_size_i = int(page_size)
@@ -991,6 +1062,7 @@ async def list_accounts_route(
         "total": total,
         "total_pages": total_pages,
         "q": (q or "").strip(),
+        "sort": sort_key,
         "paged": True,
         "fast_path": False,
     }

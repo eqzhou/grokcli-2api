@@ -36,6 +36,7 @@ window.G2A = window.G2A || {};
   let accountsLoadSeq = 0;
   let accountsPageSize = 25;
   let accountsSearchQuery = "";
+  let accountsSort = "newest";
   let selectedAccountIds = new Set();
   function syncToken() { token = (window.G2A && G2A.getToken) ? G2A.getToken() : token; }
   function headers(json = true) {
@@ -514,6 +515,25 @@ function rebindPageControls() {
   if ($("acc-search")) {
     $("acc-search").onkeydown = (e) => { if (e.key === "Enter") applyAccountSearch(true); };
   }
+  if ($("acc-sort")) {
+    try {
+      const saved = localStorage.getItem("g2a_accounts_sort");
+      if (saved) {
+        accountsSort = saved;
+        $("acc-sort").value = saved;
+      } else {
+        accountsSort = $("acc-sort").value || "newest";
+      }
+    } catch (_) {
+      accountsSort = $("acc-sort").value || "newest";
+    }
+    $("acc-sort").onchange = () => {
+      accountsSort = ($("acc-sort").value || "newest");
+      try { localStorage.setItem("g2a_accounts_sort", accountsSort); } catch (_) {}
+      accountsPage = 1;
+      loadAccountsPage({ reset: true });
+    };
+  }
   if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
   if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { setPageSelection(true); toast("已选择本页账号（服务端分页）"); };
   if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => { selectedAccountIds.clear(); renderAccountsPage(); };
@@ -886,6 +906,7 @@ async function loadDashboard() {
         if (statusCache.model_health) dashCache.model_health = statusCache.model_health;
         if (statusCache.pool) dashCache.pool = Object.assign({}, dashCache.pool || {}, statusCache.pool);
         if (statusCache.settings) dashCache.settings = Object.assign({}, dashCache.settings || {}, statusCache.settings);
+        if (statusCache.accounts) dashCache.accounts = Object.assign({}, dashCache.accounts || {}, statusCache.accounts);
       }
     }
   } catch (e) {
@@ -979,7 +1000,7 @@ function renderStats() {
     <div class="stat"><div class="label">API Base</div><div class="value mono">${esc(d.api_base || s.api_base || "")}</div></div>
     <div class="stat"><div class="label">CLI 版本</div><div class="value mono">${esc(d.cli_version || s.cli_version || "")}</div>
       <div class="sub">上游 ${esc(d.upstream || s.upstream || "")}</div></div>
-    <div class="stat"><div class="label">账号池</div><div class="value">${pool.enabled ?? acc.active_count ?? 0} 启用 / ${pool.live ?? acc.active_count ?? 0} 有效</div>
+    <div class="stat"><div class="label">账号池</div><div class="value">${pool.total ?? acc.account_count ?? 0} 总数 · ${pool.enabled ?? acc.active_count ?? 0} 启用 / ${pool.live ?? acc.active_count ?? 0} 有效</div>
       <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0}</div></div>
     <div class="stat"><div class="label">API Keys</div><div class="value">${keys.enabled ?? 0} 启用 / ${keys.total ?? 0}</div>
       <div class="sub">请求累计 ${keys.total_requests ?? 0} · 鉴权 ${keys.auth_required ? "开启" : "关闭"}</div></div>
@@ -1248,10 +1269,15 @@ async function loadAccountsPage({ reset = false } = {}) {
   const seq = ++accountsLoadSeq;
   const q = (accountsSearchQuery || ($("acc-search") && $("acc-search").value) || "").trim();
   accountsSearchQuery = q;
+  if ($("acc-sort") && $("acc-sort").value) accountsSort = $("acc-sort").value;
+  const sort = accountsSort || "newest";
   const pageSize = accountsPageSize || 25;
   const page = accountsPage || 1;
   try {
-    const data = await api(`/accounts?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}&q=${encodeURIComponent(q)}`);
+    const data = await api(
+      `/accounts?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}` +
+      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}`
+    );
     if (seq !== accountsLoadSeq) return;
     const rawAccounts = Array.isArray(data && data.accounts) ? data.accounts : [];
     accountsList = rawAccounts.map((a) => ({ ...a, _pool: a._pool || { id: a.id } }));
@@ -1266,6 +1292,12 @@ async function loadAccountsPage({ reset = false } = {}) {
     accountsTotalPages = Number(data.total_pages || Math.max(1, Math.ceil((accountsTotal || 0) / pageSize))) || 1;
     accountsPage = Number(data.page || page) || 1;
     accountsPageSize = Number(data.page_size || pageSize) || pageSize;
+    if (data.sort) {
+      accountsSort = data.sort;
+      if ($("acc-sort") && $("acc-sort").value !== data.sort) {
+        try { $("acc-sort").value = data.sort; } catch (_) {}
+      }
+    }
     if (data.pool && statusCache) statusCache.pool = Object.assign({}, statusCache.pool || {}, data.pool);
     // Remember durable store source so UI can show "数据库" instead of auth.json.
     window.__g2aAccountsStore = {
@@ -1653,13 +1685,26 @@ async function exportSelectedAccounts() {
   }
 }
 
+// Fallback bindings when page scripts load outside bindSoftNav rebind path.
 on("acc-page-prev", "onclick", () => { if (accountsPage > 1 && !accountsLoading) { accountsPage--; loadAccountsPage(); } });
 on("acc-page-next", "onclick", () => { if (!accountsLoading && accountsPage < (accountsTotalPages || 1)) { accountsPage++; loadAccountsPage(); } });
 on("acc-page-size", "onchange", () => {
   accountsPageSize = parseInt(($("acc-page-size") && $("acc-page-size").value) || "25", 10) || 25;
   accountsPage = 1;
-  renderAccountsPage();
+  loadAccountsPage({ reset: true });
 });
+if ($("acc-sort") && !$("acc-sort").onchange) {
+  try {
+    const saved = localStorage.getItem("g2a_accounts_sort");
+    if (saved) { accountsSort = saved; $("acc-sort").value = saved; }
+  } catch (_) {}
+  $("acc-sort").onchange = () => {
+    accountsSort = ($("acc-sort").value || "newest");
+    try { localStorage.setItem("g2a_accounts_sort", accountsSort); } catch (_) {}
+    accountsPage = 1;
+    loadAccountsPage({ reset: true });
+  };
+}
 
 if ($("btn-acc-search")) $("btn-acc-search").onclick = () => applyAccountSearch(true);
 if ($("btn-acc-search-clear")) $("btn-acc-search-clear").onclick = () => {
@@ -2661,8 +2706,20 @@ async function pollRegSession() {
     clearInterval(regPollTimer);
     regPollTimer = null;
     try {
+      // Force status/pool totals refresh after registration imports land in DB.
+      _statusFetchedAt = 0;
       statusCache = await api("/status");
+      _statusFetchedAt = Date.now();
+      if (statusCache && statusCache.pool) {
+        dashCache = dashCache || {};
+        dashCache.pool = Object.assign({}, dashCache.pool || {}, statusCache.pool);
+        if (statusCache.accounts) {
+          dashCache.accounts = Object.assign({}, dashCache.accounts || {}, statusCache.accounts);
+        }
+      }
       await loadDashboard();
+      // Accounts page total comes from /accounts — refresh like manual import does.
+      try { await loadAccountsPage({ reset: true }); } catch (_) {}
     } catch (_) {}
   } catch (_) {}
 }
