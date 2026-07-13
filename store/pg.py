@@ -106,6 +106,27 @@ _SCHEMA_MIGRATIONS = (
     "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created_at ON admin_audit_logs (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_action ON admin_audit_logs (action)",
     "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_target ON admin_audit_logs (target_type, target_id)",
+    # Background / long-running task log (registration, SSO import, probe, renew…).
+    """
+    CREATE TABLE IF NOT EXISTS task_logs (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      finished_at TIMESTAMPTZ,
+      kind TEXT NOT NULL,
+      task_id TEXT,
+      status TEXT NOT NULL DEFAULT 'running',
+      summary TEXT,
+      detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ok BOOLEAN,
+      progress_done INTEGER NOT NULL DEFAULT 0,
+      progress_total INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_task_logs_created_at ON task_logs (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_task_logs_kind ON task_logs (kind)",
+    "CREATE INDEX IF NOT EXISTS idx_task_logs_status ON task_logs (status)",
+    "CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs (task_id)",
     # Token / request usage daily rollups (proxy-side analytics).
     """
     CREATE TABLE IF NOT EXISTS usage_daily (

@@ -1024,6 +1024,56 @@ def run_once(*, source: str = "background") -> dict[str, Any]:
             kick_dis += 1
     result["kick_cooldown"] = kick_cd
     result["kick_disabled"] = kick_dis
+    # Durable task log for admin「任务日志」.
+    # Always keep manual probes; for background only log when something happened.
+    if not result.get("deferred_busy"):
+        try:
+            import task_log
+
+            count = int(result.get("count") or 0)
+            available = int(result.get("available_count") or 0)
+            unavailable = int(result.get("unavailable_count") or 0)
+            auto_n = int(result.get("auto_action_count") or 0)
+            is_manual = str(source or "").startswith("manual")
+            meaningful = bool(
+                is_manual
+                or count
+                or auto_n
+                or kick_cd
+                or kick_dis
+                or result.get("pruned_model_blocks")
+                or result.get("ok") is False
+            )
+            if meaningful:
+                summary = (
+                    f"模型探测[{source}]：可用 {available}/{count}"
+                    f" · 冷却踢出 {kick_cd} · 禁用 {kick_dis}"
+                )
+                st = "done"
+                if unavailable and available:
+                    st = "partial"
+                elif unavailable and not available and count:
+                    st = "error"
+                task_log.record(
+                    "probe",
+                    summary=summary,
+                    status=st,
+                    ok=bool(result.get("ok", True)) and (available > 0 or count == 0),
+                    progress_done=available,
+                    progress_total=count,
+                    detail={
+                        "source": source,
+                        "count": count,
+                        "available_count": available,
+                        "unavailable_count": unavailable,
+                        "auto_action_count": auto_n,
+                        "kick_cooldown": kick_cd,
+                        "kick_disabled": kick_dis,
+                        "pruned_model_blocks": result.get("pruned_model_blocks"),
+                    },
+                )
+        except Exception:
+            pass
     # Drop per-account payloads from last_run so /health and admin status stay small.
     slim = {
         k: v

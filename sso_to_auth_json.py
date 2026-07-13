@@ -34,6 +34,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from curl_cffi import requests
 
@@ -81,8 +82,58 @@ def rfc3339_ns(ts: float | None = None) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + ".000000000Z"
 
 
-def request_device_code() -> dict | None:
-    data = urllib.parse.urlencode({"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}).encode()
+def _http_timeout() -> float:
+    try:
+        return max(5.0, float(os.getenv("GROK2API_SSO_HTTP_TIMEOUT", "12") or 12))
+    except (TypeError, ValueError):
+        return 12.0
+
+
+def _poll_interval_sec(raw: Any = None) -> float:
+    """Device-code poll interval after approve.
+
+    Upstream often advertises interval=5, but once the user_code is already
+    approved we can poll immediately / more aggressively. Override with
+    GROK2API_SSO_POLL_INTERVAL (seconds).
+    """
+    env = (os.getenv("GROK2API_SSO_POLL_INTERVAL") or "").strip()
+    if env:
+        try:
+            return max(0.2, min(10.0, float(env)))
+        except ValueError:
+            pass
+    try:
+        hinted = float(raw if raw is not None else 1)
+    except (TypeError, ValueError):
+        hinted = 1.0
+    # Prefer 1s (or the advertised value if already smaller) after approve.
+    return max(0.4, min(hinted, 1.5))
+
+
+def request_device_code(session: Any | None = None) -> dict | None:
+    """Request OIDC device code. Prefer shared curl_cffi session when given."""
+    form = {"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}
+    timeout = _http_timeout()
+    if session is not None:
+        try:
+            r = session.post(
+                f"{OIDC_ISSUER}/oauth2/device/code",
+                data=form,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                impersonate="chrome",
+                timeout=timeout,
+                **_proxy_kwargs(),
+            )
+            if int(getattr(r, "status_code", 0) or 0) >= 400:
+                print(f"  ❌ device/code HTTP {r.status_code}: {(r.text or '')[:200]}")
+                return None
+            data = r.json()
+            return data if isinstance(data, dict) else None
+        except Exception as e:  # noqa: BLE001
+            print(f"  ❌ device/code: {e}")
+            return None
+
+    data = urllib.parse.urlencode(form).encode()
     req = urllib.request.Request(
         f"{OIDC_ISSUER}/oauth2/device/code",
         data=data,
@@ -90,24 +141,77 @@ def request_device_code() -> dict | None:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         print(f"  ❌ device/code HTTP {e.code}: {e.read().decode()[:200]}")
         return None
 
 
-def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 60) -> dict | None:
-    deadline = time.time() + min(expires_in, timeout)
+def poll_token(
+    device_code: str,
+    interval: int | float = 1,
+    expires_in: int = 1800,
+    timeout: int | float = 45,
+    *,
+    session: Any | None = None,
+    immediate: bool = True,
+) -> dict | None:
+    """Exchange an approved device_code for tokens.
+
+    Performance notes:
+    - Poll **immediately** after approve (do not sleep first).
+    - Use a short interval (default ~1s) instead of the upstream 5s hint.
+    - Prefer curl_cffi session when provided (same TLS fingerprint path).
+    """
+    interval_f = _poll_interval_sec(interval)
+    deadline = time.time() + min(float(expires_in or 1800), float(timeout or 45))
+    form = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "client_id": GROK_CLI_CLIENT_ID,
+        "device_code": device_code,
+    }
+    http_timeout = _http_timeout()
+    first = True
     while time.time() < deadline:
-        time.sleep(interval)
-        data = urllib.parse.urlencode(
-            {
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "client_id": GROK_CLI_CLIENT_ID,
-                "device_code": device_code,
-            }
-        ).encode()
+        if not (first and immediate):
+            time.sleep(interval_f)
+        first = False
+
+        if session is not None:
+            try:
+                r = session.post(
+                    f"{OIDC_ISSUER}/oauth2/token",
+                    data=form,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    impersonate="chrome",
+                    timeout=http_timeout,
+                    **_proxy_kwargs(),
+                )
+                code = int(getattr(r, "status_code", 0) or 0)
+                if code < 400:
+                    data = r.json()
+                    return data if isinstance(data, dict) else None
+                try:
+                    err = r.json() if r.content else {}
+                except Exception:
+                    err = {}
+                error = str((err or {}).get("error") or "")
+                if error == "authorization_pending":
+                    continue
+                if error == "slow_down":
+                    interval_f = min(10.0, interval_f + 1.0)
+                    continue
+                print(f"  ❌ token: {error or f'HTTP {code}'}")
+                return None
+            except Exception as e:  # noqa: BLE001
+                # Transient network blip — retry until deadline.
+                if time.time() >= deadline:
+                    print(f"  ❌ token network: {e}")
+                    return None
+                continue
+
+        data = urllib.parse.urlencode(form).encode()
         req = urllib.request.Request(
             f"{OIDC_ISSUER}/oauth2/token",
             data=data,
@@ -115,59 +219,83 @@ def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=http_timeout) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            err = json.loads(e.read())
+            try:
+                err = json.loads(e.read())
+            except Exception:
+                err = {}
             error = err.get("error", "")
             if error == "authorization_pending":
                 continue
             if error == "slow_down":
-                interval += 5
+                interval_f = min(10.0, interval_f + 1.0)
                 continue
             print(f"  ❌ token: {error}")
             return None
+        except Exception as e:  # noqa: BLE001
+            if time.time() >= deadline:
+                print(f"  ❌ token network: {e}")
+                return None
+            continue
     print("  ❌ 轮询超时")
     return None
 
 
-def sso_to_token(sso_cookie: str) -> dict | None:
-    """SSO cookie → token dict (access/refresh/expires_in)"""
+def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
+    """SSO cookie → token dict (access/refresh/expires_in).
+
+    ``quiet=True`` reduces per-account stdout (faster under high concurrency).
+    """
+    log = (lambda *a, **k: None) if quiet else print
     s = requests.Session()
     s.cookies.set("sso", sso_cookie, domain=".x.ai")
+    timeout = _http_timeout()
+    proxy_kw = _proxy_kwargs()
 
     try:
-        r = s.get("https://accounts.x.ai/", impersonate="chrome", timeout=15, **_proxy_kwargs())
+        r = s.get(
+            "https://accounts.x.ai/",
+            impersonate="chrome",
+            timeout=timeout,
+            **proxy_kw,
+        )
     except Exception as e:
-        print(f"  ❌ 网络错误: {e}")
+        log(f"  ❌ 网络错误: {e}")
         return None
     if "sign-in" in r.url or "sign-up" in r.url:
-        print("  ❌ sso 无效")
+        log("  ❌ sso 无效")
         return None
-    print("  ✅ sso 有效")
+    log("  ✅ sso 有效")
 
-    print("  🔑 Device Flow...")
-    dc = request_device_code()
+    log("  🔑 Device Flow...")
+    dc = request_device_code(session=s)
     if not dc:
         return None
-    print(f"  📋 user_code: {dc.get('user_code')}")
+    log(f"  📋 user_code: {dc.get('user_code')}")
 
     try:
-        s.get(dc["verification_uri_complete"], impersonate="chrome", timeout=15, **_proxy_kwargs())
+        s.get(
+            dc["verification_uri_complete"],
+            impersonate="chrome",
+            timeout=timeout,
+            **proxy_kw,
+        )
         r = s.post(
             f"{OIDC_ISSUER}/oauth2/device/verify",
             data={"user_code": dc["user_code"]},
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             impersonate="chrome",
-            timeout=15,
+            timeout=timeout,
             allow_redirects=True,
-            **_proxy_kwargs(),
+            **proxy_kw,
         )
         if "consent" not in r.url:
-            print(f"  ❌ verify 失败: {r.url}")
+            log(f"  ❌ verify 失败: {r.url}")
             return None
     except Exception as e:
-        print(f"  ❌ verify 异常: {e}")
+        log(f"  ❌ verify 异常: {e}")
         return None
 
     try:
@@ -181,26 +309,30 @@ def sso_to_token(sso_cookie: str) -> dict | None:
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             impersonate="chrome",
-            timeout=15,
+            timeout=timeout,
             allow_redirects=True,
-            **_proxy_kwargs(),
+            **proxy_kw,
         )
         if "done" not in r.url:
-            print(f"  ❌ approve 失败: {r.url}")
+            log(f"  ❌ approve 失败: {r.url}")
             return None
-        print("  ✅ 授权确认")
+        log("  ✅ 授权确认")
     except Exception as e:
-        print(f"  ❌ approve 异常: {e}")
+        log(f"  ❌ approve 异常: {e}")
         return None
 
+    # Approve already happened — poll immediately with a short interval.
     token = poll_token(
         dc["device_code"],
-        dc.get("interval", 5),
+        dc.get("interval", 1),
         dc.get("expires_in", 1800),
+        timeout=float(os.getenv("GROK2API_SSO_POLL_TIMEOUT", "45") or 45),
+        session=s,
+        immediate=True,
     )
     if not token:
         return None
-    print(
+    log(
         f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
         + (" + refresh_token" if token.get("refresh_token") else "")
     )

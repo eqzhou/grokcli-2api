@@ -64,8 +64,10 @@ PUBLIC_BASE_URL = (
 # Legacy single key (still accepted if set). Prefer managed keys in data/keys.json
 API_KEY = os.getenv("GROK2API_API_KEY", "")
 
-# Admin console password (required for /admin APIs & web when set).
-# If empty, first-time setup can create one stored in data/settings.json
+# Admin console password bootstrap only.
+# Live auth uses the durable password hash in PostgreSQL (hybrid) or
+# settings.json (file mode). GROK2API_ADMIN_PASSWORD is imported into the
+# store once when no hash exists yet; it is NOT a parallel live password.
 ADMIN_PASSWORD = os.getenv("GROK2API_ADMIN_PASSWORD", "")
 
 # Upstream cli-chat-proxy (session-token compatible endpoint)
@@ -153,7 +155,8 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
 TOKEN_REFRESH_WORKERS = _env_int("GROK2API_TOKEN_REFRESH_WORKERS", 4, maximum=32)
 MODEL_PROBE_WORKERS = _env_int("GROK2API_MODEL_PROBE_WORKERS", 4, maximum=32)
 QUOTA_WORKERS = _env_int("GROK2API_QUOTA_WORKERS", 6, maximum=32)
-SSO_IMPORT_WORKERS = _env_int("GROK2API_SSO_IMPORT_WORKERS", 6, maximum=32)
+# SSO cookie → token is network-bound device flow; 8–16 works well on hybrid stacks.
+SSO_IMPORT_WORKERS = _env_int("GROK2API_SSO_IMPORT_WORKERS", 12, maximum=32)
 # Startup stagger: first background cycle waits longer with large pools
 TOKEN_MAINTAIN_STARTUP_DELAY = _env_float(
     "GROK2API_TOKEN_MAINTAIN_STARTUP_DELAY", 20.0, minimum=5.0

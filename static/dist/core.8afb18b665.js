@@ -176,7 +176,7 @@ const PAGE_META = {
   keys: { title: "API Keys", sub: "创建、复制、停用客户端访问密钥" },
   accounts: { title: "账号 / 轮询", sub: "Grok 账号、设备码登录、额度与导入导出" },
   usage: { title: "用量", sub: "Token 消耗与请求使用情况（今日 / 近 N 天 / 累计）" },
-  logs: { title: "日志", sub: "查询系统与管理台日志（登录、账号、Key、探测、冷却、设置等）" },
+  logs: { title: "任务日志", sub: "查询后台任务结果（协议注册、SSO 导入、测活、Token 续期等）" },
   models: { title: "模型", sub: "上游模型缓存与探测结果" },
   settings: { title: "系统设置", sub: "修改管理员密码、轮询策略与 sub2api / 维护参数" },
   guide: { title: "接入指南", sub: "OpenAI / Anthropic 客户端配置示例" },
@@ -612,19 +612,7 @@ function rebindPageControls() {
   on("btn-copy-device", "onclick", () => copyDeviceCode());
   on("btn-import", "onclick", () => importJsonFiles());
   on("btn-import-sso", "onclick", () => importSsoCookies());
-  if ($("btn-export")) on("btn-export", "onclick", async () => {
-    try {
-      const res = await fetch("/admin/api/accounts/export?download=1", { credentials: "same-origin", headers: headers(false) });
-      if (!res.ok) throw new Error(res.statusText);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = "grok2api-auth-export.json";
-      document.body.appendChild(a); a.click(); a.remove();
-      URL.revokeObjectURL(url);
-      toast("已导出 auth.json");
-    } catch (e) { toast(e.message, false); }
-  });
+  if ($("btn-export")) on("btn-export", "onclick", () => exportAllAccounts());
   on("btn-logout-cli", "onclick", async () => {
     if (!confirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）")) return;
     try {
@@ -1723,37 +1711,11 @@ async function exportSelectedAccounts() {
     toast("请先勾选要导出的账号", false);
     return;
   }
-  try {
-    const res = await fetch("/admin/api/accounts/export-batch?download=1", {
-      method: "POST",
-      headers: headers(true),
-      body: JSON.stringify({ ids, include_secrets: true }),
-    });
-    if (!res.ok) {
-      let msg = res.statusText;
-      try {
-        const d = await res.json();
-        msg = d.detail || d.error || msg;
-      } catch {}
-      throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
-    }
-    const blob = await res.blob();
-    const cd = res.headers.get("Content-Disposition") || "";
-    let filename = `grok2api-auth-export-selected-${ids.length}.json`;
-    const m = /filename=\"?([^\";]+)\"?/.exec(cd);
-    if (m) filename = m[1];
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    toast(`已导出选中 ${ids.length} 个账号`);
-  } catch (e) {
-    toast(e.message, false);
-  }
+  return runJsonExportJob({
+    mode: "selected",
+    ids,
+    buttonId: "btn-acc-export-selected",
+  });
 }
 
 // Fallback bindings when page scripts load outside bindSoftNav rebind path.
@@ -2488,7 +2450,6 @@ function readRegConfig() {
       mailProvider === "moemail"
         ? ($("reg-base-url") ? $("reg-base-url").value.trim() : "")
         : "",
-    prefix: $("reg-prefix") ? $("reg-prefix").value.trim() : "",
     domain: activeDomain,
     moemail_domain: regMailDomains.moemail || "",
     yyds_domain: regMailDomains.yyds || "",
@@ -2511,6 +2472,9 @@ function readRegConfig() {
     count: $("reg-count") ? $("reg-count").value.trim() : "1",
     concurrency: $("reg-concurrency") ? $("reg-concurrency").value.trim() : "5",
     stagger_ms: $("reg-stagger-ms") ? $("reg-stagger-ms").value.trim() : "300",
+    probe_delay_sec: $("reg-probe-delay-sec")
+      ? $("reg-probe-delay-sec").value.trim()
+      : "30",
   };
 }
 // MoeMail official EXPIRY_OPTIONS only:
@@ -2595,7 +2559,6 @@ function applyRegConfig(cfg) {
   if ($("reg-base-url")) {
     $("reg-base-url").value = mailProv === "moemail" ? (cfg.base_url || "") : "";
   }
-  if ($("reg-prefix")) $("reg-prefix").value = cfg.prefix || "";
   if ($("reg-domain")) {
     $("reg-domain").value = regMailDomains[mailProv] || "";
     try { $("reg-domain").setAttribute("autocomplete", "off"); } catch (_) {}
@@ -2622,6 +2585,12 @@ function applyRegConfig(cfg) {
   if ($("reg-count")) $("reg-count").value = cfg.count != null ? String(cfg.count) : "1";
   if ($("reg-concurrency")) $("reg-concurrency").value = cfg.concurrency != null ? String(cfg.concurrency) : "5";
   if ($("reg-stagger-ms")) $("reg-stagger-ms").value = cfg.stagger_ms != null ? String(cfg.stagger_ms) : "300";
+  if ($("reg-probe-delay-sec")) {
+    const pd = cfg.probe_delay_sec != null ? Number(cfg.probe_delay_sec) : 30;
+    $("reg-probe-delay-sec").value = String(
+      Number.isFinite(pd) ? Math.max(0, Math.min(600, Math.floor(pd))) : 30
+    );
+  }
   syncRegCaptchaProviderUI();
   syncRegMailProviderUI();
   regConfigCache = Object.assign({}, cfg);
@@ -2730,7 +2699,6 @@ function buildRegBody(config) {
   if (body.mail_provider === "moemail" && config.base_url) {
     body.base_url = config.base_url;
   }
-  if (config.prefix) body.prefix = config.prefix;
   // Always send domain for the active provider (empty clears/auto).
   body.domain = config.domain == null ? "" : String(config.domain);
   // Always send an official MoeMail preset (including permanent=0).
@@ -2769,11 +2737,27 @@ function buildRegBody(config) {
   const count = Number.parseInt(config.count || "1", 10);
   const concurrency = Number.parseInt(config.concurrency || "5", 10);
   const stagger = Number.parseInt(config.stagger_ms || "300", 10);
+  const probeDelay = Number.parseInt(config.probe_delay_sec || "30", 10);
   if (Number.isFinite(count) && count > 0) body.count = Math.floor(count);
   // threads / concurrency: real in-flight registration cap (3 => 3 at a time)
   if (Number.isFinite(concurrency) && concurrency > 0) body.concurrency = Math.min(10, Math.max(1, Math.floor(concurrency)));
   if (Number.isFinite(stagger) && stagger >= 0) body.stagger_ms = Math.min(10000, Math.floor(stagger));
+  if (Number.isFinite(probeDelay) && probeDelay >= 0) {
+    body.probe_delay_sec = Math.min(600, Math.max(0, Math.floor(probeDelay)));
+  }
   return body;
+}
+
+function getRegProbeDelaySec() {
+  // Prefer current form value, then cached config, then 30s default.
+  const raw = $("reg-probe-delay-sec")
+    ? $("reg-probe-delay-sec").value
+    : (regConfigCache && regConfigCache.probe_delay_sec != null
+      ? regConfigCache.probe_delay_sec
+      : 30);
+  const n = Number.parseInt(String(raw ?? "30"), 10);
+  if (!Number.isFinite(n) || n < 0) return 30;
+  return Math.min(600, Math.max(0, n));
 }
 function buildProxyTestBody(config) {
   const body = {};
@@ -3184,8 +3168,11 @@ async function pollRegSession() {
     );
     if (!regStopping && needProbe.length && !backendProbed && !regProbeRunning) {
       // Fire and continue polling; probe results append to log.
-      // New registrations: wait 30s before first health probe.
-      probeImportedAccounts(needProbe, { sessions, delaySec: 30 }).catch(() => {});
+      // New registrations: wait probe_delay_sec before first health probe.
+      probeImportedAccounts(needProbe, {
+        sessions,
+        delaySec: getRegProbeDelaySec(),
+      }).catch(() => {});
     } else if (backendProbed) {
       for (const id of importedIds) regProbedIds.add(id);
     }
@@ -3545,6 +3532,234 @@ on("btn-save-mode", "onclick", async () => {  try {
 
 
 
+function showJsonIoProgress(show) {
+  const wrap = $("json-io-progress-wrap");
+  if (!wrap) return;
+  if (show) {
+    wrap.classList.remove("hidden", "is-done", "is-error");
+    wrap.hidden = false;
+  } else {
+    wrap.classList.add("hidden");
+    wrap.hidden = true;
+  }
+}
+
+function setJsonIoProgress({
+  percent = 0,
+  label = "",
+  detail = "",
+  done = null,
+  total = null,
+  success = null,
+  fail = null,
+  status = "",
+} = {}) {
+  const pct = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  const fill = $("json-io-progress-fill");
+  const bar = $("json-io-progress-bar");
+  const pctEl = $("json-io-progress-pct");
+  const labelEl = $("json-io-progress-label");
+  const detailEl = $("json-io-progress-detail");
+  const wrap = $("json-io-progress-wrap");
+  if (fill) fill.style.width = pct + "%";
+  if (bar) bar.setAttribute("aria-valuenow", String(pct));
+  if (pctEl) pctEl.textContent = pct + "%";
+  if (labelEl) labelEl.textContent = label || "处理中…";
+  if (detailEl) {
+    const parts = [];
+    if (detail) parts.push(String(detail));
+    if (total != null) {
+      parts.push(
+        `进度 ${done != null ? done : 0}/${total}` +
+          (success != null || fail != null
+            ? ` · 成功 ${success || 0} · 失败 ${fail || 0}`
+            : "")
+      );
+    }
+    detailEl.textContent = parts.filter(Boolean).join(" · ") || "—";
+  }
+  if (wrap) {
+    wrap.classList.toggle("is-done", status === "done" || status === "partial");
+    wrap.classList.toggle("is-error", status === "error");
+  }
+}
+
+async function pollJsonIoJob(jobId, { kind = "import", totalHint = 0 } = {}) {
+  const path =
+    kind === "export"
+      ? "/accounts/export/jobs/" + encodeURIComponent(jobId)
+      : "/accounts/import-files/jobs/" + encodeURIComponent(jobId);
+  const job = await api(path);
+  const status = String(job.status || "");
+  const total = Number(job.total || totalHint || 0) || 0;
+  const done = Number(job.done || 0) || 0;
+  const success = Number(job.success != null ? job.success : job.count || 0) || 0;
+  const fail = Number(job.fail || job.parse_errors || 0) || 0;
+  const percent = Number(
+    job.percent != null ? job.percent : total ? (100 * done) / total : 0
+  );
+  setJsonIoProgress({
+    percent,
+    label: job.message || (status === "done" ? "完成" : "处理中…"),
+    detail: job.phase ? `阶段: ${job.phase}` : "",
+    done,
+    total,
+    success,
+    fail,
+    status,
+  });
+  const meta = (job.file_meta || [])
+    .map((x) => {
+      if (!x) return "";
+      return `${x.ok === false ? "❌" : "✅"} ${x.filename || "file"}${x.error ? " · " + x.error : ""}`;
+    })
+    .filter(Boolean);
+  setLogPanel(
+    "json-io-result",
+    [job.message || "", meta.length ? meta.join("\n") : ""].filter(Boolean).join("\n") || "—",
+    { forceShow: true }
+  );
+  return job;
+}
+
+async function waitJsonIoJob(jobId, { kind = "import", totalHint = 0, maxWaitMs = 300000 } = {}) {
+  const startedAt = Date.now();
+  let finalJob = null;
+  while (Date.now() - startedAt < maxWaitMs) {
+    try {
+      finalJob = await pollJsonIoJob(jobId, { kind, totalHint });
+    } catch (e) {
+      setLogPanel(
+        "json-io-result",
+        `进度查询暂时失败: ${(e && e.message) || e}\n将继续重试…`,
+        { forceShow: true }
+      );
+    }
+    const st = String((finalJob && finalJob.status) || "");
+    if (st === "done" || st === "partial" || st === "error") break;
+    await new Promise((resolve) => setTimeout(resolve, 700));
+  }
+  return finalJob;
+}
+
+async function downloadExportJob(jobId, fallbackName) {
+  const res = await fetch(
+    "/admin/api/accounts/export/jobs/" + encodeURIComponent(jobId) + "/download",
+    { credentials: "same-origin", headers: headers(false) }
+  );
+  if (!res.ok) {
+    let msg = res.statusText;
+    try {
+      const d = await res.json();
+      msg = d.detail || d.error || msg;
+    } catch (_) {}
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+  }
+  const blob = await res.blob();
+  const cd = res.headers.get("Content-Disposition") || "";
+  let filename = fallbackName || "grok2api-auth-export.json";
+  const m = /filename=\"?([^\";]+)\"?/.exec(cd);
+  if (m) filename = m[1];
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  return filename;
+}
+
+async function runJsonExportJob({ mode = "all", ids = [], buttonId = "btn-export" } = {}) {
+  const btn = $(buttonId);
+  const selectedN = Array.isArray(ids) ? ids.length : 0;
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = mode === "selected" ? `导出中 0/${selectedN}` : "导出中…";
+  }
+  showJsonIoProgress(true);
+  setJsonIoProgress({
+    percent: 0,
+    label: mode === "selected" ? `开始导出选中 ${selectedN} 个账号…` : "开始导出全部账号…",
+    detail: "提交任务中",
+    done: 0,
+    total: mode === "selected" ? selectedN : 1,
+    success: 0,
+    fail: 0,
+    status: "queued",
+  });
+  setLogPanel("json-io-result", "提交导出任务…", { forceShow: true });
+  try {
+    let started;
+    if (mode === "selected") {
+      started = await api("/accounts/export-batch?async_job=1", {
+        method: "POST",
+        body: JSON.stringify({ ids, include_secrets: true }),
+      });
+    } else {
+      started = await api("/accounts/export?async_job=1");
+    }
+    const jobId = started && started.job_id;
+    if (!jobId) throw new Error("未返回 job_id，无法跟踪导出进度");
+    setJsonIoProgress({
+      percent: 5,
+      label: started.message || "任务已启动",
+      detail: `job_id: ${jobId}`,
+      done: 0,
+      total: started.total || (mode === "selected" ? selectedN : 1),
+      status: "queued",
+    });
+    const finalJob = await waitJsonIoJob(jobId, {
+      kind: "export",
+      totalHint: started.total || selectedN || 1,
+      maxWaitMs: Math.max(120000, (selectedN || 50) * 2000),
+    });
+    if (!finalJob || (finalJob.status !== "done" && finalJob.status !== "partial")) {
+      throw new Error((finalJob && (finalJob.error || finalJob.message)) || "导出超时或失败");
+    }
+    if (finalJob.status === "error") {
+      throw new Error(finalJob.error || finalJob.message || "导出失败");
+    }
+    const filename = await downloadExportJob(
+      jobId,
+      finalJob.filename ||
+        (mode === "selected"
+          ? `grok2api-auth-export-selected-${selectedN}.json`
+          : "grok2api-auth-export.json")
+    );
+    setJsonIoProgress({
+      percent: 100,
+      label: finalJob.message || "导出完成",
+      detail: filename,
+      done: finalJob.count || selectedN || 0,
+      total: finalJob.count || selectedN || 0,
+      success: finalJob.count || 0,
+      fail: 0,
+      status: "done",
+    });
+    toast(finalJob.message || `已导出 ${finalJob.count || selectedN || ""} 个账号`);
+  } catch (e) {
+    setJsonIoProgress({
+      percent: 100,
+      label: "导出失败",
+      detail: (e && e.message) || String(e),
+      status: "error",
+    });
+    toast((e && e.message) || "导出失败", false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || (mode === "selected" ? "导出选中" : "导出全部");
+    }
+  }
+}
+
+async function exportAllAccounts() {
+  return runJsonExportJob({ mode: "all", buttonId: "btn-export" });
+}
+
 async function importJsonFiles() {
   const input = $("import-file");
   const files = input && input.files;
@@ -3556,43 +3771,137 @@ async function importJsonFiles() {
     if (!btn.dataset.label) btn.dataset.label = btn.textContent;
     btn.textContent = files.length > 1 ? `导入中 0/${files.length}` : "导入中…";
   }
+  showJsonIoProgress(true);
+  setJsonIoProgress({
+    percent: 0,
+    label: `开始导入 ${files.length} 个 JSON…`,
+    detail: "提交任务中",
+    done: 0,
+    total: files.length,
+    success: 0,
+    fail: 0,
+    status: "queued",
+  });
+  setLogPanel("json-io-result", `开始导入 ${files.length} 个 JSON…\n提交后台任务…`, { forceShow: true });
   try {
     const fd = new FormData();
     for (let i = 0; i < files.length; i++) fd.append("files", files[i]);
     fd.append("merge", merge);
-    let r;
+    let started;
     try {
-      r = await api("/accounts/import-files", { method: "POST", body: fd });
+      started = await api("/accounts/import-files", { method: "POST", body: fd });
     } catch (e) {
+      // Fallback: sequential single-file jobs (older backend without bulk async).
       let totalImported = 0, totalFailed = 0, lastMessage = "";
       for (let i = 0; i < files.length; i++) {
         if (btn) btn.textContent = `导入中 ${i + 1}/${files.length}`;
+        setJsonIoProgress({
+          percent: Math.round((100 * i) / files.length),
+          label: `导入中 ${i + 1}/${files.length}`,
+          detail: files[i].name,
+          done: i,
+          total: files.length,
+          success: totalImported,
+          fail: totalFailed,
+          status: "running",
+        });
         const f = files[i];
         try {
           const one = new FormData();
           one.append("file", f);
           one.append("merge", merge);
           const rr = await api("/accounts/import-file", { method: "POST", body: one });
-          totalImported += rr.imported?.length || rr.count || 0;
-          lastMessage = rr.message || `已导入 ${rr.imported?.length || 0} 个账号`;
+          if (rr && rr.job_id) {
+            const job = await waitJsonIoJob(rr.job_id, {
+              kind: "import",
+              totalHint: 1,
+              maxWaitMs: 180000,
+            });
+            totalImported += Number((job && job.count) || 0);
+            if (job && (job.status === "error" || job.ok === false)) totalFailed++;
+            lastMessage = (job && job.message) || lastMessage;
+          } else {
+            totalImported += rr.imported?.length || rr.count || 0;
+            lastMessage = rr.message || `已导入 ${rr.imported?.length || 0} 个账号`;
+          }
         } catch (err) {
           totalFailed++;
           toast(`${f.name}: ${err.message}`, false);
         }
       }
+      setJsonIoProgress({
+        percent: 100,
+        label: totalFailed ? "导入完成（有失败）" : "导入完成",
+        done: files.length,
+        total: files.length,
+        success: totalImported,
+        fail: totalFailed,
+        status: totalFailed ? "partial" : "done",
+      });
       toast(files.length > 1 ? `批量导入完成：${totalImported} 账号，${totalFailed} 文件失败` : (lastMessage || `已导入 ${totalImported} 个账号`), totalFailed === 0);
       if (input) input.value = "";
       if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
       try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
       return;
     }
-    const count = r.count || r.imported?.length || 0;
-    const parseErrors = r.parse_errors || 0;
-    toast(r.message || `导入完成：${count} 个账号` + (parseErrors ? `，${parseErrors} 个文件失败` : ""), parseErrors === 0);
+
+    // Sync response (old backend): no job_id.
+    if (!started.job_id) {
+      const count = started.count || started.imported?.length || 0;
+      const parseErrors = started.parse_errors || 0;
+      setJsonIoProgress({
+        percent: 100,
+        label: started.message || "导入完成",
+        done: files.length,
+        total: files.length,
+        success: count,
+        fail: parseErrors,
+        status: parseErrors ? "partial" : "done",
+      });
+      toast(started.message || `导入完成：${count} 个账号` + (parseErrors ? `，${parseErrors} 个文件失败` : ""), parseErrors === 0);
+      if (input) input.value = "";
+      if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+      try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+      return;
+    }
+
+    const jobId = started.job_id;
+    if (btn) btn.textContent = `导入中 0/${started.total || files.length}`;
+    setJsonIoProgress({
+      percent: 0,
+      label: started.message || "任务已启动",
+      detail: `job_id: ${jobId}`,
+      done: 0,
+      total: started.total || files.length,
+      success: 0,
+      fail: 0,
+      status: "queued",
+    });
+    const finalJob = await waitJsonIoJob(jobId, {
+      kind: "import",
+      totalHint: started.total || files.length,
+      maxWaitMs: Math.max(120000, files.length * 30000),
+    });
+    if (!finalJob) throw new Error("导入超时，未拿到任务结果");
+    const st = String(finalJob.status || "");
+    if (st === "error") {
+      throw new Error(finalJob.error || finalJob.message || "导入失败");
+    }
+    if (btn) btn.textContent = `导入中 ${finalJob.done || files.length}/${finalJob.total || files.length}`;
+    toast(
+      finalJob.message || `导入完成：${finalJob.count || 0} 个账号`,
+      st !== "error" && !(finalJob.fail > 0 && !(finalJob.count > 0))
+    );
     if (input) input.value = "";
     if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
     try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
   } catch (e) {
+    setJsonIoProgress({
+      percent: 100,
+      label: "导入失败",
+      detail: (e && e.message) || String(e),
+      status: "error",
+    });
     toast(e.message || "导入失败", false);
   } finally {
     if (btn) {
@@ -3600,6 +3909,114 @@ async function importJsonFiles() {
       btn.textContent = btn.dataset.label || "导入文件";
     }
   }
+}
+
+let ssoImportPollTimer = null;
+let ssoImportJobId = null;
+
+function showSsoProgress(show) {
+  const wrap = $("sso-progress-wrap");
+  if (!wrap) return;
+  if (show) {
+    wrap.classList.remove("hidden", "is-done", "is-error");
+    wrap.hidden = false;
+  } else {
+    wrap.classList.add("hidden");
+    wrap.hidden = true;
+  }
+}
+
+function setSsoProgress({
+  percent = 0,
+  label = "",
+  detail = "",
+  done = null,
+  total = null,
+  success = null,
+  fail = null,
+  status = "",
+} = {}) {
+  const pct = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  const fill = $("sso-progress-fill");
+  const bar = $("sso-progress-bar");
+  const pctEl = $("sso-progress-pct");
+  const labelEl = $("sso-progress-label");
+  const detailEl = $("sso-progress-detail");
+  const wrap = $("sso-progress-wrap");
+  if (fill) fill.style.width = pct + "%";
+  if (bar) bar.setAttribute("aria-valuenow", String(pct));
+  if (pctEl) pctEl.textContent = pct + "%";
+  if (labelEl) labelEl.textContent = label || "SSO 导入中…";
+  if (detailEl) {
+    const parts = [];
+    if (detail) parts.push(String(detail));
+    if (total != null) {
+      parts.push(
+        `进度 ${done != null ? done : 0}/${total}` +
+          (success != null || fail != null
+            ? ` · 成功 ${success || 0} · 失败 ${fail || 0}`
+            : "")
+      );
+    }
+    detailEl.textContent = parts.filter(Boolean).join(" · ") || "—";
+  }
+  if (wrap) {
+    wrap.classList.toggle("is-done", status === "done");
+    wrap.classList.toggle("is-error", status === "error");
+  }
+}
+
+function formatSsoResultRows(results) {
+  return (results || []).map((x) => {
+    const st = String(x.status || "");
+    const ok = st === "ok";
+    const converted = st === "converted";
+    const icon = ok ? "✅" : converted ? "🔄" : "❌";
+    const meta = ok
+      ? `${x.email || x.user_id || ""} ${x.has_refresh_token ? "+refresh" : ""}`.trim()
+      : converted
+        ? `${x.email || ""} 已转换，等待入库`.trim()
+        : (x.error || st || "");
+    return `[${x.index ?? "?"}] ${icon} ${x.sso_hint || ""} ${meta}`.trim();
+  });
+}
+
+function stopSsoImportPolling() {
+  try { clearInterval(ssoImportPollTimer); } catch (_) {}
+  ssoImportPollTimer = null;
+}
+
+async function pollSsoImportJob(jobId, { totalHint = 0 } = {}) {
+  if (!jobId) return null;
+  const job = await api("/accounts/import-sso/jobs/" + encodeURIComponent(jobId));
+  const status = String(job.status || "");
+  const total = Number(job.total || totalHint || 0) || 0;
+  const done = Number(job.done || 0) || 0;
+  const success = Number(job.success || 0) || 0;
+  const fail = Number(job.fail || 0) || 0;
+  const percent = Number(job.percent != null ? job.percent : (total ? (100 * done) / total : 0));
+  setSsoProgress({
+    percent,
+    label: job.message || (status === "done" ? "SSO 导入完成" : "SSO 导入中…"),
+    detail: job.phase ? `阶段: ${job.phase}` : "",
+    done,
+    total,
+    success,
+    fail,
+    status,
+  });
+  const btn = $("btn-import-sso");
+  if (btn && status !== "done" && status !== "error") {
+    btn.textContent = total ? `导入中 ${done}/${total}` : "导入中…";
+  }
+  const rows = formatSsoResultRows(job.results || []);
+  const head = job.message || `SSO 导入 ${done}/${total || "?"}`;
+  setLogPanel(
+    "sso-result",
+    [head, rows.length ? rows.join("\n") : "（等待转换结果…）"].join("\n"),
+    { forceShow: true }
+  );
+  return job;
 }
 
 async function importSsoCookies() {
@@ -3616,38 +4033,138 @@ async function importSsoCookies() {
   const delay = parseInt(($("sso-delay") && $("sso-delay").value) || "0", 10) || 0;
   const merge = !!($("sso-merge") && $("sso-merge").checked);
   const btn = $("btn-import-sso");
+  stopSsoImportPolling();
+  ssoImportJobId = null;
   if (btn) {
     btn.disabled = true;
     if (!btn.dataset.label) btn.dataset.label = btn.textContent;
     btn.textContent = `导入中 0/${lines.length}`;
   }
-  setLogPanel("sso-result", `开始导入 ${lines.length} 条 SSO…\n并发转换中，请稍候`, { forceShow: true });
+  showSsoProgress(true);
+  setSsoProgress({
+    percent: 0,
+    label: `开始导入 ${lines.length} 条 SSO…`,
+    detail: "提交任务中",
+    done: 0,
+    total: lines.length,
+    success: 0,
+    fail: 0,
+    status: "queued",
+  });
+  setLogPanel("sso-result", `开始导入 ${lines.length} 条 SSO…\n提交后台任务…`, { forceShow: true });
   try {
-    // send progress-friendly max_workers; backend will cap
-    const r = await api("/accounts/import-sso", {
+    // Async job + progress polling (backend caps workers).
+    const started = await api("/accounts/import-sso", {
       method: "POST",
       body: JSON.stringify({
         sso_cookies: lines,
         merge,
         delay,
-        max_workers: delay >= 2 ? 2 : 6,
+        // Higher concurrency; backend still caps via GROK2API_SSO_IMPORT_WORKERS.
+        max_workers: delay >= 5 ? 4 : 12,
       }),
     });
-    const rows = (r.results || []).map((x) => {
-      const ok = x.status === "ok";
-      const meta = ok ? `${x.email || x.user_id || ""} ${x.has_refresh_token ? "+refresh" : ""}` : (x.error || "");
-      return `[${x.index}] ${ok ? "✅" : "❌"} ${x.sso_hint || ""} ${meta}`;
+
+    // Backward-compat: old sync response already has results.
+    if (!started.job_id && Array.isArray(started.results)) {
+      const rows = formatSsoResultRows(started.results || []);
+      setSsoProgress({
+        percent: 100,
+        label: started.message || "SSO 导入完成",
+        done: started.total || lines.length,
+        total: started.total || lines.length,
+        success: started.success || 0,
+        fail: started.fail || 0,
+        status: started.ok === false ? "error" : "done",
+      });
+      setLogPanel("sso-result", `${started.message || ""}\n${rows.join("\n")}`, { forceShow: true });
+      toast(started.message || `SSO 导入完成：${started.success || 0}/${started.total || lines.length}`, !!started.ok);
+      if (ta) ta.value = "";
+      if (fileInput) fileInput.value = "";
+      if ($("sso-file-name")) $("sso-file-name").textContent = "未选择文件";
+      try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+      return;
+    }
+
+    const jobId = started.job_id;
+    if (!jobId) throw new Error("未返回 job_id，无法跟踪进度");
+    ssoImportJobId = jobId;
+    setSsoProgress({
+      percent: 0,
+      label: started.message || "任务已启动",
+      detail: `job_id: ${jobId}`,
+      done: 0,
+      total: started.total || lines.length,
+      success: 0,
+      fail: 0,
+      status: "queued",
     });
-    setLogPanel("sso-result", `${r.message || ""}\n${rows.join("\n")}`, { forceShow: true });
-    toast(r.message || `SSO 导入完成：${r.success || 0}/${r.total || lines.length}`, !!r.ok);
-    if (ta) ta.value = "";
-    if (fileInput) fileInput.value = "";
-    if ($("sso-file-name")) $("sso-file-name").textContent = "未选择文件";
-    try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+
+    // Poll until terminal. Use timeout so a hung job doesn't lock the button forever.
+    const startedAt = Date.now();
+    const maxWaitMs = Math.max(120000, lines.length * 45000);
+    let finalJob = null;
+    while (Date.now() - startedAt < maxWaitMs) {
+      try {
+        finalJob = await pollSsoImportJob(jobId, { totalHint: lines.length });
+      } catch (e) {
+        // Transient poll errors: keep trying briefly.
+        setLogPanel(
+          "sso-result",
+          `进度查询暂时失败: ${(e && e.message) || e}\n将继续重试…`,
+          { forceShow: true }
+        );
+      }
+      const st = String((finalJob && finalJob.status) || "");
+      if (st === "done" || st === "error") break;
+      await new Promise((resolve) => setTimeout(resolve, 900));
+    }
+
+    if (!finalJob || (finalJob.status !== "done" && finalJob.status !== "error")) {
+      // One last fetch
+      try { finalJob = await pollSsoImportJob(jobId, { totalHint: lines.length }); } catch (_) {}
+    }
+
+    const st = String((finalJob && finalJob.status) || "");
+    if (st !== "done" && st !== "error") {
+      throw new Error("SSO 导入超时，请稍后刷新账号列表确认是否已部分入库");
+    }
+
+    const rows = formatSsoResultRows((finalJob && finalJob.results) || []);
+    const msg =
+      (finalJob && finalJob.message) ||
+      `SSO 导入完成：${finalJob.success || 0} 成功, ${finalJob.fail || 0} 失败`;
+    setSsoProgress({
+      percent: 100,
+      label: msg,
+      detail: finalJob.job_id ? `job_id: ${finalJob.job_id}` : "",
+      done: finalJob.total || lines.length,
+      total: finalJob.total || lines.length,
+      success: finalJob.success || 0,
+      fail: finalJob.fail || 0,
+      status: st === "error" ? "error" : "done",
+    });
+    setLogPanel("sso-result", `${msg}\n${rows.join("\n")}`, { forceShow: true });
+    toast(msg, st === "done" && !(finalJob.fail > 0 && finalJob.success === 0));
+    if (st === "done") {
+      if (ta) ta.value = "";
+      if (fileInput) fileInput.value = "";
+      if ($("sso-file-name")) $("sso-file-name").textContent = "未选择文件";
+      try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
+    }
   } catch (e) {
+    showSsoProgress(true);
+    setSsoProgress({
+      percent: 0,
+      label: "SSO 导入失败",
+      detail: (e && e.message) || String(e),
+      status: "error",
+    });
     setLogPanel("sso-result", "导入失败: " + (e.message || e), { forceShow: true });
     toast(e.message || "SSO 导入失败", false);
   } finally {
+    stopSsoImportPolling();
+    ssoImportJobId = null;
     if (btn) {
       btn.disabled = false;
       btn.textContent = btn.dataset.label || "导入 SSO";
@@ -3828,34 +4345,7 @@ if ($("sso-file")) {
   });
 }
 if ($("btn-export")) {
-  on("btn-export", "onclick", async () => {    try {
-      const res = await fetch("/admin/api/accounts/export?download=1", {
-        headers: headers(false),
-      });
-      if (!res.ok) {
-        let msg = res.statusText;
-        try {
-          const d = await res.json();
-          msg = d.detail || d.error || msg;
-        } catch {}
-        throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
-      }
-      const blob = await res.blob();
-      const cd = res.headers.get("Content-Disposition") || "";
-      let filename = "grok2api-auth-export.json";
-      const m = /filename=\"?([^\";]+)\"?/.exec(cd);
-      if (m) filename = m[1];
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      toast("已导出 auth.json");
-    } catch (e) { toast(e.message, false); }
-  });
+  on("btn-export", "onclick", () => exportAllAccounts());
 }
 
 on("btn-refresh-acc", "onclick", async () => {  try {
@@ -3903,8 +4393,12 @@ function fillSystemSettingsForm(s) {
   if ($("set-max-failover") && pol.max_failover_attempts != null) $("set-max-failover").value = pol.max_failover_attempts;
   const pill = $("pwd-env-pill");
   if (pill) {
-    if (s.admin_password_from_env) {
-      pill.textContent = "环境变量密码生效";
+    if (s.admin_password_in_store || (s.has_admin_password && !s.admin_password_from_env)) {
+      pill.textContent = "数据库密码";
+      pill.className = "g2a-tag";
+    } else if (s.admin_password_from_env) {
+      // First-boot only: env still the only source before seed/setup.
+      pill.textContent = "待写入数据库";
       pill.className = "g2a-tag g2a-tag-warn";
     } else {
       pill.textContent = s.has_admin_password ? "已设置密码" : "未设置";
@@ -4525,12 +5019,31 @@ async function loadUsage() {
   }
 }
 
-/* ── Admin operation logs ───────────────────────────── */
+/* ── Admin task logs ────────────────────────────────── */
 let logsPage = 1;
 let logsPageSize = 50;
 let logsTotalPages = 1;
 let logsLoading = false;
 let logsLoadSeq = 0;
+
+function taskStatusTag(status, ok) {
+  const st = String(status || "").toLowerCase();
+  if (st === "error" || st === "failed" || ok === false) {
+    return '<span class="g2a-tag bad">失败</span>';
+  }
+  if (st === "partial") return '<span class="g2a-tag warn">部分</span>';
+  if (st === "cancelled" || st === "stopped") return '<span class="g2a-tag">取消</span>';
+  if (st === "running" || st === "queued") return '<span class="g2a-tag">进行中</span>';
+  return '<span class="g2a-tag ok">成功</span>';
+}
+
+function taskProgressText(it) {
+  const done = Number(it.progress_done || 0) || 0;
+  const total = Number(it.progress_total || 0) || 0;
+  if (total > 0) return `${done}/${total}`;
+  if (done > 0) return String(done);
+  return "—";
+}
 
 function bindLogsControls() {
   on("btn-logs-search", "onclick", () => loadAdminLogs({ reset: true }));
@@ -4552,6 +5065,11 @@ function bindLogsControls() {
   if (act && !act._logsBound) {
     act._logsBound = true;
     act.addEventListener("change", () => loadAdminLogs({ reset: true }));
+  }
+  const st = $("logs-status");
+  if (st && !st._logsBound) {
+    st._logsBound = true;
+    st.addEventListener("change", () => loadAdminLogs({ reset: true }));
   }
   const ps = $("logs-page-size");
   if (ps && !ps._logsBound) {
@@ -4577,7 +5095,7 @@ async function ensureLogActions() {
   if (!sel || sel.options.length > 1) return;
   try {
     const r = await api("/logs/actions");
-    const actions = (r && r.actions) || [];
+    const actions = (r && (r.kinds || r.actions)) || [];
     actions.forEach((a) => {
       const opt = document.createElement("option");
       opt.value = a;
@@ -4596,19 +5114,20 @@ async function loadAdminLogs({ reset = false } = {}) {
   const seq = ++logsLoadSeq;
   const q = ($("logs-q") && $("logs-q").value || "").trim();
   const action = ($("logs-action") && $("logs-action").value) || "all";
+  const status = ($("logs-status") && $("logs-status").value) || "all";
   logsPageSize = parseInt(($("logs-page-size") && $("logs-page-size").value) || "50", 10) || 50;
-  $("logs-tbody").innerHTML = `<tr><td colspan="6" class="g2a-muted">加载日志中…</td></tr>`;
+  $("logs-tbody").innerHTML = `<tr><td colspan="6" class="g2a-muted">加载任务日志中…</td></tr>`;
   if ($("logs-info")) $("logs-info").textContent = "查询中…";
   try {
     const data = await api(
-      `/logs?page=${encodeURIComponent(logsPage)}&page_size=${encodeURIComponent(logsPageSize)}&q=${encodeURIComponent(q)}&action=${encodeURIComponent(action)}`
+      `/logs?page=${encodeURIComponent(logsPage)}&page_size=${encodeURIComponent(logsPageSize)}&q=${encodeURIComponent(q)}&kind=${encodeURIComponent(action)}&action=${encodeURIComponent(action)}&status=${encodeURIComponent(status)}`
     );
     if (seq !== logsLoadSeq) return;
     const items = (data && data.items) || [];
     logsTotalPages = Number(data.total_pages || 1) || 1;
     logsPage = Number(data.page || logsPage) || 1;
     if ($("logs-info")) {
-      $("logs-info").textContent = `共 ${data.total ?? items.length} 条 · 数据源 ${data.store_source || "postgres"} · 点击行查看详情`;
+      $("logs-info").textContent = `共 ${data.total ?? items.length} 条任务 · 数据源 ${data.store_source || "postgres"} · 点击行查看详情`;
     }
     if ($("logs-page-info")) {
       $("logs-page-info").textContent = `${logsPage} / ${logsTotalPages}`;
@@ -4616,25 +5135,34 @@ async function loadAdminLogs({ reset = false } = {}) {
     if ($("logs-page-prev")) $("logs-page-prev").disabled = logsPage <= 1;
     if ($("logs-page-next")) $("logs-page-next").disabled = logsPage >= logsTotalPages;
     if (!items.length) {
-      $("logs-tbody").innerHTML = `<tr><td colspan="6" class="g2a-muted">暂无日志</td></tr>`;
+      $("logs-tbody").innerHTML = `<tr><td colspan="6" class="g2a-muted">暂无任务日志</td></tr>`;
     } else {
       $("logs-tbody").innerHTML = items.map((it) => {
-        const detail = esc(JSON.stringify(it.detail || {}));
-        const target = [it.target_type, it.target_id].filter(Boolean).join(": ");
+        const payload = {
+          ...(it.detail || {}),
+          task_id: it.task_id || null,
+          kind: it.kind || it.action || null,
+          status: it.status || null,
+          progress_done: it.progress_done,
+          progress_total: it.progress_total,
+        };
+        const detail = esc(JSON.stringify(payload));
+        const kind = it.kind || it.action || "—";
+        const st = it.status || "—";
         return `<tr data-log-detail='${detail.replace(/'/g, "&#39;")}' style="cursor:pointer">
           <td class="g2a-muted">${esc(fmtTime(it.created_at))}</td>
-          <td class="mono">${esc(it.action || "—")}</td>
+          <td class="mono">${esc(kind)}</td>
+          <td class="mono g2a-muted">${esc(st)}</td>
           <td>${esc(it.summary || "—")}</td>
-          <td class="mono g2a-muted">${esc(target || "—")}</td>
-          <td class="g2a-muted">${esc(it.ip || "—")}</td>
-          <td>${it.ok === false ? '<span class="g2a-tag bad">失败</span>' : '<span class="g2a-tag ok">成功</span>'}</td>
+          <td class="mono g2a-muted">${esc(taskProgressText(it))}</td>
+          <td>${taskStatusTag(st, it.ok)}</td>
         </tr>`;
       }).join("");
     }
   } catch (e) {
     if (seq !== logsLoadSeq) return;
     $("logs-tbody").innerHTML = `<tr><td colspan="6" class="g2a-muted">加载失败：${esc(e.message || e)}</td></tr>`;
-    toast(e.message || "加载日志失败", false);
+    toast(e.message || "加载任务日志失败", false);
   } finally {
     if (seq === logsLoadSeq) logsLoading = false;
   }

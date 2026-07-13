@@ -293,18 +293,63 @@ def _hash_password(password: str, salt: str) -> str:
     ).hex()
 
 
-def is_setup_needed() -> bool:
-    if ADMIN_PASSWORD:
-        return False
+def _stored_admin_hash_present(data: dict[str, Any] | None = None) -> bool:
+    d = data if isinstance(data, dict) else _load()
+    return bool(d.get("admin_password_hash") and d.get("admin_password_salt"))
+
+
+def ensure_admin_password_seeded() -> dict[str, Any]:
+    """Ensure admin password lives in durable store (PG / settings file).
+
+    Auth source of truth is the stored password hash — **not** the env var.
+    ``GROK2API_ADMIN_PASSWORD`` is only a bootstrap seed when no hash exists
+    yet (first deploy). After seeding / setup / password change, login uses
+    the database hash exclusively.
+    """
     data = _load()
-    return not data.get("admin_password_hash")
+    if _stored_admin_hash_present(data):
+        return {
+            "ok": True,
+            "source": "store",
+            "seeded": False,
+            "has_password": True,
+        }
+    env_pw = (ADMIN_PASSWORD or "").strip()
+    if env_pw:
+        # First boot with env password: persist hash so multi-worker / restarts
+        # do not depend on env remaining the live credential.
+        set_admin_password(env_pw)
+        return {
+            "ok": True,
+            "source": "env_seeded",
+            "seeded": True,
+            "has_password": True,
+        }
+    return {
+        "ok": True,
+        "source": "none",
+        "seeded": False,
+        "has_password": False,
+    }
+
+
+def is_setup_needed() -> bool:
+    # Prefer durable store; env alone no longer skips setup forever — it only
+    # seeds once via ensure_admin_password_seeded().
+    try:
+        ensure_admin_password_seeded()
+    except Exception:
+        pass
+    data = _load()
+    return not _stored_admin_hash_present(data)
 
 
 def has_admin_password() -> bool:
-    if ADMIN_PASSWORD:
-        return True
-    data = _load()
-    return bool(data.get("admin_password_hash"))
+    try:
+        ensure_admin_password_seeded()
+    except Exception:
+        pass
+    return _stored_admin_hash_present()
 
 
 def set_admin_password(password: str) -> None:
@@ -315,6 +360,9 @@ def set_admin_password(password: str) -> None:
         data = _load()
         data["admin_password_hash"] = _hash_password(password, salt)
         data["admin_password_salt"] = salt
+        data["admin_password_updated_at"] = time.time()
+        # Record that password is managed in store (not live-env auth).
+        data["admin_password_source"] = "store"
         data["updated_at"] = time.time()
         _save(data, immediate=True)
 
@@ -322,8 +370,9 @@ def set_admin_password(password: str) -> None:
 def change_admin_password(*, current: str, new_password: str) -> None:
     """Change admin password after verifying current credentials.
 
-    If GROK2API_ADMIN_PASSWORD is set from env, the env password still works
-    as an alternate login; stored hash is updated for non-env logins.
+    Always writes the new hash to durable store (PostgreSQL / settings file).
+    Environment ``GROK2API_ADMIN_PASSWORD`` is never required after setup and
+    is not used as a parallel live password once a store hash exists.
     """
     if not verify_admin_password(current or ""):
         raise ValueError("当前密码不正确")
@@ -337,16 +386,26 @@ def change_admin_password(*, current: str, new_password: str) -> None:
 def verify_admin_password(password: str) -> bool:
     if not password:
         return False
-    # Env password always works if set
-    if ADMIN_PASSWORD and secrets.compare_digest(password, ADMIN_PASSWORD):
-        return True
+    # Best-effort seed from env on first boot before any hash exists.
+    try:
+        ensure_admin_password_seeded()
+    except Exception:
+        pass
     data = _load()
     salt = data.get("admin_password_salt")
     expected = data.get("admin_password_hash")
-    if not salt or not expected:
+    if salt and expected:
+        got = _hash_password(password, salt)
+        if hmac.compare_digest(got, expected):
+            return True
+        # Store hash is authoritative: do not fall back to env once present.
         return False
-    got = _hash_password(password, salt)
-    return hmac.compare_digest(got, expected)
+    # No store hash yet: allow env only as emergency bootstrap login, then
+    # callers (setup/change) should persist a hash.
+    env_pw = (ADMIN_PASSWORD or "").strip()
+    if env_pw and secrets.compare_digest(password, env_pw):
+        return True
+    return False
 
 
 def _redis_admin_sessions() -> bool:
@@ -1219,6 +1278,17 @@ def set_default_model_setting(model: str) -> str:
 
 def apply_runtime_settings_to_modules() -> None:
     """Push persisted settings into in-process modules (call on startup)."""
+    # Admin password: seed durable store from env once if empty.
+    try:
+        seed = ensure_admin_password_seeded()
+        if seed.get("seeded"):
+            print("  admin password: seeded from GROK2API_ADMIN_PASSWORD → store")
+        elif seed.get("has_password"):
+            print("  admin password: loaded from store (DB/settings)")
+        else:
+            print("  admin password: not set (setup required)")
+    except Exception as e:  # noqa: BLE001
+        print(f"  admin password: seed/load skipped ({e})")
     try:
         set_reasoning_compat(get_reasoning_compat())
     except Exception:
@@ -1282,6 +1352,7 @@ _REG_CONFIG_KEYS = (
     "count",
     "concurrency",
     "stagger_ms",
+    "probe_delay_sec",
 )
 
 _REG_SECRET_KEYS = frozenset(
@@ -1588,6 +1659,18 @@ def _normalize_registration_config(
     cfg["count"] = _int_field("count", 1, 1, 10_000)
     cfg["concurrency"] = _int_field("concurrency", 5, 1, 10)
     cfg["stagger_ms"] = _int_field("stagger_ms", 400, 0, 10_000)
+    # New-account auto-probe settle window (seconds). 0 = probe immediately.
+    # Prefer form/DB value; fall back to env GROK2API_REG_PROBE_DELAY_SEC.
+    try:
+        env_probe = int(float(os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30))
+    except (TypeError, ValueError):
+        env_probe = 30
+    probe_raw = src.get("probe_delay_sec", env.get("probe_delay_sec", env_probe))
+    try:
+        probe_delay = int(float(probe_raw))
+    except (TypeError, ValueError):
+        probe_delay = env_probe
+    cfg["probe_delay_sec"] = max(0, min(600, probe_delay))
     return cfg
 
 
@@ -1785,7 +1868,7 @@ def set_registration_config(
         if not (isinstance(v, str) and v == "" and k not in keep_empty)
     }
     # Always keep numeric defaults
-    for k in ("expiry_ms", "count", "concurrency", "stagger_ms"):
+    for k in ("expiry_ms", "count", "concurrency", "stagger_ms", "probe_delay_sec"):
         cleaned[k] = cfg[k]
     # Always persist active + per-provider domain slots (including empty).
     for k in ("domain", "moemail_domain", "yyds_domain", "gptmail_domain"):
@@ -1856,6 +1939,12 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     if base_url:
         _set_env("GROK2API_MOEMAIL_BASE_URL", base_url)
     _set_env("GROK2API_MOEMAIL_DOMAIN", domain)
+    try:
+        probe_delay = int(cfg.get("probe_delay_sec", 30))
+    except (TypeError, ValueError):
+        probe_delay = 30
+    probe_delay = max(0, min(600, probe_delay))
+    _set_env("GROK2API_REG_PROBE_DELAY_SEC", str(probe_delay))
     _set_env("GROK2API_CAPTCHA_PROVIDER", provider)
     _set_env("CAPTCHA_PROVIDER", provider)
     if provider == "local":
@@ -1921,7 +2010,7 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     except Exception:
         pass
 
-    # Adapter caches YESCAPTCHA_KEY at import — refresh module attribute.
+    # Adapter caches YESCAPTCHA_KEY / probe delay at import — refresh module attrs.
     try:
         import grok_build_adapter as gba
 
@@ -1929,6 +2018,8 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
             gba.CAPTCHA_PROVIDER = provider
         if hasattr(gba, "MAIL_PROVIDER"):
             gba.MAIL_PROVIDER = mail_provider
+        if hasattr(gba, "REGISTER_PROBE_DELAY_SEC"):
+            gba.REGISTER_PROBE_DELAY_SEC = float(probe_delay)
         if provider == "local":
             gba.YESCAPTCHA_KEY = "local"
             if hasattr(gba, "LOCAL_SOLVER_URL"):
@@ -2163,7 +2254,13 @@ def get_public_settings() -> dict[str, Any]:
         "account_modes": list(VALID_ACCOUNT_MODES),
         "has_admin_password": has_admin_password(),
         "setup_needed": is_setup_needed(),
-        "admin_password_from_env": bool(ADMIN_PASSWORD),
+        # True only when env was used (or could still be used) as bootstrap seed
+        # because no durable hash existed yet. After setup/seed, always false
+        # for "live env auth" — password is store-backed.
+        "admin_password_from_env": bool(
+            ADMIN_PASSWORD and not _stored_admin_hash_present()
+        ),
+        "admin_password_in_store": _stored_admin_hash_present(),
         "token_maintain_enabled": get_token_maintain_enabled(),
         "model_health_enabled": get_model_health_enabled(),
         "reasoning_compat": get_reasoning_compat(),

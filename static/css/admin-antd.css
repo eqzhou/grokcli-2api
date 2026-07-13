@@ -702,6 +702,59 @@ button[disabled] { opacity: .55; cursor: not-allowed; }
 }
 
 
+/* SSO import progress bar */
+.g2a-sso-progress {
+  margin: 12px 0 8px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--ant-color-border, rgba(255,255,255,.08));
+  background: color-mix(in srgb, var(--ant-color-bg-container) 92%, var(--ant-color-primary) 8%);
+}
+.g2a-sso-progress.hidden,
+.g2a-sso-progress[hidden] {
+  display: none !important;
+}
+.g2a-sso-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.g2a-sso-progress-track {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--ant-color-fill-secondary, #2a2d3a) 80%, transparent);
+}
+.g2a-sso-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--ant-color-primary, #3b82f6),
+    color-mix(in srgb, var(--ant-color-primary, #3b82f6) 65%, #22c55e)
+  );
+  transition: width .25s ease;
+}
+.g2a-sso-progress.is-done .g2a-sso-progress-fill {
+  background: linear-gradient(90deg, #16a34a, #22c55e);
+}
+.g2a-sso-progress.is-error .g2a-sso-progress-fill {
+  background: linear-gradient(90deg, #dc2626, #f97316);
+}
+#sso-progress-pct,
+#json-io-progress-pct {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  min-width: 3.2em;
+  text-align: right;
+}
+
+
 /* Usage page simple bar chart */
 .g2a-usage-bars {
   display: flex;

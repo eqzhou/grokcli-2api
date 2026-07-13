@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.c33ec30b40.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.fd8289a708.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -116,7 +116,7 @@
         <a class="g2a-menu-item " href="/admin/keys" data-page="keys"><span class="g2a-menu-ico">🔑</span><span>API Keys</span></a>
         <a class="g2a-menu-item is-active" href="/admin/accounts" data-page="accounts"><span class="g2a-menu-ico">👥</span><span>账号 / 轮询</span></a>
         <a class="g2a-menu-item " href="/admin/usage" data-page="usage"><span class="g2a-menu-ico">Σ</span><span>用量</span></a>
-        <a class="g2a-menu-item " href="/admin/logs" data-page="logs"><span class="g2a-menu-ico">📜</span><span>日志</span></a>
+        <a class="g2a-menu-item " href="/admin/logs" data-page="logs"><span class="g2a-menu-ico">📜</span><span>任务日志</span></a>
         <a class="g2a-menu-item " href="/admin/models" data-page="models"><span class="g2a-menu-ico">▣</span><span>模型</span></a>
         <a class="g2a-menu-item " href="/admin/settings" data-page="settings"><span class="g2a-menu-ico">⚙</span><span>系统设置</span></a>
         <a class="g2a-menu-item " href="/admin/guide" data-page="guide"><span class="g2a-menu-ico">📘</span><span>接入指南</span></a>
@@ -300,7 +300,6 @@
       <label id="reg-domain-label">邮箱域名</label>
       <input id="reg-domain" placeholder="example.com" autocomplete="off" name="reg-domain" spellcheck="false" />
     </div>
-    <div class="g2a-field"><label>前缀</label><input id="reg-prefix" placeholder="可选" /></div>
     <div class="g2a-field">
       <label for="reg-captcha-provider">过盾方式</label>
       <select id="reg-captcha-provider">
@@ -315,6 +314,10 @@
     <div class="g2a-field"><label>数量</label><input id="reg-count" type="number" min="1" value="1" /></div>
     <div class="g2a-field"><label title="同时注册的线程数：3 就是同时只跑 3 个，完成一个再补一个">线程数</label><input id="reg-concurrency" type="number" min="1" max="10" value="5" /></div>
     <div class="g2a-field"><label title="同一波线程启动时的错峰间隔（毫秒）">错峰 ms</label><input id="reg-stagger-ms" type="number" min="0" value="300" /></div>
+    <div class="g2a-field">
+      <label for="reg-probe-delay-sec" title="新账号入池后等待多少秒再自动测活；0=立即测活">测活等待秒</label>
+      <input id="reg-probe-delay-sec" type="number" min="0" max="600" step="1" value="30" />
+    </div>
     <div class="g2a-field">
       <label for="reg-expiry-ms">邮箱有效期</label>
       <select id="reg-expiry-ms">
@@ -345,7 +348,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>SSO Cookie 导入</h3>
-      <p>粘贴或上传 SSO cookie，Device Flow 换 token 后入库。</p>
+      <p>粘贴或上传 SSO cookie，Device Flow 换 token 后入库。支持实时进度条。</p>
     </div>
   </div>
   <div class="g2a-form-row">
@@ -371,6 +374,16 @@
       <button type="button" class="g2a-btn g2a-btn-primary" id="btn-import-sso">导入 SSO</button>
     </div>
   </div>
+  <div id="sso-progress-wrap" class="g2a-sso-progress hidden" hidden>
+    <div class="g2a-sso-progress-meta">
+      <span id="sso-progress-label" class="g2a-muted">准备中…</span>
+      <span id="sso-progress-pct" class="g2a-muted">0%</span>
+    </div>
+    <div class="g2a-sso-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="sso-progress-bar">
+      <div id="sso-progress-fill" class="g2a-sso-progress-fill" style="width:0%"></div>
+    </div>
+    <div id="sso-progress-detail" class="g2a-muted" style="margin-top:6px">—</div>
+  </div>
   <pre id="sso-result" class="g2a-log is-empty hidden" hidden>—</pre>
 </section>
 
@@ -378,7 +391,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>JSON 导入 / 导出</h3>
-      <p>上传 auth.json / 导出完整凭证。</p>
+      <p>上传 auth.json / 导出完整凭证。支持实时进度条。</p>
     </div>
   </div>
   <div class="g2a-form-row g2a-import-controls">
@@ -398,6 +411,17 @@
       </div>
     </div>
   </div>
+  <div id="json-io-progress-wrap" class="g2a-sso-progress hidden" hidden>
+    <div class="g2a-sso-progress-meta">
+      <span id="json-io-progress-label" class="g2a-muted">准备中…</span>
+      <span id="json-io-progress-pct" class="g2a-muted">0%</span>
+    </div>
+    <div class="g2a-sso-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="json-io-progress-bar">
+      <div id="json-io-progress-fill" class="g2a-sso-progress-fill" style="width:0%"></div>
+    </div>
+    <div id="json-io-progress-detail" class="g2a-muted" style="margin-top:6px">—</div>
+  </div>
+  <pre id="json-io-result" class="g2a-log is-empty hidden" hidden>—</pre>
 </section>
 
       </div>
@@ -407,6 +431,6 @@
   <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.fbb0e303c7.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.8afb18b665.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

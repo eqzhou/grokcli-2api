@@ -258,6 +258,63 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
         slim_last["next_wait_sec"] = _next_wait_seconds()
     except Exception:
         slim_last["next_wait_sec"] = _interval()
+    # Durable task log for admin「任务日志」.
+    # Skip pure deferred no-ops and empty background sweeps to avoid flood.
+    if not slim_last.get("deferred_busy"):
+        try:
+            import task_log
+
+            rf = slim_last.get("refresh") if isinstance(slim_last.get("refresh"), dict) else {}
+            refreshed = int(rf.get("refreshed") or 0)
+            attempted = int(rf.get("attempted") or refreshed or 0)
+            failed = int(rf.get("failed") or 0)
+            deleted = int(rf.get("deleted") or rf.get("invalidated") or 0)
+            purged = 0
+            try:
+                purged = int(((slim_last.get("purged_dead") or {}) or {}).get("deleted") or 0)
+            except Exception:
+                purged = 0
+            meaningful = bool(
+                force
+                or slim_last.get("ok") is False
+                or attempted
+                or refreshed
+                or failed
+                or deleted
+                or purged
+                or slim_last.get("error")
+            )
+            if meaningful:
+                summary = (
+                    f"Token 续期{'（强制）' if force else ''}："
+                    f"刷新 {refreshed}/{attempted or refreshed}"
+                    f" · 失败 {failed}"
+                    + (f" · 清理 {deleted or purged}" if (deleted or purged) else "")
+                )
+                st = "done"
+                if failed and refreshed:
+                    st = "partial"
+                elif failed and not refreshed and attempted:
+                    st = "error"
+                if slim_last.get("ok") is False:
+                    st = "error"
+                task_log.record(
+                    "token_refresh",
+                    summary=summary,
+                    status=st,
+                    ok=bool(slim_last.get("ok", True))
+                    and not (failed and not refreshed and attempted),
+                    progress_done=refreshed,
+                    progress_total=attempted or refreshed,
+                    detail={
+                        "force": force,
+                        "refresh": rf,
+                        "purged_dead": slim_last.get("purged_dead"),
+                        "error": slim_last.get("error"),
+                    },
+                )
+        except Exception:
+            pass
     _last_run.clear()
     _last_run.update(slim_last)
     # Also mirror last run into Redis so non-leader workers can show real status.

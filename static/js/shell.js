@@ -7,7 +7,7 @@ window.G2A = window.G2A || {};
     keys: { title: "API Keys", sub: "创建、复制、停用客户端访问密钥", path: "/admin/keys" },
     accounts: { title: "账号 / 轮询", sub: "Grok 账号、设备码登录、额度与导入导出", path: "/admin/accounts" },
     usage: { title: "用量", sub: "Token 消耗与请求使用情况（今日 / 近 N 天 / 累计）", path: "/admin/usage" },
-    logs: { title: "日志", sub: "查询系统与管理台日志（登录、账号、Key、探测、冷却、设置等）", path: "/admin/logs" },
+    logs: { title: "任务日志", sub: "查询后台任务结果（协议注册、SSO 导入、测活、Token 续期等）", path: "/admin/logs" },
     models: { title: "模型", sub: "上游模型缓存与探测结果", path: "/admin/models" },
     settings: { title: "系统设置", sub: "修改管理员密码、轮询策略与 sub2api / 维护参数", path: "/admin/settings" },
     guide: { title: "接入指南", sub: "OpenAI / Anthropic 客户端配置示例", path: "/admin/guide" },

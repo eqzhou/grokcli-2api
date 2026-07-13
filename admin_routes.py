@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
@@ -171,10 +173,10 @@ class ImportSsoBody(BaseModel):
     merge: bool = Field(default=True, description="Merge into existing auth.json")
     delay: int = Field(default=0, ge=0, le=300, description="Seconds between accounts")
     max_workers: int = Field(
-        default=4,
+        default=8,
         ge=1,
-        le=16,
-        description="Concurrent import threads (hard-capped to avoid WSL freezes)",
+        le=32,
+        description="Concurrent SSO convert threads (capped by GROK2API_SSO_IMPORT_WORKERS)",
     )
 
 
@@ -247,6 +249,12 @@ class EmailRegistrationBody(BaseModel):
         le=10000,
         description="Stagger delay between worker starts (ms)",
     )
+    probe_delay_sec: int | None = Field(
+        default=None,
+        ge=0,
+        le=600,
+        description="Seconds to wait after import before auto health probe (0=immediate)",
+    )
 
 
 class EmailRegistrationProxyTestBody(BaseModel):
@@ -303,6 +311,12 @@ class RegistrationConfigBody(BaseModel):
     count: int | None = Field(default=None, ge=1, le=10000)
     concurrency: int | None = Field(default=None, ge=1, le=10)
     stagger_ms: int | None = Field(default=None, ge=0, le=10000)
+    probe_delay_sec: int | None = Field(
+        default=None,
+        ge=0,
+        le=600,
+        description="Seconds to wait after import before auto health probe (0=immediate)",
+    )
 
 
 class RefreshBody(BaseModel):
@@ -1162,81 +1176,175 @@ async def import_account(
     return result
 
 
-@router.post("/accounts/import-sso")
-async def import_sso(
-    body: ImportSsoBody,
-    request: Request,
-    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
-):
-    """
-    Import accounts from xAI SSO cookies via pure HTTP device flow.
-    Each SSO cookie is validated, used to authorize a device code, and the
-    resulting access_token / refresh_token is merged into auth.json.
-    """
-    require_admin(request, x_admin_token)
+# ── SSO import jobs (progress polling across multi-worker via Redis) ───────
 
-    def _parse_sso_lines(lines: list[str]) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
-        for raw in lines:
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                email = ""
-                if "----" in line:
-                    parts = line.split("----")
-                    email = parts[0].strip()
-                    line = parts[-1].strip()
-                elif ":" in line and not line.startswith("eyJ"):
-                    parts = line.rsplit(":", 1)
-                    email = parts[0].strip()
-                    line = parts[-1].strip()
-                out.append((email, line))
-        return out
+_SSO_JOB_TTL_SEC = 3600
+_sso_jobs_lock = threading.Lock()
+_sso_jobs_local: dict[str, dict[str, Any]] = {}
 
-    sso_items = _parse_sso_lines(body.sso_cookies)
-    sso_cookies = [sso for _, sso in sso_items]
-    if not sso_cookies:
-        raise HTTPException(status_code=400, detail="No valid SSO cookies provided")
 
-    results: list[dict[str, Any]] = []
-    imported: list[dict[str, Any]] = []
-    ok = 0
-    fail = 0
+def _sso_job_key(job_id: str) -> str:
+    try:
+        from store.redis_client import key as rk
 
+        return rk("sso_import", "job", job_id)
+    except Exception:
+        return f"g2a:sso_import:job:{job_id}"
+
+
+def _sso_job_put(job_id: str, job: dict[str, Any]) -> None:
+    payload = dict(job)
+    with _sso_jobs_lock:
+        _sso_jobs_local[job_id] = payload
+    try:
+        from store.redis_client import set_json
+
+        set_json(_sso_job_key(job_id), payload, _SSO_JOB_TTL_SEC)
+    except Exception:
+        pass
+
+
+def _sso_job_get(job_id: str) -> dict[str, Any] | None:
+    try:
+        from store.redis_client import get_json
+
+        data = get_json(_sso_job_key(job_id))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    with _sso_jobs_lock:
+        job = _sso_jobs_local.get(job_id)
+        return dict(job) if isinstance(job, dict) else None
+
+
+def _sso_job_patch(job_id: str, **fields: Any) -> dict[str, Any] | None:
+    job = _sso_job_get(job_id)
+    if not isinstance(job, dict):
+        return None
+    job.update(fields)
+    job["updated_at"] = time.time()
+    total = max(1, int(job.get("total") or 1))
+    done = int(job.get("done") or 0)
+    job["percent"] = min(100, int(round(100.0 * done / total)))
+    _sso_job_put(job_id, job)
+    return job
+
+
+def _sso_public_job(job: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(job, dict):
+        return {"ok": False, "error": "job not found"}
+    # Never leak full SSO cookies / tokens in progress responses.
+    out = {
+        "ok": True,
+        "job_id": job.get("id"),
+        "status": job.get("status") or "unknown",
+        "phase": job.get("phase") or "",
+        "message": job.get("message") or "",
+        "total": int(job.get("total") or 0),
+        "done": int(job.get("done") or 0),
+        "success": int(job.get("success") or 0),
+        "fail": int(job.get("fail") or 0),
+        "converted": int(job.get("converted") or 0),
+        "percent": int(job.get("percent") or 0),
+        "workers": int(job.get("workers") or 0),
+        "delay": int(job.get("delay") or 0),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "finished_at": job.get("finished_at"),
+        "results": job.get("results") or [],
+        "imported": job.get("imported") or [],
+        "error": job.get("error"),
+    }
+    return out
+
+
+def _parse_sso_lines(lines: list[str]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for raw in lines:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            email = ""
+            if "----" in line:
+                parts = line.split("----")
+                email = parts[0].strip()
+                line = parts[-1].strip()
+            elif ":" in line and not line.startswith("eyJ"):
+                parts = line.rsplit(":", 1)
+                email = parts[0].strip()
+                line = parts[-1].strip()
+            out.append((email, line))
+    return out
+
+
+def _run_sso_import_job(
+    job_id: str,
+    *,
+    sso_items: list[tuple[str, str]],
+    merge: bool,
+    delay: int,
+    max_workers: int,
+) -> None:
+    """Background worker: convert SSO cookies then bulk-import with progress updates."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    total = len(sso_items)
     try:
         from config import SSO_IMPORT_WORKERS
     except Exception:
-        SSO_IMPORT_WORKERS = 4
-    # Hard cap regardless of client-supplied max_workers
-    workers = min(int(body.max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)))
-    # If delay is large, prefer fewer workers to keep pacing meaningful.
-    if body.delay and body.delay >= 2:
-        workers = min(workers, 2)
+        SSO_IMPORT_WORKERS = 8
+    workers = min(int(max_workers), int(SSO_IMPORT_WORKERS), max(1, total))
+    # delay only staggers starts; keep enough parallelism for throughput.
+    if delay and delay >= 5:
+        workers = min(workers, 4)
 
-    # Stage 1: convert SSO -> token entries concurrently (network bound)
-    # Stage 2: merge all successful entries with ONE auth write (storage bound)
+    _sso_job_patch(
+        job_id,
+        status="running",
+        phase="converting",
+        message=f"正在转换 SSO → token（{workers} 线程）…",
+        workers=workers,
+        done=0,
+        success=0,
+        fail=0,
+        converted=0,
+        results=[],
+        imported=[],
+    )
+
     pending_entries: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    converted_count = 0
+    fail = 0
+    progress_lock = threading.Lock()
+    last_progress_at = 0.0
+    # Throttle Redis/progress writes under high concurrency.
+    progress_every = 1 if total <= 20 else max(2, total // 25)
 
     def _convert_one(args: tuple[int, str, str]) -> dict[str, Any]:
         i, email_hint, sso = args
-        if body.delay > 0 and i > 1:
+        if delay > 0 and i > 1:
             # tiny staggered start only (seconds), not cumulative per index
-            time.sleep(min(float(body.delay), 3.0) * (((i - 1) % max(1, workers)) / max(1.0, float(workers))))
+            time.sleep(
+                min(float(delay), 2.0)
+                * (((i - 1) % max(1, workers)) / max(1.0, float(workers)))
+            )
         item: dict[str, Any] = {
             "index": i,
             "sso_hint": (sso[:12] + "...") if len(sso) > 12 else sso,
         }
         try:
-            token = sso_import.sso_to_token(sso)
+            # quiet=True: less stdout lock contention under multi-thread import
+            token = sso_import.sso_to_token(sso, quiet=True)
             if not token:
                 item["status"] = "failed"
                 item["error"] = "device flow failed or invalid sso"
                 return item
             _key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
             item["status"] = "converted"
+            item["email"] = entry.get("email", email_hint)
             item["entry"] = {
                 "key": entry["key"],
                 "auth_mode": entry.get("auth_mode", "oidc"),
@@ -1250,87 +1358,301 @@ async def import_sso(
                 "user_id": entry.get("user_id") or entry.get("principal_id"),
             }
             return item
+        except TypeError:
+            # Older sso_to_token without quiet=
+            try:
+                token = sso_import.sso_to_token(sso)
+                if not token:
+                    item["status"] = "failed"
+                    item["error"] = "device flow failed or invalid sso"
+                    return item
+                _key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
+                item["status"] = "converted"
+                item["email"] = entry.get("email", email_hint)
+                item["entry"] = {
+                    "key": entry["key"],
+                    "auth_mode": entry.get("auth_mode", "oidc"),
+                    "email": entry.get("email", email_hint),
+                    "refresh_token": entry.get("refresh_token", ""),
+                    "expires_at": entry.get("expires_at"),
+                    "oidc_issuer": entry.get("oidc_issuer", sso_import.OIDC_ISSUER),
+                    "oidc_client_id": entry.get(
+                        "oidc_client_id", sso_import.GROK_CLI_CLIENT_ID
+                    ),
+                    "user_id": entry.get("user_id") or entry.get("principal_id"),
+                }
+                return item
+            except Exception as e:  # noqa: BLE001
+                item["status"] = "failed"
+                item["error"] = str(e)
+                return item
         except Exception as e:  # noqa: BLE001
             item["status"] = "failed"
             item["error"] = str(e)
             return item
 
-    converted: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sso-import-") as ex:
-        futs = [
-            ex.submit(_convert_one, (i, e, s))
-            for i, (e, s) in enumerate(sso_items, 1)
-        ]
-        for fut in as_completed(futs):
-            converted.append(fut.result())
+    try:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="sso-import-"
+        ) as ex:
+            futs = [
+                ex.submit(_convert_one, (i, e, s))
+                for i, (e, s) in enumerate(sso_items, 1)
+            ]
+            for fut in as_completed(futs):
+                item = fut.result()
+                with progress_lock:
+                    if item.get("status") == "converted":
+                        converted_count += 1
+                        pending_entries.append(item["entry"])
+                        pub = {k: v for k, v in item.items() if k != "entry"}
+                        # Keep status as converting until bulk import finishes.
+                        pub["status"] = "converted"
+                        results.append(pub)
+                    else:
+                        fail += 1
+                        results.append(
+                            {k: v for k, v in item.items() if k != "entry"}
+                        )
+                    done = converted_count + fail
+                    # Sort for stable UI order.
+                    results.sort(key=lambda x: int(x.get("index") or 0))
+                    now = time.time()
+                    should_publish = (
+                        done >= total
+                        or done % progress_every == 0
+                        or (now - last_progress_at) >= 0.8
+                    )
+                    if should_publish:
+                        last_progress_at = now
+                        _sso_job_patch(
+                            job_id,
+                            status="running",
+                            phase="converting",
+                            message=(
+                                f"转换中 {done}/{total}"
+                                f"（成功 {converted_count} · 失败 {fail}）"
+                            ),
+                            done=done,
+                            converted=converted_count,
+                            success=0,
+                            fail=fail,
+                            results=list(results),
+                        )
 
-    # preserve input order in results
-    converted.sort(key=lambda x: int(x.get("index") or 0))
-    for item in converted:
-        if item.get("status") != "converted":
-            fail += 1
-            results.append({k: v for k, v in item.items() if k != "entry"})
-            continue
-        pending_entries.append(item["entry"])
-        results.append({k: v for k, v in item.items() if k != "entry"})
-
-    if pending_entries:
-        # one storage write for all converted accounts
-        bulk = accounts.import_auth_payloads_bulk(pending_entries, merge=body.merge)
-        if not bulk.get("ok"):
-            # mark all converted as failed import
-            for item in results:
-                if item.get("status") is None:
-                    continue
-            # fallback: mark recent converted rows failed
-            for item in results:
-                if "account_id" not in item and item.get("status") not in ("failed", "ok"):
-                    item["status"] = "failed"
-                    item["error"] = bulk.get("error") or "bulk import failed"
-                    fail += 1
-        else:
-            # map imported by email/user roughly
-            imp = bulk.get("imported") or []
-            # attach in order as best-effort
-            imp_iter = iter(imp)
-            for item in results:
-                if item.get("status") == "failed":
-                    continue
-                info = next(imp_iter, None)
-                if not info:
+        # Stage 2: one storage write for all converted accounts.
+        imported: list[dict[str, Any]] = []
+        ok = 0
+        if pending_entries:
+            _sso_job_patch(
+                job_id,
+                status="running",
+                phase="importing",
+                message=f"正在写入账号池（{len(pending_entries)} 个）…",
+                done=total,  # convert phase finished
+                converted=converted_count,
+                fail=fail,
+                results=list(results),
+            )
+            bulk = accounts.import_auth_payloads_bulk(pending_entries, merge=merge)
+            if not bulk.get("ok"):
+                err = bulk.get("error") or "bulk import failed"
+                for item in results:
+                    if item.get("status") == "converted":
+                        item["status"] = "failed"
+                        item["error"] = err
+                        fail += 1
+                converted_count = 0
+            else:
+                imp = bulk.get("imported") or []
+                imp_iter = iter(imp)
+                for item in results:
+                    if item.get("status") != "converted":
+                        continue
+                    info = next(imp_iter, None)
+                    if not info:
+                        item["status"] = "ok"
+                        ok += 1
+                        continue
                     item["status"] = "ok"
+                    item["account_id"] = info.get("id")
+                    item["email"] = info.get("email") or item.get("email")
+                    item["user_id"] = info.get("user_id")
+                    item["expires_at"] = info.get("expires_at")
+                    item["has_refresh_token"] = info.get("has_refresh_token")
                     ok += 1
-                    continue
-                item["status"] = "ok"
-                item["account_id"] = info.get("id")
-                item["email"] = info.get("email") or item.get("email")
-                item["user_id"] = info.get("user_id")
-                item["expires_at"] = info.get("expires_at")
-                item["has_refresh_token"] = info.get("has_refresh_token")
-                ok += 1
-                imported.append({
-                    "id": info.get("id"),
-                    "email": info.get("email"),
-                    "user_id": info.get("user_id"),
-                    "expires_at": info.get("expires_at"),
-                    "has_refresh_token": info.get("has_refresh_token"),
-                })
+                    imported.append(
+                        {
+                            "id": info.get("id"),
+                            "email": info.get("email"),
+                            "user_id": info.get("user_id"),
+                            "expires_at": info.get("expires_at"),
+                            "has_refresh_token": info.get("has_refresh_token"),
+                        }
+                    )
 
-    # recount fail for non-ok
-    fail = sum(1 for x in results if x.get("status") != "ok")
-    ok = sum(1 for x in results if x.get("status") == "ok")
+        fail = sum(1 for x in results if x.get("status") != "ok")
+        ok = sum(1 for x in results if x.get("status") == "ok")
+        msg = f"SSO 导入完成：{ok} 成功, {fail} 失败（workers={workers}）"
+        _sso_job_patch(
+            job_id,
+            status="done",
+            phase="done",
+            message=msg,
+            done=total,
+            success=ok,
+            fail=fail,
+            converted=converted_count,
+            imported=imported,
+            results=results,
+            finished_at=time.time(),
+            percent=100,
+            ok=fail == 0,
+        )
+        try:
+            import task_log
+
+            task_log.record(
+                "sso_import",
+                task_id=job_id,
+                summary=msg,
+                status="done" if fail == 0 else ("partial" if ok else "error"),
+                ok=fail == 0,
+                progress_done=total,
+                progress_total=total,
+                detail={
+                    "success": ok,
+                    "fail": fail,
+                    "converted": converted_count,
+                    "workers": workers,
+                    "imported_count": len(imported),
+                },
+            )
+        except Exception:
+            pass
+    except Exception as e:  # noqa: BLE001
+        msg = f"SSO 导入失败：{e}"
+        _sso_job_patch(
+            job_id,
+            status="error",
+            phase="error",
+            message=msg,
+            error=str(e),
+            finished_at=time.time(),
+            ok=False,
+        )
+        try:
+            import task_log
+
+            task_log.record(
+                "sso_import",
+                task_id=job_id,
+                summary=msg,
+                status="error",
+                ok=False,
+                progress_done=0,
+                progress_total=total,
+                detail={"error": str(e)[:400]},
+            )
+        except Exception:
+            pass
+
+
+@router.post("/accounts/import-sso")
+async def import_sso(
+    body: ImportSsoBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """
+    Start SSO cookie import as a background job with progress polling.
+
+    Returns immediately with ``job_id``. Poll
+    ``GET /accounts/import-sso/jobs/{job_id}`` until ``status`` is
+    ``done`` / ``error``.
+
+    Each SSO cookie is validated, used to authorize a device code, and the
+    resulting access_token / refresh_token is merged into the account pool.
+    """
+    require_admin(request, x_admin_token)
+
+    sso_items = _parse_sso_lines(body.sso_cookies)
+    if not sso_items:
+        raise HTTPException(status_code=400, detail="No valid SSO cookies provided")
+
+    try:
+        from config import SSO_IMPORT_WORKERS
+    except Exception:
+        SSO_IMPORT_WORKERS = 8
+    workers = min(int(body.max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)))
+    if body.delay and body.delay >= 5:
+        workers = min(workers, 4)
+
+    job_id = f"sso_{uuid.uuid4().hex[:16]}"
+    now = time.time()
+    job = {
+        "id": job_id,
+        "status": "queued",
+        "phase": "queued",
+        "message": f"已排队，共 {len(sso_items)} 条 SSO",
+        "total": len(sso_items),
+        "done": 0,
+        "success": 0,
+        "fail": 0,
+        "converted": 0,
+        "percent": 0,
+        "workers": workers,
+        "delay": int(body.delay or 0),
+        "merge": bool(body.merge),
+        "created_at": now,
+        "updated_at": now,
+        "finished_at": None,
+        "results": [],
+        "imported": [],
+        "error": None,
+        "ok": None,
+    }
+    _sso_job_put(job_id, job)
+
+    t = threading.Thread(
+        target=_run_sso_import_job,
+        kwargs={
+            "job_id": job_id,
+            "sso_items": sso_items,
+            "merge": bool(body.merge),
+            "delay": int(body.delay or 0),
+            "max_workers": int(body.max_workers or workers),
+        },
+        daemon=True,
+        name=f"sso-import-job-{job_id[-8:]}",
+    )
+    t.start()
 
     return {
-        "ok": fail == 0,
-        "message": f"SSO 导入完成：{ok} 成功, {fail} 失败（workers={workers}）",
-        "total": len(sso_cookies),
-        "success": ok,
-        "fail": fail,
-        "imported": imported,
-        "results": results,
+        "ok": True,
+        "async": True,
+        "job_id": job_id,
+        "status": "queued",
+        "total": len(sso_items),
         "workers": workers,
-        "delay": body.delay,
+        "delay": int(body.delay or 0),
+        "message": f"SSO 导入已启动（{len(sso_items)} 条，workers={workers}）",
+        "poll_url": f"/admin/api/accounts/import-sso/jobs/{job_id}",
     }
+
+
+@router.get("/accounts/import-sso/jobs/{job_id}")
+async def get_sso_import_job(
+    job_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Poll SSO import job progress (percent / done / success / fail / results)."""
+    require_admin(request, x_admin_token)
+    job = _sso_job_get(str(job_id or "").strip())
+    if not job:
+        raise HTTPException(status_code=404, detail="SSO import job not found")
+    return _sso_public_job(job)
 
 
 def _require_register_adapter():
@@ -1383,6 +1705,7 @@ def _registration_cfg_from_body(body: EmailRegistrationBody | RegistrationConfig
         "count": getattr(body, "count", None),
         "concurrency": getattr(body, "concurrency", None),
         "stagger_ms": getattr(body, "stagger_ms", None),
+        "probe_delay_sec": getattr(body, "probe_delay_sec", None),
     }
 
 
@@ -1476,6 +1799,7 @@ async def start_email_registration(
             count=resolved.get("count"),
             concurrency=resolved.get("concurrency"),
             stagger_ms=resolved.get("stagger_ms"),
+            probe_delay_sec=resolved.get("probe_delay_sec"),
         )
     except TypeError:
         # Older adapter without batch / mail_provider kwargs.
@@ -1662,6 +1986,458 @@ async def stop_all_email_registrations(
     return result
 
 
+# ── JSON import / export jobs (progress polling) ───────────────────────────
+
+_IO_JOB_TTL_SEC = 3600
+_io_jobs_lock = threading.Lock()
+_io_jobs_local: dict[str, dict[str, Any]] = {}
+
+
+def _io_job_key(job_id: str) -> str:
+    try:
+        from store.redis_client import key as rk
+
+        return rk("io_job", job_id)
+    except Exception:
+        return f"g2a:io_job:{job_id}"
+
+
+def _io_job_put(job_id: str, job: dict[str, Any]) -> None:
+    payload = dict(job)
+    with _io_jobs_lock:
+        _io_jobs_local[job_id] = payload
+    try:
+        from store.redis_client import set_json
+
+        # Never put full export auth map into Redis — keep secrets process-local.
+        public = {k: v for k, v in payload.items() if k not in ("payload", "payload_bytes", "raw_files")}
+        set_json(_io_job_key(job_id), public, _IO_JOB_TTL_SEC)
+    except Exception:
+        pass
+
+
+def _io_job_get(job_id: str) -> dict[str, Any] | None:
+    with _io_jobs_lock:
+        job = _io_jobs_local.get(job_id)
+        if isinstance(job, dict):
+            return dict(job)
+    try:
+        from store.redis_client import get_json
+
+        data = get_json(_io_job_key(job_id))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _io_job_patch(job_id: str, **fields: Any) -> dict[str, Any] | None:
+    job = _io_job_get(job_id)
+    if not isinstance(job, dict):
+        return None
+    job.update(fields)
+    job["updated_at"] = time.time()
+    total = max(1, int(job.get("total") or 1))
+    done = int(job.get("done") or 0)
+    # Prefer explicit percent when provided.
+    if "percent" not in fields:
+        job["percent"] = min(100, int(round(100.0 * done / total)))
+    else:
+        try:
+            job["percent"] = min(100, max(0, int(fields["percent"])))
+        except Exception:
+            job["percent"] = min(100, int(round(100.0 * done / total)))
+    _io_job_put(job_id, job)
+    return job
+
+
+def _io_public_job(job: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(job, dict):
+        return {"ok": False, "error": "job not found"}
+    return {
+        "ok": True,
+        "job_id": job.get("id"),
+        "kind": job.get("kind") or "",
+        "status": job.get("status") or "unknown",
+        "phase": job.get("phase") or "",
+        "message": job.get("message") or "",
+        "total": int(job.get("total") or 0),
+        "done": int(job.get("done") or 0),
+        "success": int(job.get("success") or 0),
+        "fail": int(job.get("fail") or 0),
+        "percent": int(job.get("percent") or 0),
+        "count": int(job.get("count") or 0),
+        "parse_errors": int(job.get("parse_errors") or 0),
+        "filename": job.get("filename"),
+        "download_ready": bool(job.get("download_ready")),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "finished_at": job.get("finished_at"),
+        "file_meta": job.get("file_meta") or [],
+        "error": job.get("error"),
+    }
+
+
+def _parse_json_import_text(text: str, filename: str | None = None) -> tuple[Any | None, str | None]:
+    """Return (payload, error). payload may be dict or JWT string."""
+    raw = (text or "").strip()
+    if not raw:
+        return None, "empty content"
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError as e:
+        if raw.startswith("eyJ") and "." in raw and "\n" not in raw:
+            return raw, None
+        return None, f"invalid JSON: {e}"
+
+
+def _run_json_import_job(
+    job_id: str,
+    *,
+    file_items: list[dict[str, Any]],
+    merge: bool,
+) -> None:
+    """Background: parse uploaded JSON texts then bulk-import with progress."""
+    total = max(1, len(file_items))
+    payloads: list[Any] = []
+    file_meta: list[dict[str, Any]] = []
+    parse_errors = 0
+    try:
+        _io_job_patch(
+            job_id,
+            status="running",
+            phase="parsing",
+            message=f"正在解析 JSON（0/{len(file_items)}）…",
+            done=0,
+            total=len(file_items),
+            success=0,
+            fail=0,
+            percent=0,
+        )
+        for i, item in enumerate(file_items, 1):
+            name = item.get("filename") or f"file-{i}.json"
+            text = item.get("text") or ""
+            payload, err = _parse_json_import_text(text, name)
+            if err or payload is None:
+                parse_errors += 1
+                file_meta.append({"filename": name, "ok": False, "error": err or "parse failed"})
+            else:
+                payloads.append(payload)
+                file_meta.append({"filename": name, "ok": True})
+            _io_job_patch(
+                job_id,
+                status="running",
+                phase="parsing",
+                message=f"正在解析 JSON（{i}/{len(file_items)}）…",
+                done=i,
+                total=len(file_items),
+                fail=parse_errors,
+                success=len(payloads),
+                file_meta=list(file_meta),
+                parse_errors=parse_errors,
+                percent=min(50, int(round(50.0 * i / total))),
+            )
+
+        if not payloads:
+            msg = "没有可导入的有效 JSON"
+            _io_job_patch(
+                job_id,
+                status="error",
+                phase="error",
+                message=msg,
+                error=msg,
+                done=len(file_items),
+                total=len(file_items),
+                fail=parse_errors or len(file_items),
+                success=0,
+                file_meta=file_meta,
+                parse_errors=parse_errors,
+                finished_at=time.time(),
+                percent=100,
+                ok=False,
+            )
+            try:
+                import task_log
+
+                task_log.record(
+                    "json_import",
+                    task_id=job_id,
+                    summary=msg,
+                    status="error",
+                    ok=False,
+                    progress_done=0,
+                    progress_total=len(file_items),
+                    detail={"parse_errors": parse_errors, "files": len(file_items)},
+                )
+            except Exception:
+                pass
+            return
+
+        _io_job_patch(
+            job_id,
+            status="running",
+            phase="importing",
+            message=f"正在写入账号池（{len(payloads)} 个文件已解析）…",
+            done=len(file_items),
+            total=len(file_items),
+            percent=70,
+            file_meta=file_meta,
+            parse_errors=parse_errors,
+        )
+        result = accounts.import_auth_payloads_bulk(payloads, merge=merge)
+        count = int(result.get("count") or 0)
+        ok = bool(result.get("ok"))
+        if not ok:
+            msg = str(result.get("error") or "import failed")
+            _io_job_patch(
+                job_id,
+                status="error",
+                phase="error",
+                message=msg,
+                error=msg,
+                count=0,
+                success=0,
+                fail=len(file_items),
+                file_meta=file_meta,
+                parse_errors=parse_errors,
+                finished_at=time.time(),
+                percent=100,
+                ok=False,
+            )
+            try:
+                import task_log
+
+                task_log.record(
+                    "json_import",
+                    task_id=job_id,
+                    summary=msg,
+                    status="error",
+                    ok=False,
+                    progress_done=0,
+                    progress_total=len(file_items),
+                    detail={"parse_errors": parse_errors, "files": len(file_items)},
+                )
+            except Exception:
+                pass
+            return
+
+        st = "done" if not parse_errors else "partial"
+        msg = result.get("message") or f"JSON 导入完成：{count} 个账号"
+        if parse_errors:
+            msg = f"{msg}（{parse_errors} 个文件解析失败）"
+        _io_job_patch(
+            job_id,
+            status=st,
+            phase="done",
+            message=msg,
+            count=count,
+            success=count,
+            fail=parse_errors,
+            file_meta=file_meta,
+            parse_errors=parse_errors,
+            finished_at=time.time(),
+            percent=100,
+            ok=True,
+            imported=result.get("imported") or [],
+        )
+        try:
+            import task_log
+
+            task_log.record(
+                "json_import",
+                task_id=job_id,
+                summary=msg,
+                status=st,
+                ok=True,
+                progress_done=len(file_items) - parse_errors,
+                progress_total=len(file_items),
+                detail={
+                    "count": count,
+                    "files": len(file_items),
+                    "parse_errors": parse_errors,
+                    "merge": merge,
+                },
+            )
+        except Exception:
+            pass
+    except Exception as e:  # noqa: BLE001
+        msg = f"JSON 导入失败：{e}"
+        _io_job_patch(
+            job_id,
+            status="error",
+            phase="error",
+            message=msg,
+            error=str(e)[:400],
+            finished_at=time.time(),
+            percent=100,
+            ok=False,
+        )
+        try:
+            import task_log
+
+            task_log.record(
+                "json_import",
+                task_id=job_id,
+                summary=msg,
+                status="error",
+                ok=False,
+                detail={"error": str(e)[:400]},
+            )
+        except Exception:
+            pass
+
+
+def _run_json_export_job(
+    job_id: str,
+    *,
+    account_ids: list[str] | None,
+    include_secrets: bool,
+    filename_prefix: str,
+) -> None:
+    """Background: build export JSON and keep bytes process-local for download."""
+    try:
+        selected_n = len(account_ids) if account_ids is not None else 0
+        _io_job_patch(
+            job_id,
+            status="running",
+            phase="exporting",
+            message=(
+                f"正在导出选中账号（{selected_n}）…"
+                if account_ids is not None
+                else "正在导出全部账号…"
+            ),
+            done=0,
+            total=max(1, selected_n or 1),
+            percent=10,
+        )
+        result = accounts.export_auth_payload(
+            include_secrets=include_secrets,
+            account_ids=account_ids,
+        )
+        count = int(result.get("count") or 0)
+        if account_ids is not None and count <= 0:
+            msg = "没有匹配的账号可导出"
+            _io_job_patch(
+                job_id,
+                status="error",
+                phase="error",
+                message=msg,
+                error=msg,
+                count=0,
+                finished_at=time.time(),
+                percent=100,
+                ok=False,
+            )
+            try:
+                import task_log
+
+                task_log.record(
+                    "json_export",
+                    task_id=job_id,
+                    summary=msg,
+                    status="error",
+                    ok=False,
+                    progress_done=0,
+                    progress_total=selected_n,
+                    detail={"selected": selected_n},
+                )
+            except Exception:
+                pass
+            return
+
+        _io_job_patch(
+            job_id,
+            status="running",
+            phase="serializing",
+            message=f"正在序列化 {count} 个账号…",
+            done=count,
+            total=max(1, count),
+            count=count,
+            percent=70,
+        )
+        payload = {
+            "exported_at": result.get("exported_at") or time.time(),
+            "source": "grokcli-2api",
+            "count": count,
+            "auth": result.get("auth") or {},
+        }
+        if result.get("selected") is not None:
+            payload["selected"] = result.get("selected")
+        if result.get("missing") is not None:
+            payload["missing"] = result.get("missing")
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        filename = f"{filename_prefix}-{count}-{ts}.json"
+        msg = (
+            f"导出完成：{count} 个账号"
+            + (f"（选中 {selected_n}）" if account_ids is not None else "")
+        )
+        _io_job_patch(
+            job_id,
+            status="done",
+            phase="done",
+            message=msg,
+            count=count,
+            success=count,
+            fail=0,
+            done=count,
+            total=max(1, count),
+            filename=filename,
+            download_ready=True,
+            payload_bytes=body,
+            finished_at=time.time(),
+            percent=100,
+            ok=True,
+        )
+        try:
+            import task_log
+
+            task_log.record(
+                "json_export",
+                task_id=job_id,
+                summary=msg,
+                status="done",
+                ok=True,
+                progress_done=count,
+                progress_total=count,
+                detail={
+                    "count": count,
+                    "selected": selected_n if account_ids is not None else None,
+                    "include_secrets": include_secrets,
+                    "filename": filename,
+                    "bytes": len(body),
+                },
+            )
+        except Exception:
+            pass
+    except Exception as e:  # noqa: BLE001
+        msg = f"JSON 导出失败：{e}"
+        _io_job_patch(
+            job_id,
+            status="error",
+            phase="error",
+            message=msg,
+            error=str(e)[:400],
+            finished_at=time.time(),
+            percent=100,
+            ok=False,
+        )
+        try:
+            import task_log
+
+            task_log.record(
+                "json_export",
+                task_id=job_id,
+                summary=msg,
+                status="error",
+                ok=False,
+                detail={"error": str(e)[:400]},
+            )
+        except Exception:
+            pass
+
+
 @router.post("/accounts/import-file")
 async def import_account_file(
     request: Request,
@@ -1669,7 +2445,7 @@ async def import_account_file(
     merge: str = Form(default="true"),
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Import accounts from a JSON file upload (no paste / textarea)."""
+    """Import one JSON file as a background job with progress polling."""
     require_admin(request, x_admin_token)
     merge_flag = str(merge).strip().lower() not in ("0", "false", "no", "off")
     try:
@@ -1689,21 +2465,50 @@ async def import_account_file(
     text = text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty file content")
-    try:
-        payload: Any = json.loads(text)
-    except json.JSONDecodeError as e:
-        if text.startswith("eyJ") and "." in text and "\n" not in text:
-            payload = text
-        else:
-            raise HTTPException(status_code=400, detail=f"invalid JSON: {e}") from e
-    result = accounts.import_auth_payload(payload, merge=merge_flag)
-    if not result.get("ok"):
-        raise HTTPException(
-            status_code=400, detail=result.get("error") or "import failed"
-        )
-    result["filename"] = file.filename
-    return result
 
+    job_id = f"jsonimp_{uuid.uuid4().hex[:16]}"
+    now = time.time()
+    job = {
+        "id": job_id,
+        "kind": "json_import",
+        "status": "queued",
+        "phase": "queued",
+        "message": f"已排队：{file.filename or '1 个文件'}",
+        "total": 1,
+        "done": 0,
+        "success": 0,
+        "fail": 0,
+        "percent": 0,
+        "count": 0,
+        "parse_errors": 0,
+        "created_at": now,
+        "updated_at": now,
+        "finished_at": None,
+        "file_meta": [],
+        "error": None,
+        "ok": None,
+    }
+    _io_job_put(job_id, job)
+    t = threading.Thread(
+        target=_run_json_import_job,
+        kwargs={
+            "job_id": job_id,
+            "file_items": [{"filename": file.filename, "text": text}],
+            "merge": merge_flag,
+        },
+        daemon=True,
+        name=f"json-import-{job_id[-8:]}",
+    )
+    t.start()
+    return {
+        "ok": True,
+        "async": True,
+        "job_id": job_id,
+        "status": "queued",
+        "total": 1,
+        "message": job["message"],
+        "poll_url": f"/admin/api/accounts/import-files/jobs/{job_id}",
+    }
 
 
 @router.post("/accounts/import-files")
@@ -1713,7 +2518,7 @@ async def import_account_files_bulk(
     merge: str = Form(default="true"),
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Bulk JSON import: parse all files then one storage write."""
+    """Bulk JSON import as background job (parse → write) with progress polling."""
     require_admin(request, x_admin_token)
     merge_flag = str(merge).strip().lower() not in ("0", "false", "no", "off")
     if not files:
@@ -1721,47 +2526,91 @@ async def import_account_files_bulk(
     if len(files) > 200:
         raise HTTPException(status_code=400, detail="too many files (max 200)")
 
-    payloads: list[Any] = []
-    file_meta: list[dict[str, Any]] = []
+    file_items: list[dict[str, Any]] = []
     for f in files:
         try:
             raw_bytes = await f.read()
         except Exception as e:  # noqa: BLE001
-            file_meta.append({"filename": f.filename, "ok": False, "error": f"read failed: {e}"})
-            continue
+            raise HTTPException(status_code=400, detail=f"read file failed: {e}") from e
         if not raw_bytes:
-            file_meta.append({"filename": f.filename, "ok": False, "error": "empty file"})
             continue
         if len(raw_bytes) > 8 * 1024 * 1024:
-            file_meta.append({"filename": f.filename, "ok": False, "error": "file too large (max 8MB)"})
-            continue
+            raise HTTPException(
+                status_code=400,
+                detail=f"file too large (max 8MB): {f.filename}",
+            )
         try:
             text = raw_bytes.decode("utf-8-sig").strip()
         except UnicodeDecodeError as e:
-            file_meta.append({"filename": f.filename, "ok": False, "error": f"utf-8 required: {e}"})
-            continue
+            raise HTTPException(
+                status_code=400,
+                detail=f"file must be UTF-8 JSON ({f.filename}): {e}",
+            ) from e
         if not text:
-            file_meta.append({"filename": f.filename, "ok": False, "error": "empty content"})
             continue
-        try:
-            payload: Any = json.loads(text)
-        except json.JSONDecodeError:
-            if text.startswith("eyJ") and "." in text and "\n" not in text:
-                payload = text
-            else:
-                file_meta.append({"filename": f.filename, "ok": False, "error": "invalid JSON"})
-                continue
-        payloads.append(payload)
-        file_meta.append({"filename": f.filename, "ok": True})
+        file_items.append({"filename": f.filename, "text": text})
 
-    if not payloads:
-        raise HTTPException(status_code=400, detail="no valid JSON files")
+    if not file_items:
+        raise HTTPException(status_code=400, detail="no valid files")
 
-    result = accounts.import_auth_payloads_bulk(payloads, merge=merge_flag)
-    result["file_meta"] = file_meta
-    if not result.get("ok"):
-        raise HTTPException(status_code=400, detail=result.get("error") or "import failed")
-    return result
+    job_id = f"jsonimp_{uuid.uuid4().hex[:16]}"
+    now = time.time()
+    job = {
+        "id": job_id,
+        "kind": "json_import",
+        "status": "queued",
+        "phase": "queued",
+        "message": f"已排队，共 {len(file_items)} 个 JSON 文件",
+        "total": len(file_items),
+        "done": 0,
+        "success": 0,
+        "fail": 0,
+        "percent": 0,
+        "count": 0,
+        "parse_errors": 0,
+        "created_at": now,
+        "updated_at": now,
+        "finished_at": None,
+        "file_meta": [],
+        "error": None,
+        "ok": None,
+    }
+    _io_job_put(job_id, job)
+    t = threading.Thread(
+        target=_run_json_import_job,
+        kwargs={
+            "job_id": job_id,
+            "file_items": file_items,
+            "merge": merge_flag,
+        },
+        daemon=True,
+        name=f"json-import-{job_id[-8:]}",
+    )
+    t.start()
+    return {
+        "ok": True,
+        "async": True,
+        "job_id": job_id,
+        "status": "queued",
+        "total": len(file_items),
+        "message": job["message"],
+        "poll_url": f"/admin/api/accounts/import-files/jobs/{job_id}",
+    }
+
+
+@router.get("/accounts/import-files/jobs/{job_id}")
+async def get_json_import_job(
+    job_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Poll JSON import job progress."""
+    require_admin(request, x_admin_token)
+    job = _io_job_get(str(job_id or "").strip())
+    pub = _io_public_job(job)
+    if not pub.get("ok") and pub.get("error") == "job not found":
+        raise HTTPException(status_code=404, detail="job not found")
+    return pub
 
 
 def _export_response(
@@ -1796,17 +2645,85 @@ def _export_response(
     )
 
 
+def _start_export_job(
+    *,
+    account_ids: list[str] | None,
+    include_secrets: bool,
+    filename_prefix: str,
+) -> dict[str, Any]:
+    job_id = f"jsonexp_{uuid.uuid4().hex[:16]}"
+    now = time.time()
+    total_hint = len(account_ids) if account_ids is not None else 0
+    job = {
+        "id": job_id,
+        "kind": "json_export",
+        "status": "queued",
+        "phase": "queued",
+        "message": (
+            f"已排队导出选中 {total_hint} 个账号"
+            if account_ids is not None
+            else "已排队导出全部账号"
+        ),
+        "total": max(1, total_hint or 1),
+        "done": 0,
+        "success": 0,
+        "fail": 0,
+        "percent": 0,
+        "count": 0,
+        "download_ready": False,
+        "filename": None,
+        "created_at": now,
+        "updated_at": now,
+        "finished_at": None,
+        "error": None,
+        "ok": None,
+    }
+    _io_job_put(job_id, job)
+    t = threading.Thread(
+        target=_run_json_export_job,
+        kwargs={
+            "job_id": job_id,
+            "account_ids": account_ids,
+            "include_secrets": include_secrets,
+            "filename_prefix": filename_prefix,
+        },
+        daemon=True,
+        name=f"json-export-{job_id[-8:]}",
+    )
+    t.start()
+    return {
+        "ok": True,
+        "async": True,
+        "job_id": job_id,
+        "status": "queued",
+        "total": job["total"],
+        "message": job["message"],
+        "poll_url": f"/admin/api/accounts/export/jobs/{job_id}",
+        "download_url": f"/admin/api/accounts/export/jobs/{job_id}/download",
+    }
+
+
 @router.get("/accounts/export")
 async def export_accounts(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
     download: int = 1,
+    async_job: int = 0,
 ):
     """
     Export full auth.json (with tokens) for backup / migration.
-    download=1 → attachment; download=0 → JSON body.
+
+    - async_job=1 → start background job, poll /accounts/export/jobs/{id}
+    - download=1 → attachment (sync path only)
+    - download=0 → JSON body (sync path only)
     """
     require_admin(request, x_admin_token)
+    if async_job:
+        return _start_export_job(
+            account_ids=None,
+            include_secrets=True,
+            filename_prefix="grok2api-auth-export",
+        )
     result = accounts.export_auth_payload(include_secrets=True)
     return _export_response(result, download=bool(download))
 
@@ -1817,14 +2734,21 @@ async def export_accounts_batch(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
     download: int = 1,
+    async_job: int = 0,
 ):
-    """Export selected accounts only (multi-select)."""
+    """Export selected accounts only (multi-select). Supports async_job=1."""
     require_admin(request, x_admin_token)
     ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
     if len(ids) > 2000:
         raise HTTPException(status_code=400, detail="too many ids (max 2000)")
+    if async_job:
+        return _start_export_job(
+            account_ids=ids,
+            include_secrets=bool(body.include_secrets),
+            filename_prefix="grok2api-auth-export-selected",
+        )
     result = accounts.export_auth_payload(
         include_secrets=bool(body.include_secrets),
         account_ids=ids,
@@ -1835,6 +2759,51 @@ async def export_accounts_batch(
         result,
         download=bool(download),
         filename_prefix="grok2api-auth-export-selected",
+    )
+
+
+@router.get("/accounts/export/jobs/{job_id}")
+async def get_json_export_job(
+    job_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Poll JSON export job progress."""
+    require_admin(request, x_admin_token)
+    job = _io_job_get(str(job_id or "").strip())
+    pub = _io_public_job(job)
+    if not pub.get("ok") and pub.get("error") == "job not found":
+        raise HTTPException(status_code=404, detail="job not found")
+    return pub
+
+
+@router.get("/accounts/export/jobs/{job_id}/download")
+async def download_json_export_job(
+    job_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Download finished export payload for a job (process-local bytes)."""
+    require_admin(request, x_admin_token)
+    job = _io_job_get(str(job_id or "").strip())
+    if not isinstance(job, dict):
+        raise HTTPException(status_code=404, detail="job not found")
+    if str(job.get("status") or "") != "done" or not job.get("download_ready"):
+        raise HTTPException(status_code=409, detail="export not ready")
+    body = job.get("payload_bytes")
+    if not isinstance(body, (bytes, bytearray)):
+        raise HTTPException(
+            status_code=410,
+            detail="export payload expired or unavailable on this worker; re-export",
+        )
+    filename = job.get("filename") or "grok2api-auth-export.json"
+    return Response(
+        content=bytes(body),
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -2077,13 +3046,21 @@ async def accounts_probe_batch(
     results = await asyncio.to_thread(_run)
     ok_n = sum(1 for r in results if r.get("ok"))
     cool_n = sum(1 for r in results if (r.get("pool") or {}).get("in_cooldown"))
-    audit_log(
-        request,
-        action="accounts.probe_batch",
-        summary=f"批量模型探测：成功 {ok_n}/{len(results)} · 冷却 {cool_n}",
-        target_type="pool",
-        detail={"count": len(results), "ok": ok_n, "cooldown": cool_n},
-    )
+    summary = f"批量模型探测：成功 {ok_n}/{len(results)} · 冷却 {cool_n}"
+    try:
+        import task_log
+
+        task_log.record(
+            "probe_batch",
+            summary=summary,
+            status="done" if ok_n == len(results) else ("partial" if ok_n else "error"),
+            ok=ok_n > 0 or not results,
+            progress_done=ok_n,
+            progress_total=len(results),
+            detail={"count": len(results), "ok": ok_n, "cooldown": cool_n},
+        )
+    except Exception:
+        pass
     return {
         "ok": True,
         "count": len(results),
@@ -2102,21 +3079,7 @@ async def accounts_probe_all(
     """Run model probe for every live account (same as background cycle)."""
     require_admin(request, x_admin_token)
     result = await asyncio.to_thread(model_health.run_once, source="manual_all")
-    audit_log(
-        request,
-        action="accounts.probe_all",
-        summary=(
-            f"全部模型探测：可用 {result.get('available_count')}/{result.get('count')}"
-            if isinstance(result, dict) else "全部模型探测"
-        ),
-        target_type="pool",
-        detail={
-            "count": (result or {}).get("count") if isinstance(result, dict) else None,
-            "available_count": (result or {}).get("available_count") if isinstance(result, dict) else None,
-            "unavailable_count": (result or {}).get("unavailable_count") if isinstance(result, dict) else None,
-            "auto_action_count": (result or {}).get("auto_action_count") if isinstance(result, dict) else None,
-        },
-    )
+    # task_log is written inside model_health.run_once
     return result
 
 
@@ -2399,13 +3362,23 @@ async def refresh_accounts(
                 "skipped": result.get("skipped"),
                 "deferred": result.get("deferred"),
             }
-        audit_log(
-            request,
-            action="accounts.refresh",
-            summary=f"Token 续期{'（强制）' if force else ''}：刷新 {result.get('refreshed') or (result.get('refresh') or {}).get('refreshed') or 0}",
-            target_type="pool",
-            detail=result.get("refresh") if isinstance(result.get("refresh"), dict) else None,
-        )
+        try:
+            import task_log
+
+            refreshed = result.get("refreshed") or (result.get("refresh") or {}).get("refreshed") or 0
+            attempted = (result.get("refresh") or {}).get("attempted") or 0
+            failed = (result.get("refresh") or {}).get("failed") or 0
+            task_log.record(
+                "token_refresh",
+                summary=f"Token 续期{'（强制）' if force else ''}：刷新 {refreshed}",
+                status="done" if not failed else ("partial" if refreshed else "error"),
+                ok=bool(result.get("ok", True)) and not (failed and not refreshed),
+                progress_done=int(refreshed or 0),
+                progress_total=int(attempted or refreshed or 0),
+                detail=result.get("refresh") if isinstance(result.get("refresh"), dict) else None,
+            )
+        except Exception:
+            pass
     return result
 
 
@@ -2430,15 +3403,8 @@ async def maintainer_run(
     """Run one maintenance cycle immediately (normalize + refresh)."""
     require_admin(request, x_admin_token)
     force = True if body is None else bool(body.force)
-    result = token_maintainer.run_once(force=force)
-    audit_log(
-        request,
-        action="accounts.refresh",
-        summary=f"Token 续期{'（强制）' if force else ''}",
-        target_type="pool",
-        detail=(result.get("refresh") if isinstance(result, dict) else None),
-    )
-    return result
+    # task_log is written inside token_maintainer.run_once
+    return token_maintainer.run_once(force=force)
 
 
 @router.post("/accounts/normalize")
@@ -2493,13 +3459,25 @@ async def list_admin_logs(
     page_size: int = 50,
     q: str = "",
     action: str = "",
+    kind: str = "",
+    status: str = "",
 ):
-    """Query admin operation logs (PostgreSQL)."""
+    """Query task logs (registration / SSO / probe / renew…).
+
+    ``action`` is accepted as an alias of ``kind`` for older UI clients.
+    """
     require_admin(request, x_admin_token)
     try:
-        from store.audit_pg import list_logs
+        from store.task_logs_pg import list_tasks
 
-        return list_logs(q=q, action=action, page=page, page_size=page_size)
+        kk = (kind or action or "").strip()
+        return list_tasks(
+            q=q,
+            kind=kk,
+            status=status,
+            page=page,
+            page_size=page_size,
+        )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"logs query failed: {e}") from e
 
@@ -2509,11 +3487,12 @@ async def list_admin_log_actions(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
+    """Return distinct task kinds (kept path for older UI: /logs/actions)."""
     require_admin(request, x_admin_token)
     try:
-        from store.audit_pg import list_actions
+        from store.task_logs_pg import list_kinds
 
-        return {"ok": True, "actions": list_actions()}
+        return {"ok": True, "actions": list_kinds(), "kinds": list_kinds()}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e)[:300]) from e
 

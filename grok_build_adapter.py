@@ -484,7 +484,9 @@ def _make_email_receiver(
     base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
     prov = normalize_mail_provider(mail_provider, base_url=base)
     dom = (domain or MOEMAIL_DOMAIN or "").strip(".")
-    pre = (prefix or f"grok-{secrets.token_hex(4)}").lower()
+    # Random local-part only (no "grok-" brand prefix). Admin UI no longer exposes
+    # a custom prefix field; ignore leftover config values for new mailboxes.
+    pre = secrets.token_hex(5).lower()
 
     mailbox = create_mailbox(
         provider=prov,
@@ -754,6 +756,7 @@ def start_registration(
     count: int | None = None,
     concurrency: int | None = None,
     stagger_ms: int | None = None,
+    probe_delay_sec: float | int | None = None,
 ) -> dict[str, Any]:
     """Start one or many registration sessions (multi-thread).
 
@@ -767,6 +770,18 @@ def start_registration(
         return {"ok": False, "error": str(e)}
 
     _clean_old_sessions()
+
+    # Allow admin form / env to override settle window for post-import probe.
+    if probe_delay_sec is not None:
+        try:
+            globals()["REGISTER_PROBE_DELAY_SEC"] = max(
+                0.0, min(600.0, float(probe_delay_sec))
+            )
+            os.environ["GROK2API_REG_PROBE_DELAY_SEC"] = str(
+                int(globals()["REGISTER_PROBE_DELAY_SEC"])
+            )
+        except (TypeError, ValueError):
+            pass
 
     provider = (
         captcha_provider
@@ -1404,6 +1419,29 @@ def _spawn_batch_runner(
                             f"(ok={ok_n} fail={fail_n}, threads={workers})"
                         )
                     _mirror_reg_batch(bid, dict(b))
+                    try:
+                        import task_log
+
+                        st = str(b.get("status") or "done")
+                        task_log.record(
+                            "register",
+                            task_id=str(bid),
+                            summary=str(b.get("message") or f"协议注册批次 {bid}"),
+                            status=st,
+                            ok=st in {"done", "partial"} and ok_n > 0,
+                            progress_done=int(finished or 0),
+                            progress_total=int(target_total or finished or 0),
+                            detail={
+                                "batch_id": bid,
+                                "ok_count": ok_n,
+                                "fail_count": fail_n,
+                                "threads": workers,
+                                "status": st,
+                                "errors": (errors or [])[:10],
+                            },
+                        )
+                    except Exception:
+                        pass
             _release_batch_runner(bid, lock_token)
 
     threading.Thread(
