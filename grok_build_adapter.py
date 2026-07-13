@@ -28,7 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-13-reg-stop-fast-1"
+ADAPTER_BUILD = "2026-07-14-reg-tasklog-restore-1"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -249,6 +249,76 @@ def _mirror_reg_batch(batch_id: str, batch: dict[str, Any] | None) -> None:
         sessions_redis.reg_batch_put(batch_id, batch)
     except Exception:
         pass
+
+
+def _record_register_task(
+    *,
+    task_id: str | None,
+    summary: str,
+    status: str,
+    ok: bool | None = None,
+    progress_done: int = 0,
+    progress_total: int = 0,
+    finished: bool = True,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort write into admin「任务日志」for protocol registration."""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return
+    try:
+        import task_log
+
+        task_log.record(
+            "register",
+            task_id=tid,
+            summary=str(summary or f"协议注册 {tid}")[:500],
+            status=str(status or "done"),
+            ok=ok,
+            progress_done=int(progress_done or 0),
+            progress_total=int(progress_total or 0),
+            finished=bool(finished),
+            detail=detail if isinstance(detail, dict) else {},
+        )
+    except Exception:
+        # Never break registration workers because of logging.
+        pass
+
+
+def _session_task_log_payload(sess: dict[str, Any] | None) -> dict[str, Any]:
+    s = sess if isinstance(sess, dict) else {}
+    st = str(s.get("status") or "done").lower() or "done"
+    ok: bool | None
+    if st in ("imported", "success", "completed", "done"):
+        ok = True
+    elif st in ("error", "failed", "expired", "protocol_error", "protocol_blocked"):
+        ok = False
+    elif st in ("cancelled", "stopped"):
+        ok = False
+    else:
+        ok = None
+    email = str(s.get("email") or "").strip()
+    summary = str(s.get("message") or "").strip()
+    if not summary:
+        summary = f"协议注册 {email or s.get('id') or ''}".strip()
+    return {
+        "task_id": str(s.get("id") or ""),
+        "summary": summary,
+        "status": st,
+        "ok": ok,
+        "progress_done": 1 if st in _TERMINAL_STATUSES else 0,
+        "progress_total": 1,
+        "finished": st in _TERMINAL_STATUSES,
+        "detail": {
+            "session_id": s.get("id"),
+            "batch_id": s.get("batch_id"),
+            "email": email or None,
+            "status": st,
+            "error": s.get("error"),
+            "imported_account_ids": list(s.get("imported_account_ids") or [])[:20],
+            "adapter_build": s.get("adapter_build") or ADAPTER_BUILD,
+        },
+    }
 
 
 def _load_reg_sess(sid: str) -> dict[str, Any] | None:
@@ -735,6 +805,23 @@ def _start_one_registration(
             _sessions[sid]["message"] = f"started; email={_sessions[sid].get('email') or ''}"
             _sessions[sid]["updated_at"] = _now()
             _mirror_reg_sess(sid, _sessions[sid])
+    # Single-job starts are not covered by the batch finalizer — log "running"
+    # immediately so 任务日志 shows the registration task right away.
+    if not batch_id:
+        with _lock:
+            started_sess = dict(_sessions.get(sid) or {})
+        if started_sess:
+            payload = _session_task_log_payload(started_sess)
+            _record_register_task(
+                task_id=payload["task_id"],
+                summary=payload["summary"] or f"协议注册启动 {started_sess.get('email') or sid}",
+                status="running",
+                ok=None,
+                progress_done=0,
+                progress_total=1,
+                finished=False,
+                detail={**payload["detail"], "phase": "started"},
+            )
     threading.Thread(
         target=_run_registration,
         args=(sid, yescaptcha_key, proxy or "", receiver),
@@ -933,6 +1020,25 @@ def start_registration(
     with _lock:
         _batches[batch_id] = batch
     _mirror_reg_batch(batch_id, batch)
+    # Log batch start so 任务日志 has a running row even before the first
+    # session finishes (previously only the terminal row was written).
+    _record_register_task(
+        task_id=batch_id,
+        summary=f"协议注册批次启动 count={n} concurrency={workers}",
+        status="running",
+        ok=None,
+        progress_done=0,
+        progress_total=n,
+        finished=False,
+        detail={
+            "batch_id": batch_id,
+            "count": n,
+            "concurrency": workers,
+            "stagger_ms": stagger,
+            "phase": "started",
+            "adapter_build": ADAPTER_BUILD,
+        },
+    )
 
     started = _spawn_batch_runner(
         batch_id,
@@ -1426,29 +1532,26 @@ def _spawn_batch_runner(
                             f"(ok={ok_n} fail={fail_n}, threads={workers})"
                         )
                     _mirror_reg_batch(bid, dict(b))
-                    try:
-                        import task_log
-
-                        st = str(b.get("status") or "done")
-                        task_log.record(
-                            "register",
-                            task_id=str(bid),
-                            summary=str(b.get("message") or f"协议注册批次 {bid}"),
-                            status=st,
-                            ok=st in {"done", "partial"} and ok_n > 0,
-                            progress_done=int(finished or 0),
-                            progress_total=int(target_total or finished or 0),
-                            detail={
-                                "batch_id": bid,
-                                "ok_count": ok_n,
-                                "fail_count": fail_n,
-                                "threads": workers,
-                                "status": st,
-                                "errors": (errors or [])[:10],
-                            },
-                        )
-                    except Exception:
-                        pass
+                    st = str(b.get("status") or "done")
+                    _record_register_task(
+                        task_id=str(bid),
+                        summary=str(b.get("message") or f"协议注册批次 {bid}"),
+                        status=st,
+                        ok=st in {"done", "partial"} and ok_n > 0,
+                        progress_done=int(finished or 0),
+                        progress_total=int(target_total or finished or 0),
+                        finished=True,
+                        detail={
+                            "batch_id": bid,
+                            "ok_count": ok_n,
+                            "fail_count": fail_n,
+                            "threads": workers,
+                            "status": st,
+                            "errors": (errors or [])[:10],
+                            "phase": "finished",
+                            "adapter_build": ADAPTER_BUILD,
+                        },
+                    )
             _release_batch_runner(bid, lock_token)
 
     threading.Thread(
@@ -2243,9 +2346,25 @@ def _run_registration(
             except Exception:
                 pass
         with _lock:
+            final_sess = dict(_sessions.get(sid) or sess or {})
             if sid in _sessions:
                 _sessions[sid].pop("_receiver", None)
                 _sessions[sid].pop("_client", None)
+        # Single sessions write their own terminal task log. Batch sessions are
+        # summarized once by the batch finalizer (avoids N noise rows).
+        if final_sess and not final_sess.get("batch_id"):
+            payload = _session_task_log_payload(final_sess)
+            if payload.get("finished"):
+                _record_register_task(
+                    task_id=payload["task_id"] or sid,
+                    summary=payload["summary"],
+                    status=payload["status"],
+                    ok=payload["ok"],
+                    progress_done=payload["progress_done"],
+                    progress_total=payload["progress_total"],
+                    finished=True,
+                    detail={**payload["detail"], "phase": "finished"},
+                )
 
 
 def stop_registration_session(session_id: str) -> dict[str, Any]:

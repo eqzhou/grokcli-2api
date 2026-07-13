@@ -209,9 +209,21 @@ def list_tasks(
     }
 
 
+# Always surface these in the admin filter even before any rows exist.
+_KNOWN_KINDS = (
+    "register",
+    "sso_import",
+    "json_import",
+    "json_export",
+    "probe",
+    "renew",
+)
+
+
 def list_kinds(limit: int = 50) -> list[str]:
+    known = [k for k in _KNOWN_KINDS]
     if not enabled():
-        return []
+        return known[: max(1, min(200, int(limit or 50)))]
     try:
         with connection() as conn:
             with conn.cursor() as cur:
@@ -225,6 +237,12 @@ def list_kinds(limit: int = 50) -> list[str]:
                     """,
                     (max(1, min(200, int(limit))),),
                 )
-                return [str(r[0]) for r in cur.fetchall() if r and r[0]]
+                found = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+        # Prefer DB-ordered kinds, then fill missing known kinds so filters stay useful.
+        out: list[str] = []
+        for k in found + known:
+            if k and k not in out:
+                out.append(k)
+        return out[: max(1, min(200, int(limit or 50)))]
     except Exception:
-        return []
+        return known

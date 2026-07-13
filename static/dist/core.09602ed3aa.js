@@ -30,6 +30,8 @@ window.G2A = window.G2A || {};
   let regLastEmailText = "";
   let regProbedIds = new Set();
   let regProbeRunning = false;
+  // Survive hard refresh: remember which batch/sessions the UI was tracking.
+  const REG_TRACK_KEY = "g2a_reg_track_v1";
   let keysCache = [];
   let quotaCache = {};
   let uiRefreshTimer = null;
@@ -684,6 +686,8 @@ function rebindPageControls() {
           { forceShow: true }
         );
       }
+      // Persist track immediately so hard refresh can restore this card.
+      saveRegTrack();
       toast(r.message || `已启动注册 ×${startedCount}（线程 ${workers}，同时最多 ${workers} 个）`);
       // Start path auto-saves on server; refresh form from DB shortly after
       setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
@@ -2263,6 +2267,62 @@ pip install -r requirements.txt
 /* ── Email registration ─────────────────────────────── */
 const REG_CONFIG_KEY = "g2a_registration_config_v1";
 
+function clearRegTrack() {
+  try { sessionStorage.removeItem(REG_TRACK_KEY); } catch (_) {}
+}
+
+function saveRegTrack() {
+  try {
+    if (!regBatchId && !regSessionId && !(regSessionIds && regSessionIds.length)) {
+      clearRegTrack();
+      return;
+    }
+    sessionStorage.setItem(
+      REG_TRACK_KEY,
+      JSON.stringify({
+        batch_id: regBatchId || null,
+        session_id: regSessionId || null,
+        session_ids: Array.isArray(regSessionIds) ? regSessionIds.slice(0, 200) : [],
+        finished: !!regFinishedNotified,
+        saved_at: Date.now(),
+      })
+    );
+  } catch (_) {}
+}
+
+function loadRegTrack() {
+  try {
+    const raw = sessionStorage.getItem(REG_TRACK_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object") return null;
+    // Drop stale tracks (> 12h) so we don't keep resurrecting ancient cards.
+    const age = Date.now() - Number(obj.saved_at || 0);
+    if (age > 12 * 3600 * 1000) {
+      clearRegTrack();
+      return null;
+    }
+    return obj;
+  } catch (_) {
+    return null;
+  }
+}
+
+function applyRegTrack(track) {
+  if (!track || typeof track !== "object") return false;
+  const batchId = track.batch_id || null;
+  const ids = Array.isArray(track.session_ids)
+    ? track.session_ids.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  const sid = track.session_id || ids[0] || null;
+  if (!batchId && !sid && !ids.length) return false;
+  regBatchId = batchId;
+  regSessionIds = ids.length ? ids.slice() : (sid ? [sid] : []);
+  regSessionId = regSessionIds[0] || sid || null;
+  regFinishedNotified = !!track.finished;
+  return hasTrackedRegTask();
+}
+
 function dismissRegProgressCard() {
   // Close only the UI card. Backend registration keeps running unless user hits stop.
   try { clearInterval(regPollTimer); } catch (_) {}
@@ -2278,6 +2338,7 @@ function dismissRegProgressCard() {
   regLastEmailText = "";
   regProbedIds = new Set();
   regProbeRunning = false;
+  clearRegTrack();
   hidePanel("reg-session-box");
   setLogPanel("reg-log", "", { forceShow: false });
   setRegStatusText("idle");
@@ -2360,6 +2421,7 @@ async function stopRegistration() {
       { forceShow: true }
     );
     showPanel("reg-session-box");
+    saveRegTrack();
     // Keep polling until cancelled/stopped, but avoid aggressive 1.2s thrash.
     startRegPolling({ immediate: true, intervalMs: 2000 });
   } catch (e) {
@@ -3021,18 +3083,110 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
   } else {
     startRegPolling({ immediate: true, intervalMs: 2000 });
   }
+  saveRegTrack();
   return true;
+}
+
+async function restoreTrackedRegistration({ toastIfEmpty = false } = {}) {
+  // Prefer the last browser-tracked batch/session ids (hard refresh safe).
+  const track = loadRegTrack();
+  if (!track) return false;
+  if (!applyRegTrack(track)) return false;
+
+  showPanel("reg-session-box");
+  setRegStatusText(track.finished ? "restoring…" : "restoring…");
+  setRegEmailText(regBatchId ? `batch ${regBatchId}` : (regSessionId || "—"));
+  setLogPanel(
+    "reg-log",
+    [
+      "[恢复] 正在从后端恢复注册进度…",
+      regBatchId ? `batch_id: ${regBatchId}` : "",
+      regSessionId ? `session_id: ${regSessionId}` : "",
+      regSessionIds.length > 1 ? `session_ids: ${regSessionIds.slice(0, 12).join(", ")}${regSessionIds.length > 12 ? "…" : ""}` : "",
+    ].filter(Boolean).join("\n"),
+    { forceShow: true }
+  );
+
+  // Fetch tracked batch/session even if list endpoint is empty on this worker.
+  try {
+    let batch = null;
+    let sessions = [];
+    if (regBatchId) {
+      try {
+        batch = await api("/accounts/register-email/batches/" + encodeURIComponent(regBatchId));
+      } catch (_) {
+        batch = null;
+      }
+    }
+    if (batch) {
+      if (Array.isArray(batch.session_ids) && batch.session_ids.length) {
+        for (const id of batch.session_ids) {
+          if (id && !regSessionIds.includes(id)) regSessionIds.push(id);
+        }
+        regSessionId = regSessionIds[0] || regSessionId;
+      }
+      if (Array.isArray(batch.sessions) && batch.sessions.length) {
+        sessions = batch.sessions.slice();
+      }
+    }
+    if (!sessions.length) {
+      const ids = regSessionIds.length ? regSessionIds : (regSessionId ? [regSessionId] : []);
+      for (const id of ids.slice(0, 40)) {
+        try {
+          const s = await api("/accounts/register-email/sessions/" + encodeURIComponent(id));
+          if (s) sessions.push(s);
+        } catch (_) {}
+      }
+    }
+    if (sessions.length || batch) {
+      const ok = adoptRegSessions(sessions, {
+        batch: batch || (regBatchId ? { id: regBatchId, batch_id: regBatchId, session_ids: regSessionIds } : null),
+        continuePolling: true,
+      });
+      if (ok) return true;
+    }
+    // Track exists but backend no longer has it (TTL expired / finished ages ago).
+    // Keep a final "not found" card instead of silently vanishing.
+    setRegStatusText("not found");
+    setLogPanel(
+      "reg-log",
+      [
+        "[恢复] 后端已找不到该注册任务（可能已完成并过期，或 worker 重启后未镜像）",
+        regBatchId ? `batch_id: ${regBatchId}` : "",
+        regSessionId ? `session_id: ${regSessionId}` : "",
+        "可点「关闭」收起进度卡片，或重新开始注册",
+      ].filter(Boolean).join("\n"),
+      { forceShow: true }
+    );
+    saveRegTrack();
+    if (toastIfEmpty) toast("未找到进行中的注册任务", false);
+    return true;
+  } catch (e) {
+    if (toastIfEmpty) toast((e && e.message) || "恢复注册进度失败", false);
+    return hasTrackedRegTask();
+  }
 }
 
 async function restoreActiveRegistration({ force = false, toastIfEmpty = false } = {}) {
   // Hard refresh / soft-nav re-entry loses in-memory session ids. Rebuild from backend.
+  if (!hasTrackedRegTask()) {
+    // Rehydrate from sessionStorage first (hard refresh path).
+    applyRegTrack(loadRegTrack());
+  }
   if (!force && hasTrackedRegTask()) {
     showPanel("reg-session-box");
     if (!regFinishedNotified) startRegPolling({ immediate: true, intervalMs: 2000 });
     else pollRegSession().catch(() => {});
+    saveRegTrack();
     return true;
   }
   try {
+    // 1) Prefer explicitly tracked ids (survives refresh even when list is empty).
+    if (hasTrackedRegTask() || loadRegTrack()) {
+      const tracked = await restoreTrackedRegistration({ toastIfEmpty: false });
+      if (tracked) return true;
+    }
+
     const all = await api("/accounts/register-email/sessions");
     const sessions = Array.isArray(all && all.sessions) ? all.sessions : [];
     const batches = Array.isArray(all && all.batches) ? all.batches : [];
@@ -3467,6 +3621,8 @@ async function pollRegSession() {
 
     if (sessions.length <= 1 && !regBatchId) showRegSession(sessions[0] || batch, { batch });
     else showRegSessionGroup(sessions, { batch });
+    // Keep browser track in sync as late-spawned sessions appear.
+    saveRegTrack();
 
     const stats = summarizeRegSessions(sessions);
     // Use batch totals if spawner hasn't emitted all sessions yet.
@@ -3527,6 +3683,8 @@ async function pollRegSession() {
 
     regFinishedNotified = true;
     regStopping = false;
+    // Keep track after finish so refresh can still reopen the final card.
+    saveRegTrack();
     const success = Math.max(
       stats.success,
       Number((batch && batch.imported) || 0) || 0
@@ -4986,6 +5144,7 @@ if ($("btn-start-reg")) {
           showRegSession(r);
           toast(r.email ? ("已启动: " + r.email) : "已启动邮箱注册");
         }
+        saveRegTrack();
         setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
         startRegPolling({ immediate: true, intervalMs: 2000 });
         if (r.batch_id) {
@@ -4999,6 +5158,7 @@ if ($("btn-start-reg")) {
               if (Array.isArray(b.sessions) && b.sessions.length) {
                 showRegSessionGroup(b.sessions, { batch: b });
               }
+              saveRegTrack();
             } catch (_) {}
           }, 1500);
         }
