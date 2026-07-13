@@ -2406,7 +2406,7 @@ function syncRegMailProviderUI() {
   }
   if ($("reg-domain")) {
     $("reg-domain").placeholder = isYyds
-      ? "可选公开域名；留空可自动选"
+      ? "留空则自动随机获取公开域名"
       : isGpt
         ? "可选；留空由 GPTMail 随机分配"
         : "example.com";
@@ -2650,11 +2650,13 @@ function loadRegConfigLocal() {
 }
 
 async function loadRegConfig(force) {
-  // Prefer server truth. Local cache is only a first-paint fallback when we
+  // Prefer server/DB truth. Local cache is only a first-paint fallback when we
   // have nothing yet — never let it overwrite a just-cleared domain/key.
+  // Always re-fetch when forced, or when cache is older than 2s (multi-worker
+  // saves must not stick on a stale browser/page session forever).
   if (!force && !regConfigCache) loadRegConfigLocal();
   const now = Date.now();
-  if (!force && regConfigCache && now - regConfigLoadedAt < 15000) {
+  if (!force && regConfigCache && now - regConfigLoadedAt < 2000) {
     applyRegConfig(regConfigCache);
     return regConfigCache;
   }
@@ -2665,6 +2667,10 @@ async function loadRegConfig(force) {
       applyRegConfig(cfg);
       cacheRegConfigLocal(cfg);
       regConfigLoadedAt = Date.now();
+      // Expose source for debugging in console when not from database.
+      if (r && r.source && r.source !== "database") {
+        console.info("registration_config source=", r.source);
+      }
       return cfg;
     }
   } catch (e) {

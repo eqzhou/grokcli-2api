@@ -130,15 +130,44 @@ def _load_disk() -> dict[str, Any]:
         return {}
 
 
+def _refresh_pg_scalar_keys_into(data: dict[str, Any]) -> None:
+    """Overlay durable scalar settings from PostgreSQL onto an in-memory map.
+
+    Multi-worker hybrid mode: each process keeps a sticky ``_mem`` cache. Writes
+    go to PG, but other workers would otherwise keep serving stale values
+    (especially ``registration_config`` after admin save / start).
+    """
+    pg = _pg_settings()
+    if pg is None or not isinstance(data, dict):
+        return
+    for key in _PG_SCALAR_KEYS:
+        try:
+            fv = pg.get_setting(key)
+        except Exception:
+            continue
+        if fv is not None:
+            data[key] = fv
+        else:
+            # Explicit delete/clear on another worker — drop local copy.
+            data.pop(key, None)
+
+
 def _load() -> dict[str, Any]:
-    """Return the live in-memory settings map (revalidates file mtime)."""
+    """Return the live in-memory settings map (revalidates PG / file)."""
     global _mem, _mem_mtime_ns, _mem_stat_at
     with _lock:
         now = time.time()
-        # Optimization: re-read settings.json when another process rewrote it
-        # (multi-worker shared volume without PG). Sticky cache caused lost
-        # cooldowns / mode changes across workers.
-        if _mem is not None and _pg_settings() is None:
+        # Hybrid / multi-worker: periodically re-read durable scalar keys from PG
+        # so registration config / mode flags stay consistent across workers.
+        if _mem is not None and _pg_settings() is not None:
+            if now - _mem_stat_at >= _MEM_STAT_MIN_INTERVAL:
+                _mem_stat_at = now
+                try:
+                    _refresh_pg_scalar_keys_into(_mem)
+                except Exception:
+                    pass
+        # File backend: re-read settings.json when another process rewrote it.
+        elif _mem is not None and _pg_settings() is None:
             if now - _mem_stat_at >= _MEM_STAT_MIN_INTERVAL:
                 _mem_stat_at = now
                 mt = _file_mtime_ns()
@@ -1040,6 +1069,21 @@ _VALID_REASONING = ("off", "think_tag", "content")
 
 
 def _get_setting_value(key: str, default: Any = None) -> Any:
+    # Durable scalars: always prefer PostgreSQL so multi-worker reads see the
+    # latest admin save (registration_config, account_mode, …).
+    if key in _PG_SCALAR_KEYS:
+        pg = _pg_settings()
+        if pg is not None:
+            try:
+                fv = pg.get_setting(key)
+            except Exception:
+                fv = None
+            if fv is not None:
+                with _lock:
+                    data = _load()
+                    data[key] = fv
+                return fv
+            # Missing in PG → fall through to mem/default (first boot / env only).
     data = _load()
     if key in data and data.get(key) is not None:
         return data.get(key)
@@ -1047,13 +1091,22 @@ def _get_setting_value(key: str, default: Any = None) -> Any:
 
 
 def _set_setting_value(key: str, value: Any) -> Any:
+    # Write PostgreSQL first so other workers can observe the change immediately
+    # via _get_setting_value / periodic refresh (do not rely on sticky mem alone).
+    pg = _pg_settings()
+    if pg is not None and key in _PG_SCALAR_KEYS:
+        try:
+            pg.set_setting(key, value)
+        except Exception:
+            # Still update local mem + mirror file so this worker keeps working.
+            pass
     with _lock:
         data = _load()
         data[key] = value
         data["updated_at"] = time.time()
         _save(data, immediate=True)
-    pg = _pg_settings()
-    if pg is not None:
+    # Non-scalar / non-PG keys still get a best-effort PG side write when enabled.
+    if pg is not None and key not in _PG_SCALAR_KEYS:
         try:
             pg.set_setting(key, value)
         except Exception:
@@ -1675,7 +1728,12 @@ def _normalize_registration_config(
 
 
 def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
-    """Effective registration config: DB override merged with env defaults."""
+    """Effective registration config: DB override merged with env defaults.
+
+    Always reads ``registration_config`` through ``_get_setting_value`` which
+    prefers PostgreSQL under hybrid multi-worker, so admin saves are visible
+    on every worker without restart.
+    """
     stored = _get_setting_value("registration_config", None)
     if not isinstance(stored, dict):
         stored = {}

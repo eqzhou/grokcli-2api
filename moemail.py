@@ -11,6 +11,7 @@ Providers:
 """
 from __future__ import annotations
 
+import random
 import re
 from typing import Any
 from urllib.parse import quote, unquote, urlparse, urlunparse
@@ -356,14 +357,15 @@ def yyds_create_mailbox(
             "(X-API-Key, usually starts with AC-)."
         )
     base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
-    dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
+    # Never fall back to MOEMAIL_DOMAIN (MoeMail default / example.com). Empty
+    # means auto: randomly pick a healthy public domain from GET /v1/domains.
+    dom = (domain or "").strip().lstrip("@").strip(".")
     if not dom:
-        # Best-effort: pick first public domain from catalog.
         dom = yyds_pick_domain(api_key=key, base_url=base) or ""
     if not dom:
         raise ValueError(
-            "YYDS Mail domain missing. Set domain in registration config "
-            "(e.g. a public domain from GET /v1/domains)."
+            "YYDS Mail domain auto-fetch failed. Leave domain empty for random "
+            "public domain, or set an explicit domain from GET /v1/domains."
         )
     local = (name or "").strip().lower() or None
     payload: dict[str, Any] = {"domain": dom}
@@ -399,29 +401,32 @@ def yyds_create_mailbox(
     }
 
 
-def yyds_pick_domain(
+def yyds_list_domains(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
-) -> str | None:
-    """Pick a healthy public domain from YYDS catalog (prefer wildcard MX)."""
+    public_only: bool = True,
+    ready_only: bool = True,
+) -> list[str]:
+    """List usable domains from YYDS catalog (``GET /v1/domains``)."""
     key = (api_key or MOEMAIL_API_KEY or "").strip()
     base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
     try:
         with httpx.Client(timeout=20.0) as client:
             resp = client.get(f"{base}/v1/domains", headers=_headers(key) if key else {})
             if resp.status_code >= 400:
-                return None
+                return []
             data = resp.json()
     except Exception:
-        return None
+        return []
     items = data
     if isinstance(data, dict):
         items = data.get("data") or data.get("domains") or data.get("items") or []
     if not isinstance(items, list):
-        return None
+        return []
     preferred: list[str] = []
     fallback: list[str] = []
+    seen: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -429,15 +434,38 @@ def yyds_pick_domain(
         if not isinstance(name, str) or not name.strip():
             continue
         name = name.strip().lstrip("@").strip(".")
-        if item.get("isPublic") is False:
+        if not name or name in seen:
             continue
-        if item.get("receivingReady") is False or item.get("isMxValid") is False:
+        if public_only and item.get("isPublic") is False:
             continue
+        if ready_only and (
+            item.get("receivingReady") is False or item.get("isMxValid") is False
+        ):
+            continue
+        seen.add(name)
         if item.get("wildcardMxValid") is True or item.get("wildcard_mx_valid") is True:
             preferred.append(name)
         else:
             fallback.append(name)
-    return (preferred or fallback or [None])[0]
+    # Prefer wildcard-MX domains first so random pick weights healthier ones.
+    return preferred + fallback
+
+
+def yyds_pick_domain(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> str | None:
+    """Randomly pick a healthy public domain from YYDS catalog.
+
+    Catalog order is preferred (wildcard MX) then fallback. Randomize across
+    the full usable set so batch registration rotates domains.
+    Empty admin domain => call this.
+    """
+    domains = yyds_list_domains(api_key=api_key, base_url=base_url)
+    if not domains:
+        return None
+    return random.choice(domains)
 
 
 def yyds_fetch_messages(
@@ -569,7 +597,9 @@ def gptmail_create_mailbox(
     """Create a temporary inbox on GPTMail (https://mail.chatgpt.org.uk/zh/api/)."""
     key = (api_key or MOEMAIL_API_KEY or "").strip() or GPTMAIL_PUBLIC_TEST_KEY
     base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
-    dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
+    # Never fall back to MOEMAIL_DOMAIN (MoeMail default). Empty => GPTMail
+    # random generate / public domain pick.
+    dom = (domain or "").strip().lstrip("@").strip(".")
     pre = (name or "").strip().lower() or None
 
     # Prefer server-side generate so we get a real active domain when none given.

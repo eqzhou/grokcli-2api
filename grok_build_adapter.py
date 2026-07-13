@@ -483,7 +483,12 @@ def _make_email_receiver(
         )
     base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
     prov = normalize_mail_provider(mail_provider, base_url=base)
-    dom = (domain or MOEMAIL_DOMAIN or "").strip(".")
+    # YYDS/GPTMail: empty domain means provider-side auto/random pick.
+    # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
+    if prov in {"yyds", "gptmail"}:
+        dom = (domain or "").strip().lstrip("@").strip(".")
+    else:
+        dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
     # Random local-part only (no "grok-" brand prefix). Admin UI no longer exposes
     # a custom prefix field; ignore leftover config values for new mailboxes.
     pre = secrets.token_hex(5).lower()
