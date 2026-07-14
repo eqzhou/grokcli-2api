@@ -44,6 +44,10 @@ _LOCAL_TOOL_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "write": ("file_path", "content"),
     "edit": ("file_path", "old_string", "new_string"),
     "update": ("file_path", "old_string", "new_string"),
+    "strreplace": ("file_path", "old_string", "new_string"),
+    "str_replace": ("file_path", "old_string", "new_string"),
+    "stringreplace": ("file_path", "old_string", "new_string"),
+    "replace": ("file_path", "old_string", "new_string"),
     "multiedit": ("file_path", "edits"),
     "notebookedit": ("notebook_path", "new_source"),
     "bash": ("command",),
@@ -94,8 +98,11 @@ def _local_required_keys_for_tool(name: str | None) -> tuple[str, ...]:
         return ()
     if key in _LOCAL_TOOL_REQUIRED_KEYS:
         return _LOCAL_TOOL_REQUIRED_KEYS[key]
+    # Token-boundary only — never plain endswith. TaskUpdate must not inherit
+    # Update's file_path/old_string/new_string requirements (same for TodoWrite
+    # vs Write). That mis-match held task tools forever under sub2api.
     for short, req in _LOCAL_TOOL_REQUIRED_KEYS.items():
-        if key.endswith(short) or key.endswith(f"_{short}"):
+        if key.endswith(f"_{short}") or key.endswith(f"__{short}"):
             return req
     return ()
 
@@ -132,10 +139,12 @@ def _local_normalize_tool_arg_keys(obj: Any) -> Any:
 
 def _local_tool_arg_value_score(value: Any) -> tuple[int, int, int, int]:
     if isinstance(value, dict):
+        present = 0
         non_empty = 0
         for v in value.values():
             if v is None:
                 continue
+            present += 1
             if isinstance(v, str) and not v.strip():
                 continue
             if isinstance(v, (list, dict)) and not v:
@@ -145,7 +154,7 @@ def _local_tool_arg_value_score(value: Any) -> tuple[int, int, int, int]:
             nbytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
         except (TypeError, ValueError):
             nbytes = len(str(value))
-        return (3, len(value), non_empty, nbytes)
+        return (3, len(value), present, non_empty * 1_000_000 + nbytes)
     if isinstance(value, list):
         try:
             nbytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
@@ -170,6 +179,9 @@ def _local_merge_tool_arg_dicts(values: list[Any]) -> dict[str, Any] | None:
                 continue
             old = merged.get(k)
             if old in (None, "", [], {}):
+                merged[k] = v
+            elif isinstance(v, str) and not v.strip():
+                # Later explicit empty string (Edit/Update new_string="" delete).
                 merged[k] = v
             elif isinstance(old, dict) and isinstance(v, dict):
                 tmp = dict(old)
@@ -308,6 +320,9 @@ def _local_tool_args_ready(args: str, *, tool_name: str | None = None) -> bool:
         return False
     if isinstance(parsed, dict):
         required = _local_required_keys_for_tool(tool_name)
+        # new_string="" is a valid Edit/Update (delete match). Only path-like
+        # required keys must be non-empty.
+        empty_ok = {"new_string", "new_source", "content"}
         for k in required:
             if k not in parsed:
                 return False
@@ -315,7 +330,9 @@ def _local_tool_args_ready(args: str, *, tool_name: str | None = None) -> bool:
             if val is None:
                 return False
             if isinstance(val, str) and not val.strip():
-                return False
+                if k not in empty_ok:
+                    return False
+                continue
             if isinstance(val, (list, dict)) and not val:
                 return False
     return True
@@ -1289,6 +1306,32 @@ class ResponsesLiveStreamer:
             if slot.get("args_emitted") and (slot.get("name") or "").strip():
                 return True
         return False
+
+    def any_shipable_tool(self, *, terminal: bool = False) -> bool:
+        """Public: whether any held tool can ship (strict mid-stream or terminal)."""
+        return self._any_shipable_tool(terminal=terminal)
+
+    def held_tool_summary(self) -> list[dict[str, Any]]:
+        """Compact debug view of held tool slots (admin / empty-turn diagnostics)."""
+        out: list[dict[str, Any]] = []
+        for idx in sorted(self._tools.keys()):
+            slot = self._tools.get(idx) or {}
+            args = slot.get("arguments") or ""
+            if not isinstance(args, str):
+                args = str(args)
+            out.append(
+                {
+                    "index": idx,
+                    "name": (slot.get("name") or "")[:80],
+                    "call_id": (slot.get("call_id") or "")[:64],
+                    "args_len": len(args),
+                    "args_emitted": bool(slot.get("args_emitted")),
+                    "done": idx in self._tool_done,
+                    "ready_strict": self._tool_is_ready(idx, terminal=False),
+                    "ready_terminal": self._tool_is_ready(idx, terminal=True),
+                }
+            )
+        return out
 
     def on_text_delta(self, delta: str) -> list[str]:
         if not delta or self._closed:

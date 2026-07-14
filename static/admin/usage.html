@@ -249,7 +249,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>使用明细</h3>
-      <p>每条 API 请求的 Token 明细、调用的 API Key、客户端 IP 与缓存命中（prompt cache）。</p>
+      <p>每条 API 请求的 Token 明细、首字/完成耗时、调用的 API Key、客户端 IP 与缓存命中（prompt cache）。</p>
     </div>
     <div class="g2a-actions">
       <button class="g2a-btn g2a-btn-default" id="btn-usage-events-reload">刷新明细</button>
@@ -304,10 +304,12 @@
           <th style="width:100px">合计 token</th>
           <th style="width:100px">缓存 token</th>
           <th style="width:100px">推理 token</th>
+          <th style="width:90px">首字</th>
+          <th style="width:90px">完成</th>
           <th style="width:70px">结果</th>
         </tr>
       </thead>
-      <tbody id="usage-events-tbody"><tr><td colspan="11" class="g2a-muted">加载中…</td></tr></tbody>
+      <tbody id="usage-events-tbody"><tr><td colspan="13" class="g2a-muted">加载中…</td></tr></tbody>
     </table>
   </div>
   <div class="g2a-actions" style="justify-content:space-between;margin-top:12px">
@@ -327,6 +329,6 @@
   <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.03235a7d29.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.9d84f2f9c6.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

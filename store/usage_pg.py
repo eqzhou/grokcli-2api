@@ -378,6 +378,7 @@ def record_event(
     user_agent: str | None = None,
     status_code: int | None = None,
     latency_ms: int | None = None,
+    ttft_ms: int | None = None,
     error: str | None = None,
     detail: dict[str, Any] | None = None,
     ts: float | None = None,
@@ -397,6 +398,25 @@ def record_event(
     if not ok:
         pt = ct = tt = cr = cc = rt = 0
     payload = detail if isinstance(detail, dict) else {}
+    # Prefer explicit kwargs; fall back to detail JSON for older call sites.
+    lat_out = latency_ms
+    ttft_out = ttft_ms
+    if isinstance(payload, dict):
+        if lat_out is None and payload.get("latency_ms") is not None:
+            try:
+                lat_out = int(payload.get("latency_ms"))
+            except Exception:
+                pass
+        if ttft_out is None and payload.get("ttft_ms") is not None:
+            try:
+                ttft_out = int(payload.get("ttft_ms"))
+            except Exception:
+                pass
+        # Mirror top-level columns into detail for the admin detail panel.
+        if lat_out is not None and payload.get("latency_ms") is None:
+            payload["latency_ms"] = int(lat_out)
+        if ttft_out is not None and payload.get("ttft_ms") is None:
+            payload["ttft_ms"] = int(ttft_out)
     created_expr = "now()"
     params_extra: list[Any] = []
     if ts is not None:
@@ -418,13 +438,15 @@ def record_event(
                       api_key_id, account_id, model, protocol, path, stream, ok,
                       prompt_tokens, completion_tokens, total_tokens,
                       cache_read_tokens, cache_creation_tokens, reasoning_tokens,
-                      client_ip, user_agent, status_code, latency_ms, error, detail
+                      client_ip, user_agent, status_code, latency_ms, ttft_ms,
+                      error, detail
                     ) VALUES (
                       {created_expr},
                       %s, %s, %s, %s, %s, %s, %s,
                       %s, %s, %s,
                       %s, %s, %s,
-                      %s, %s, %s, %s, %s, %s::jsonb
+                      %s, %s, %s, %s, %s,
+                      %s, %s::jsonb
                     )
                     RETURNING id
                     """,
@@ -446,7 +468,8 @@ def record_event(
                         (str(client_ip)[:80] if client_ip else None),
                         (str(user_agent)[:300] if user_agent else None),
                         (int(status_code) if status_code is not None else None),
-                        (int(latency_ms) if latency_ms is not None else None),
+                        (int(lat_out) if lat_out is not None else None),
+                        (int(ttft_out) if ttft_out is not None else None),
                         (str(error)[:500] if error else None),
                         json_dump(payload),
                     ),
@@ -671,7 +694,8 @@ def list_events(
                            stream, ok,
                            prompt_tokens, completion_tokens, total_tokens,
                            cache_read_tokens, cache_creation_tokens, reasoning_tokens,
-                           client_ip, user_agent, status_code, latency_ms, error, detail
+                           client_ip, user_agent, status_code, latency_ms, ttft_ms,
+                           error, detail
                     FROM usage_events
                     {wh}
                     ORDER BY created_at DESC, id DESC
@@ -685,7 +709,7 @@ def list_events(
 
     items: list[dict[str, Any]] = []
     for r in rows:
-        detail = r[20]
+        detail = r[21]
         if isinstance(detail, str):
             try:
                 import json
@@ -700,6 +724,20 @@ def list_events(
             )
         except Exception:
             created_ts = time.time()
+        latency_val = r[18]
+        ttft_val = r[19]
+        # Fall back to detail JSON for rows written before top-level columns.
+        if isinstance(detail, dict):
+            if latency_val is None and detail.get("latency_ms") is not None:
+                try:
+                    latency_val = int(detail.get("latency_ms"))
+                except Exception:
+                    pass
+            if ttft_val is None and detail.get("ttft_ms") is not None:
+                try:
+                    ttft_val = int(detail.get("ttft_ms"))
+                except Exception:
+                    pass
         items.append(
             {
                 "id": int(r[0]),
@@ -720,8 +758,9 @@ def list_events(
                 "client_ip": r[15],
                 "user_agent": r[16],
                 "status_code": r[17],
-                "latency_ms": r[18],
-                "error": r[19],
+                "latency_ms": latency_val,
+                "ttft_ms": ttft_val,
+                "error": r[20],
                 "detail": detail if isinstance(detail, dict) else {},
             }
         )

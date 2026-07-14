@@ -147,6 +147,7 @@ def record_usage(
     user_agent: str | None = None,
     status_code: int | None = None,
     latency_ms: int | None = None,
+    ttft_ms: int | None = None,
     error: str | None = None,
     detail: dict[str, Any] | None = None,
     ts: float | None = None,
@@ -194,6 +195,22 @@ def record_usage(
         detail_out: dict[str, Any] = {}
         if isinstance(detail, dict):
             detail_out.update(detail)
+        # Normalize timing fields onto both top-level columns and detail JSON.
+        try:
+            if latency_ms is not None and "latency_ms" not in detail_out:
+                detail_out["latency_ms"] = int(latency_ms)
+        except Exception:
+            pass
+        try:
+            if ttft_ms is not None:
+                detail_out["ttft_ms"] = int(ttft_ms)
+            elif "ttft_ms" in detail_out:
+                try:
+                    ttft_ms = int(detail_out.get("ttft_ms"))  # type: ignore[assignment]
+                except Exception:
+                    pass
+        except Exception:
+            pass
         if isinstance(usage, dict) and "raw_usage" not in detail_out:
             raw_snap: dict[str, Any] = {}
             for k in (
@@ -308,6 +325,7 @@ def record_usage(
                 user_agent=ua_s,
                 status_code=status_code,
                 latency_ms=latency_ms,
+                ttft_ms=ttft_ms,
                 error=error,
                 detail=detail_out or None,
                 ts=ts,

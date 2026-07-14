@@ -540,12 +540,19 @@ def map_finish_to_stop_reason(
 
 
 def _tool_arg_value_score(value: Any) -> tuple[int, int, int, int]:
-    """Higher score = richer / more usable tool-argument payload."""
+    """Higher score = richer / more usable tool-argument payload.
+
+    Empty strings still count as *present* keys (Edit/Update new_string="" is a
+    valid delete). Rank by key count first so path-only partials lose to full
+    schemas even when new_string is blank.
+    """
     if isinstance(value, dict):
+        present = 0
         non_empty = 0
         for v in value.values():
             if v is None:
                 continue
+            present += 1
             if isinstance(v, str) and not v.strip():
                 continue
             if isinstance(v, (list, dict)) and not v:
@@ -555,7 +562,8 @@ def _tool_arg_value_score(value: Any) -> tuple[int, int, int, int]:
             nbytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
         except (TypeError, ValueError):
             nbytes = len(str(value))
-        return (3, len(value), non_empty, nbytes)
+        # kind, key_count, present_keys, non_empty*1e6+bytes
+        return (3, len(value), present, non_empty * 1_000_000 + nbytes)
     if isinstance(value, list):
         try:
             nbytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
@@ -569,7 +577,12 @@ def _tool_arg_value_score(value: Any) -> tuple[int, int, int, int]:
 
 
 def _merge_tool_arg_dicts(values: list[Any]) -> dict[str, Any] | None:
-    """Deep-ish merge of successive dict rewrites (later non-empty wins)."""
+    """Deep-ish merge of successive dict rewrites (later values win).
+
+    Explicit later empty string (Edit/Update new_string="") must overwrite an
+    earlier non-empty value when the model rewrites the full object; missing
+    keys still do not wipe earlier content.
+    """
     dicts = [v for v in values if isinstance(v, dict)]
     if not dicts:
         return None
@@ -582,6 +595,12 @@ def _merge_tool_arg_dicts(values: list[Any]) -> dict[str, Any] | None:
             old = merged.get(k)
             if old in (None, "", [], {}):
                 merged[k] = v
+            elif isinstance(v, str) and not v.strip():
+                # Later explicit empty string (delete match).
+                merged[k] = v
+            elif v in (None, [], {}):
+                # Keep earlier non-empty over later null/empty-container.
+                continue
             elif isinstance(old, dict) and isinstance(v, dict):
                 tmp = dict(old)
                 tmp.update(v)
@@ -720,6 +739,11 @@ _TOOL_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "write": ("file_path", "content"),
     "edit": ("file_path", "old_string", "new_string"),
     "update": ("file_path", "old_string", "new_string"),
+    # Common aliases / historical names for the same Edit tool.
+    "strreplace": ("file_path", "old_string", "new_string"),
+    "str_replace": ("file_path", "old_string", "new_string"),
+    "stringreplace": ("file_path", "old_string", "new_string"),
+    "replace": ("file_path", "old_string", "new_string"),
     "multiedit": ("file_path", "edits"),
     "notebookedit": ("notebook_path", "new_source"),
     # Shell / search
@@ -732,6 +756,17 @@ _TOOL_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "websearch": ("query",),
     "web_search": ("query",),
 }
+
+# Keys that MAY be empty string when present (still required to exist).
+# Claude Code Edit/Update uses new_string="" to delete matched text — treating
+# empty as "not ready" held the tool forever and looked like Update broken.
+_TOOL_EMPTY_STRING_OK: frozenset[str] = frozenset(
+    {
+        "new_string",
+        "new_source",  # NotebookEdit may clear a cell
+        "content",  # Write empty file is valid
+    }
+)
 
 # Alternate key spellings some models / relays emit. Normalized to the Claude
 # Code schema before readiness checks and outbound emission.
@@ -772,9 +807,13 @@ def _required_keys_for_tool(name: str | None) -> tuple[str, ...]:
         return ()
     if key in _TOOL_REQUIRED_KEYS:
         return _TOOL_REQUIRED_KEYS[key]
-    # Suffix match: mcp__x__Read / company_Update → read / update
+    # Suffix match ONLY on token boundaries (underscore / mcp double-underscore).
+    # Plain endswith("update") wrongly maps TaskUpdate → Update and TodoWrite →
+    # Write. Those agent tools then wait forever for file_path/old_string and
+    # never ship — Claude Code via sub2api shows "task status not updating".
+    # mcp__x__Read / company_Update still match via _read / _update.
     for short, req in _TOOL_REQUIRED_KEYS.items():
-        if key.endswith(short) or key.endswith(f"_{short}"):
+        if key.endswith(f"_{short}") or key.endswith(f"__{short}"):
             return req
     return ()
 
@@ -884,11 +923,15 @@ def is_complete_tool_arguments_json(
                 if k not in parsed:
                     return False
                 val = parsed.get(k)
-                # Empty string for path/content fields is not a usable payload.
-                if isinstance(val, str) and not val.strip():
-                    return False
                 if val is None:
                     return False
+                # Empty string is OK for some fields (Edit/Update new_string=""
+                # deletes matched text). Path-like keys still require content.
+                if isinstance(val, str) and not val.strip():
+                    if k not in _TOOL_EMPTY_STRING_OK:
+                        return False
+                    # still require the key to be a string (already is)
+                    continue
                 if isinstance(val, (list, dict)) and not val:
                     return False
     return True
@@ -1296,9 +1339,20 @@ def anthropic_stream_error(message: str, err_type: str = "api_error") -> str:
 def anthropic_stream_terminal_error(
     message: str, err_type: str = "api_error"
 ) -> list[str]:
-    """Error + message_stop so secondary relays close the SSE envelope cleanly."""
+    """Error + terminal envelope so secondary relays close cleanly.
+
+    sub2api / Claude Code need a full stop sequence to update task state:
+    optional message_delta(stop_reason) + message_stop. A bare error without
+    those leaves the agent hanging ("task status not updating").
+    """
     return [
         anthropic_stream_error(message, err_type=err_type),
+        # stop_reason=null is invalid for some converters; use end_turn so the
+        # client can mark the turn finished (failed) rather than stuck running.
+        anthropic_stream_message_delta(
+            stop_reason="end_turn",
+            output_tokens=0,
+        ),
         anthropic_stream_message_stop(),
     ]
 
@@ -1376,8 +1430,9 @@ def merge_tool_argument_delta(
         if a == b:
             return cur
         if isinstance(a, dict) and isinstance(b, dict):
-            # Field growth / partial rewrite: merge keys, prefer later non-empty.
+            # Field growth / partial rewrite: merge keys.
             # Example: {"file_path":"x"} + {"file_path":"x","old_string":"a",...}
+            # Explicit later empty string is kept (Edit/Update new_string="" delete).
             merged = dict(a)
             for k, v in b.items():
                 if k not in merged:
@@ -1385,6 +1440,8 @@ def merge_tool_argument_delta(
                     continue
                 old = merged.get(k)
                 if old in (None, "", [], {}):
+                    merged[k] = v
+                elif isinstance(v, str) and not v.strip():
                     merged[k] = v
                 elif isinstance(old, dict) and isinstance(v, dict):
                     tmp = dict(old)
@@ -1462,6 +1519,10 @@ class AnthropicStreamAssembler:
         return max(0, int(max_tools) - self._tools_started_count)
 
     def start(self, input_tokens: int = 0) -> list[str]:
+        # Idempotent: early-open paths (v1.9.72+) may call start at upstream 200
+        # and again from feed()/finish() guards.
+        if self._started:
+            return []
         self._started = True
         return [
             anthropic_stream_message_start(
@@ -1537,7 +1598,13 @@ class AnthropicStreamAssembler:
         return events
 
     def _close_tools(self) -> list[str]:
-        """Stop all open tool_use blocks (flush args first)."""
+        """Stop all open tool_use blocks (flush args first).
+
+        Never invent empty ``{}`` for known schema tools that still lack
+        required keys — that freezes Claude Code (Update/Edit with no body).
+        Incomplete open tools still get content_block_stop so the client can
+        leave the block, but without a fake empty input payload.
+        """
         events: list[str] = []
         # Close in ascending content_block index order (not OpenAI tool index).
         open_states = [
@@ -1558,14 +1625,29 @@ class AnthropicStreamAssembler:
                 self._next_index += 1
             state["_closing"] = True
             events.extend(self._flush_tool_args(state))
-            if not (state.get("args_sent_text") or "").strip():
-                events.append(
-                    anthropic_stream_input_json_delta(state["block_index"], "{}")
-                )
-                state["args"] = state.get("args") or "{}"
-                state["args_sent_text"] = "{}"
-                state["args_sent"] = 2
-                self._output_chars += 2
+            sent = (state.get("args_sent_text") or "").strip()
+            name = (state.get("name") or "").strip()
+            if not sent:
+                # Only invent "{}" for unknown / free-form tools. Known schema
+                # tools (Update/Edit/…) must not ship empty input — Claude Code
+                # then marks the tool failed and task status stops advancing.
+                allow_empty = True
+                try:
+                    required = _required_keys_for_tool(name)
+                    if required:
+                        allow_empty = False
+                except Exception:
+                    allow_empty = True
+                if allow_empty:
+                    events.append(
+                        anthropic_stream_input_json_delta(
+                            state["block_index"], "{}"
+                        )
+                    )
+                    state["args"] = state.get("args") or "{}"
+                    state["args_sent_text"] = "{}"
+                    state["args_sent"] = 2
+                    self._output_chars += 2
             events.append(anthropic_stream_block_stop(state["block_index"]))
             state["stopped"] = True
             state.pop("_closing", None)
@@ -1858,39 +1940,33 @@ class AnthropicStreamAssembler:
 
         events.extend(self._close_thinking())
         events.extend(self._close_text())
-        # Open any buffered tools that never became "started" (name without
-        # complete args, or args without live emission), then close each tool
-        # before starting the next. Assign block_index only at real start time,
-        # in sorted OpenAI index order, so content_block indices never go
-        # backwards mid-stream and only one block is active at a time.
+        # Open any buffered tools that never became "started", then close each.
+        # CRITICAL: only open tools with *complete* args (or already started).
+        # Opening incomplete Update/Edit with "{}" freezes Claude Code task state
+        # (tool_use received, execution fails / hangs, status never advances).
         for oi in sorted(self._tools.keys()):
             state = self._tools[oi]
             if state.get("stopped"):
                 continue
             name = (state.get("name") or "").strip()
             args = (state.get("args") or "").strip()
-            # Skip pure ghost previews (no name, no args) so we don't open a
-            # nameless tool_use that secondary clients can't close cleanly.
+            # Skip pure ghost previews (no name, no args).
             if not state.get("started") and not name and not args:
                 continue
             if not state.get("started"):
-                # If we still hold a non-tool preface and this tool is incomplete,
-                # prefer the text answer over a placeholder tool.
-                if (
-                    self._held_pre_tool
-                    and not self._saw_tool
-                    and not (
-                        name
-                        and args
-                        and is_complete_tool_arguments_json(
-                            args, tool_name=name
-                        )
-                    )
+                # Incomplete tools never go on the wire.
+                if not (
+                    name
+                    and args
+                    and is_complete_tool_arguments_json(args, tool_name=name)
                 ):
+                    continue
+                # If we still hold a non-tool preface and somehow no ready tool,
+                # prefer the text answer (already handled above) — skip.
+                if self._held_pre_tool and not self._saw_tool and not has_ready_tool:
                     continue
                 budget = self._tool_budget_left()
                 if budget is not None and budget <= 0:
-                    # Drop remaining tools rather than open concurrent blocks.
                     continue
                 # Close any still-open prior tool before opening this one.
                 events.extend(self._close_tools())
@@ -1909,13 +1985,15 @@ class AnthropicStreamAssembler:
                         name=name or "tool",
                     )
                 )
-            # Close this tool (flush empty {} if needed) before the next.
+            # Close this tool (flush remaining args) before the next.
             events.extend(self._close_tools())
         events.extend(self._close_tools())
         # Upstream often finishes with stop even when tools were emitted.
         effective_finish = finish_reason
         if self._saw_tool and effective_finish in (None, "stop", "end_turn", ""):
             effective_finish = "tool_calls"
+        # If we never shipped a tool or text, still close with end_turn so
+        # Claude Code can leave "running" (empty answer is better than hang).
         stop = map_finish_to_stop_reason(
             effective_finish, has_tool_calls=self._saw_tool
         )

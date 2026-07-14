@@ -38,6 +38,12 @@ def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 10_000
 # Opt-in only: long CC/sub2api tool loops can enable this to shrink 400–670KB bodies.
 # Default off — compacting tool results can drop context the model still needs.
 HISTORY_COMPACT_ENABLED = _env_bool("GROK2API_HISTORY_COMPACT", False)
+# Auto-compact when messages JSON exceeds this many chars even if compact is off.
+# Codex / long agent loops otherwise push 100k–150k+ tokens and TTFT explodes.
+# 0 disables the auto threshold.
+HISTORY_COMPACT_AUTO_CHARS = _env_int(
+    "GROK2API_HISTORY_COMPACT_AUTO_CHARS", 180_000, minimum=0, maximum=5_000_000
+)
 # When compacting, keep older rewrites deterministic so multi-turn prompt *prefixes*
 # stay byte-stable across turns (helps upstream automatic prefix cache, same idea
 # as superagent-ai/grok-cli replaying a stable message prefix).
@@ -65,6 +71,11 @@ OUTBOUND_MAX_TOOLS = _env_int("GROK2API_OUTBOUND_MAX_TOOLS", 1, minimum=0, maxim
 OUTBOUND_MAX_TOOLS_OPENAI = _env_int(
     "GROK2API_OUTBOUND_MAX_TOOLS_OPENAI", 0, minimum=0, maximum=64
 )
+# OpenAI-native Responses clients (Codex TUI / OpenAI Python SDK talking to
+# /v1/responses directly — not Claude Code via sub2api). Unlimited by default.
+OUTBOUND_MAX_TOOLS_RESPONSES_NATIVE = _env_int(
+    "GROK2API_OUTBOUND_MAX_TOOLS_RESPONSES_NATIVE", 0, minimum=0, maximum=64
+)
 
 
 # Real wall-clock gap between consecutive outbound tool SSE frames (seconds).
@@ -80,19 +91,88 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: floa
 
 
 OUTBOUND_TOOL_GAP_SEC = _env_float("GROK2API_OUTBOUND_TOOL_GAP_SEC", 0.08, minimum=0.0, maximum=2.0)
+# Pure OpenAI / Codex clients do not need the sub2api content_block gap.
+OUTBOUND_TOOL_GAP_SEC_NATIVE = _env_float(
+    "GROK2API_OUTBOUND_TOOL_GAP_SEC_NATIVE", 0.0, minimum=0.0, maximum=2.0
+)
 
 
-def resolve_outbound_max_tools(protocol: str | None = None) -> int:
-    """Pick the per-turn tool cap for a public protocol.
+def is_openai_native_client(user_agent: str | None = None) -> bool:
+    """True for Codex / OpenAI SDK / pure Responses clients (not Claude Code).
 
-    - anthropic / openai_responses (sub2api): OUTBOUND_MAX_TOOLS (default 1)
+    These clients speak OpenAI Responses natively and can schedule multiple
+    tool_calls per turn. Claude Code via sub2api still needs the conservative
+    single-tool + gap policy.
+    """
+    ua = (user_agent or "").strip().lower()
+    if not ua:
+        return False
+    # Claude Code / Anthropic SDK always take the conservative path.
+    if "claude-cli" in ua or "anthropic" in ua or "claude-code" in ua:
+        return False
+    markers = (
+        "codex",
+        "openai/python",
+        "openai-python",
+        "openai/",
+        "chatgpt",
+        "gpt-agent",
+        "responses-sdk",
+    )
+    return any(m in ua for m in markers)
+
+
+def resolve_outbound_max_tools(
+    protocol: str | None = None,
+    *,
+    user_agent: str | None = None,
+) -> int:
+    """Pick the per-turn tool cap for a public protocol / client.
+
     - openai chat/completions: OUTBOUND_MAX_TOOLS_OPENAI (default 0 = unlimited)
+    - openai_responses + Codex/OpenAI-native UA: OUTBOUND_MAX_TOOLS_RESPONSES_NATIVE
+    - anthropic / openai_responses via sub2api (Claude): OUTBOUND_MAX_TOOLS (default 1)
     """
     proto = (protocol or "").strip().lower()
     if proto in ("openai", "chat", "chat_completions", "openai_chat"):
         return int(OUTBOUND_MAX_TOOLS_OPENAI)
-    # Default conservative: Claude / Responses / unknown secondary relays.
+    if proto in ("openai_responses", "responses") and is_openai_native_client(user_agent):
+        return int(OUTBOUND_MAX_TOOLS_RESPONSES_NATIVE)
+    # Default conservative: Claude / Responses-via-sub2api / unknown relays.
     return int(OUTBOUND_MAX_TOOLS)
+
+
+def resolve_outbound_tool_gap_sec(
+    protocol: str | None = None,
+    *,
+    user_agent: str | None = None,
+) -> float:
+    """Wall-clock gap between outbound tool frames (0 = none)."""
+    proto = (protocol or "").strip().lower()
+    if proto in ("openai", "chat", "chat_completions", "openai_chat"):
+        return float(OUTBOUND_TOOL_GAP_SEC_NATIVE)
+    if is_openai_native_client(user_agent):
+        return float(OUTBOUND_TOOL_GAP_SEC_NATIVE)
+    return float(OUTBOUND_TOOL_GAP_SEC)
+
+
+def should_auto_compact(body: dict[str, Any] | None) -> bool:
+    """True when body messages exceed the auto-compact char threshold."""
+    if not HISTORY_COMPACT_AUTO_CHARS or HISTORY_COMPACT_AUTO_CHARS <= 0:
+        return False
+    if not isinstance(body, dict):
+        return False
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    try:
+        size = len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        try:
+            size = sum(len(str(m)) for m in messages)
+        except Exception:
+            return False
+    return size >= int(HISTORY_COMPACT_AUTO_CHARS)
 
 
 _PLACEHOLDER_PREFIX = "[compacted tool result"
@@ -457,13 +537,27 @@ def compact_openai_messages(
     return out, stats
 
 
-def compact_upstream_body(body: dict[str, Any]) -> dict[str, Any]:
-    """Apply message compaction to an OpenAI chat.completions body. Mutates body."""
+def compact_upstream_body(
+    body: dict[str, Any],
+    *,
+    enabled: bool | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Apply message compaction to an OpenAI chat.completions body. Mutates body.
+
+    ``force=True`` runs compact even when HISTORY_COMPACT is off (used by the
+    auto threshold for Codex / long agent loops).
+    """
     if not isinstance(body, dict):
         return {"enabled": False, "applied": False}
     messages = body.get("messages")
-    new_messages, stats = compact_openai_messages(messages)
+    use = enabled
+    if use is None and force:
+        use = True
+    new_messages, stats = compact_openai_messages(messages, enabled=use)
     body["messages"] = new_messages
+    if force and stats.get("applied"):
+        stats["auto"] = True
     return stats
 
 
@@ -472,6 +566,7 @@ def cap_outbound_tools(
     *,
     max_tools: int | None = None,
     protocol: str | None = None,
+    user_agent: str | None = None,
 ) -> list[Any] | None:
     """Optional safety valve: limit tools emitted in one assistant response.
 
@@ -483,7 +578,7 @@ def cap_outbound_tools(
     limit = (
         int(max_tools)
         if max_tools is not None
-        else resolve_outbound_max_tools(protocol)
+        else resolve_outbound_max_tools(protocol, user_agent=user_agent)
         if protocol is not None
         else int(OUTBOUND_MAX_TOOLS)
     )
@@ -499,6 +594,7 @@ def remaining_outbound_tool_budget(
     *,
     max_tools: int | None = None,
     protocol: str | None = None,
+    user_agent: str | None = None,
 ) -> int | None:
     """How many more tools may be shipped this turn.
 
@@ -507,7 +603,7 @@ def remaining_outbound_tool_budget(
     limit = (
         int(max_tools)
         if max_tools is not None
-        else resolve_outbound_max_tools(protocol)
+        else resolve_outbound_max_tools(protocol, user_agent=user_agent)
         if protocol is not None
         else int(OUTBOUND_MAX_TOOLS)
     )

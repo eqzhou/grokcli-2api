@@ -172,10 +172,13 @@ _SCHEMA_MIGRATIONS = (
       user_agent TEXT,
       status_code INT,
       latency_ms INT,
+      ttft_ms INT,
       error TEXT,
       detail JSONB NOT NULL DEFAULT '{}'::jsonb
     )
     """,
+    # Existing DBs created before ttft_ms: add column idempotently.
+    "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS ttft_ms INT",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_created_at ON usage_events (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_api_key ON usage_events (api_key_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_account ON usage_events (account_id, created_at DESC)",

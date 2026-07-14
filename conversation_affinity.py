@@ -405,6 +405,12 @@ def get_affinity_entry(fingerprint: str | None) -> dict[str, Any] | None:
         sfp = entry.get("session_fp")
         if sfp:
             out["session_fp"] = str(sfp)
+        # Must surface stored prompt_cache_key so previous_response_id-only
+        # turns (Codex) recover the same synthetic key instead of minting a
+        # new one every turn (cold account + cache miss + slow TTFT).
+        pck = entry.get("prompt_cache_key")
+        if pck:
+            out["prompt_cache_key"] = str(pck)
         return out
 
 
