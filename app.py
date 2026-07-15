@@ -21,6 +21,7 @@ import json
 import os
 import time
 import uuid
+from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
@@ -54,7 +55,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.86"
+APP_VERSION = "1.9.87"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -72,8 +73,16 @@ _allowed_tool_names_ctx: ContextVar[set[str] | None] = ContextVar(
 # Default direct client + per-proxy clients so account-pool egress can rotate
 # without reopening a TCP connection on every request.
 _http_client: httpx.AsyncClient | None = None
-_http_clients_by_proxy: dict[str, httpx.AsyncClient] = {}
+_http_clients_by_proxy: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
 _http_client_lock = asyncio.Lock() if hasattr(asyncio, "Lock") else None  # set later
+
+
+def _proxy_client_cache_limit() -> int:
+    try:
+        raw = int(os.getenv("GROK2API_PROXY_CLIENT_CACHE", "128") or 128)
+    except (TypeError, ValueError):
+        raw = 128
+    return max(8, min(512, raw))
 
 
 def _http_timeouts() -> tuple[httpx.Timeout, httpx.Limits]:
@@ -282,30 +291,60 @@ async def get_http_client(
     if not proxy_url:
         if _client_loop_ok(_http_client):
             return _http_client  # type: ignore[return-value]
-        # Drop stale client silently (do not aclose on foreign/dead loop).
-        _http_client = _new_async_client()
-        return _http_client
+        if _http_client_lock is None:
+            _http_client = _new_async_client()
+            return _http_client
+        async with _http_client_lock:
+            if _client_loop_ok(_http_client):
+                return _http_client  # type: ignore[return-value]
+            # Drop stale client silently (do not aclose on foreign/dead loop).
+            _http_client = _new_async_client()
+            return _http_client
 
     client = _http_clients_by_proxy.get(proxy_url)
     if _client_loop_ok(client):
+        # LRU: keep active proxy clients hot in large residential pools.
+        try:
+            _http_clients_by_proxy.move_to_end(proxy_url)
+        except Exception:
+            pass
         return client  # type: ignore[return-value]
-    client = _new_async_client(proxy=proxy_url)
-    _http_clients_by_proxy[proxy_url] = client
-    # Bound the map so a huge residential pool cannot retain thousands of clients.
-    if len(_http_clients_by_proxy) > 32:
-        # Drop an arbitrary idle-ish entry (not the one we just created).
-        for old_key in list(_http_clients_by_proxy.keys()):
+
+    if _http_client_lock is None:
+        if client is not None:
+            _http_clients_by_proxy.pop(proxy_url, None)
+        client = _new_async_client(proxy=proxy_url)
+        _http_clients_by_proxy[proxy_url] = client
+        return client
+
+    async with _http_client_lock:
+        client = _http_clients_by_proxy.get(proxy_url)
+        if _client_loop_ok(client):
+            try:
+                _http_clients_by_proxy.move_to_end(proxy_url)
+            except Exception:
+                pass
+            return client  # type: ignore[return-value]
+        if client is not None:
+            _http_clients_by_proxy.pop(proxy_url, None)
+        client = _new_async_client(proxy=proxy_url)
+        _http_clients_by_proxy[proxy_url] = client
+        # Bound the map so a huge residential pool cannot retain thousands of clients.
+        # Use LRU eviction instead of arbitrary deletion to avoid constantly rebuilding
+        # the same active proxy connections under account-sticky routing.
+        limit = _proxy_client_cache_limit()
+        while len(_http_clients_by_proxy) > limit:
+            old_key, old = _http_clients_by_proxy.popitem(last=False)
             if old_key == proxy_url:
-                continue
-            old = _http_clients_by_proxy.pop(old_key, None)
+                _http_clients_by_proxy[old_key] = old
+                break
             if old is not None and not old.is_closed:
                 try:
                     if _client_loop_ok(old):
                         await old.aclose()
                 except Exception:
                     pass
-            break
-    return client
+        return client
 
 
 def invalidate_http_clients() -> None:
@@ -316,6 +355,12 @@ def invalidate_http_clients() -> None:
     yet another temp loop and re-introduce Event loop is closed).
     """
     global _http_client
+    try:
+        from proxy_pool import invalidate_outbound_proxy_cache
+
+        invalidate_outbound_proxy_cache()
+    except Exception:
+        pass
     clients: list[httpx.AsyncClient] = []
     if _http_client is not None:
         clients.append(_http_client)
@@ -2709,6 +2754,10 @@ def _sanitize_upstream_error_message(detail: str, status_code: int | None = None
     """Short, non-leaky upstream error for clients (full detail stays in logs/pool)."""
     text = (detail or "").strip()
     low = text.lower()
+    if low.startswith("<!doctype html") or low.startswith("<html") or "<html" in low[:240]:
+        if "cloudflare" in low or "/cdn-cgi/" in low or "cf-error" in low:
+            return "上游返回 Cloudflare/HTML 风控页面，请降低并发或检查出口代理"
+        return f"上游返回 HTML 错误页面 HTTP {status_code or '?'}"
     if "free-usage-exhausted" in low or "free usage" in low:
         return "上游临时额度耗尽，已自动切换账号"
     if status_code == 429 or "rate limit" in low or "too many requests" in low:
@@ -4147,11 +4196,12 @@ async def chat_completions(
             )
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
-            detail = e.response.text[:800] if e.response is not None else str(e)
+            raw_detail = e.response.text[:800] if e.response is not None else str(e)
+            detail = _sanitize_upstream_error_message(raw_detail, code)
             hdrs = dict(e.response.headers) if e.response is not None else None
             _report_upstream_failure(
                 creds.auth_key,
-                error=detail,
+                error=raw_detail,
                 status_code=code,
                 model=model,
                 headers=hdrs,
@@ -5553,11 +5603,12 @@ async def anthropic_messages(
             )
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
-            detail = e.response.text[:800] if e.response is not None else str(e)
+            raw_detail = e.response.text[:800] if e.response is not None else str(e)
+            detail = _sanitize_upstream_error_message(raw_detail, code)
             hdrs = dict(e.response.headers) if e.response is not None else None
             _report_upstream_failure(
                 creds.auth_key,
-                error=detail,
+                error=raw_detail,
                 status_code=code,
                 model=model,
                 headers=hdrs,
@@ -5922,11 +5973,12 @@ async def openai_responses(
                 return content, reasoning, finish, usage, tool_calls, creds
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code if e.response is not None else 502
-                detail = e.response.text[:800] if e.response is not None else str(e)
+                raw_detail = e.response.text[:800] if e.response is not None else str(e)
+                detail = _sanitize_upstream_error_message(raw_detail, code)
                 hdrs = dict(e.response.headers) if e.response is not None else None
                 _report_upstream_failure(
                 creds.auth_key,
-                error=detail,
+                error=raw_detail,
                 status_code=code,
                 model=model,
                 headers=hdrs,

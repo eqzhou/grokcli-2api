@@ -768,6 +768,8 @@ def _derive_pool_status(meta: dict[str, Any]) -> str:
             return "cooldown"
     except (TypeError, ValueError):
         pass
+    if str(meta.get("pool_status") or "").strip().lower() == "expired":
+        return "expired"
     blocked = meta.get("blocked_models") or {}
     if isinstance(blocked, dict) and blocked:
         return "model_blocked"
@@ -785,6 +787,7 @@ def touch_account_stats(
     last_status_code: int | None = None,
     cooldown_sec: float | None = None,
     preserve_cooldown: bool = False,
+    current_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Update per-account pool stats + status.
 
@@ -794,6 +797,8 @@ def touch_account_stats(
 
     preserve_cooldown=True (live request success): never clear/rewrite cooldown
     fields or force pool_status away from cooldown — only counters / last_used.
+    current_meta lets hot paths reuse a single-account meta read instead of
+    fetching the same row again before patching counters.
     """
     if not account_id:
         return None
@@ -854,17 +859,18 @@ def touch_account_stats(
     # Always persist counters to durable store NOW.
     pg = _pg_settings()
     if pg is not None:
-        cur: dict[str, Any] = {}
-        try:
-            from store.settings_pg import get_pool_meta_many
-
-            cur = (get_pool_meta_many([account_id]) or {}).get(account_id) or {}
-        except Exception:
+        cur: dict[str, Any] = dict(current_meta or {}) if isinstance(current_meta, dict) else {}
+        if not cur:
             try:
-                with _lock:
-                    cur = dict((_load().get("account_pool") or {}).get(account_id) or {})
+                from store.settings_pg import get_pool_meta_many
+
+                cur = (get_pool_meta_many([account_id]) or {}).get(account_id) or {}
             except Exception:
-                cur = {}
+                try:
+                    with _lock:
+                        cur = dict((_load().get("account_pool") or {}).get(account_id) or {})
+                except Exception:
+                    cur = {}
         if not isinstance(cur, dict):
             cur = {}
 
@@ -3135,7 +3141,13 @@ def apply_outbound_proxy_config_to_runtime(
     except Exception:
         pass
 
-    # Drop process-local HTTP clients so next request rebuilds with new proxy.
+    # Drop process-local proxy/client caches so next request sees new config.
+    try:
+        from proxy_pool import invalidate_outbound_proxy_cache
+
+        invalidate_outbound_proxy_cache()
+    except Exception:
+        pass
     try:
         import app as _app
 
@@ -3302,6 +3314,7 @@ def get_public_settings() -> dict[str, Any]:
         sub2api_pub = public_sub2api_config()
     except Exception:
         sub2api_pub = {"enabled": False, "base_url": "", "email": "", "has_password": False}
+    pool_policy = get_pool_policy()
 
     return {
         "account_mode": get_account_mode(),
@@ -3335,7 +3348,10 @@ def get_public_settings() -> dict[str, Any]:
         "model_health_auto_disable": get_model_health_auto_disable(),
         "probe_models": get_probe_models(),
         "default_model": get_default_model_setting(),
-        "pool_policy": get_pool_policy(),
+        # Expose both nested and flat policy fields. Older UI/builds read the
+        # flat keys directly; current UI prefers pool_policy.
+        **pool_policy,
+        "pool_policy": pool_policy,
         "registration_config": reg,
         "outbound_proxy_config": outbound,
         "outbound_proxy_pool": outbound_summary,

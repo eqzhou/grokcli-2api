@@ -325,9 +325,17 @@ def sync_models_from_upstream(path: Any = None) -> dict[str, Any]:
         return {"ok": False, "error": f"network: {e}"}
 
     if resp.status_code >= 400:
+        body = (resp.text or "").strip()
+        low = body.lower()
+        if low.startswith("<!doctype html") or low.startswith("<html") or "<html" in low[:240]:
+            detail = "Cloudflare/HTML challenge; lower concurrency or check outbound proxy" if (
+                "cloudflare" in low or "/cdn-cgi/" in low or "cf-error" in low
+            ) else "HTML error page"
+        else:
+            detail = body[:300]
         return {
             "ok": False,
-            "error": f"upstream {resp.status_code}: {(resp.text or '')[:300]}",
+            "error": f"upstream {resp.status_code}: {detail}",
             "status_code": resp.status_code,
         }
 

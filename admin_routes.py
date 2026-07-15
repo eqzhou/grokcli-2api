@@ -7,9 +7,10 @@ import json
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
-from fastapi import Response, APIRouter, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -135,8 +136,11 @@ class RuntimeSettingsBody(BaseModel):
     sse_keepalive: float | None = Field(default=None, ge=2.0, le=120.0)
     conversation_affinity_enabled: bool | None = None
     conversation_affinity_ttl_sec: float | None = Field(default=None, ge=60.0, le=86_400.0)
-    token_maintain_interval_sec: float | None = Field(default=None, ge=30.0, le=3600.0)
-    token_refresh_skew_sec: float | None = Field(default=None, ge=30.0, le=1800.0)
+    # Accept out-of-range form values here and let settings_store clamp them.
+    # Otherwise one stale/low field (for example token_refresh_skew_sec=18)
+    # blocks saving unrelated sections such as Relay/sub2api or cooldown policy.
+    token_maintain_interval_sec: float | None = Field(default=None, ge=0.0, le=3600.0)
+    token_refresh_skew_sec: float | None = Field(default=None, ge=0.0, le=1800.0)
     model_health_interval_sec: float | None = Field(default=None, ge=0.0, le=86_400.0)
     model_health_auto_disable: bool | None = None
     probe_models: str | list[str] | None = Field(
@@ -686,6 +690,7 @@ async def admin_status(request: Request):
             "in_cooldown": pool.get("in_cooldown"),
             "quota_disabled": pool.get("quota_disabled"),
             "model_blocked": pool.get("model_blocked"),
+            "expired": pool.get("expired"),
             "source": pool.get("source") or "postgres",
         },
         "keys": key_stats,
@@ -969,6 +974,10 @@ async def list_accounts_route(
     q: str = "",
     sort: str = "newest",
     summary: bool = False,
+    has_sso: bool | None = Query(
+        default=None,
+        description="true=only accounts with SSO cookie; false=only without SSO; omit=all",
+    ),
 ):
     """List accounts with server-side SQL pagination (PostgreSQL path).
 
@@ -977,8 +986,13 @@ async def list_accounts_route(
     - page_size<=0 or page_size>=10000: return all summary rows (export/legacy)
     - sort: newest|oldest|expires_desc|expires_asc|email_asc|email_desc|
             last_used_desc|last_used_asc|requests_desc|cooldown_first|disabled_first
+    - has_sso: filter accounts that keep a non-empty SSO cookie
     """
     require_admin(request, x_admin_token)
+    try:
+        _reconcile_saved_sso_to_accounts()
+    except Exception:
+        pass
 
     try:
         from store.accounts_pg import normalize_account_sort
@@ -1005,9 +1019,12 @@ async def list_accounts_route(
         from settings_store import get_account_mode
         import time as _time
 
-        if pg_on():
+        # SSO filter must be exact and use the same Python-side detector/export
+        # source, because older rows may keep cookies in several legacy shapes or
+        # in registration-session backups that are reconciled just above.
+        if pg_on() and has_sso is None:
             paged = list_account_summaries(
-                q=q, page=page, page_size=page_size, sort=sort_key
+                q=q, page=page, page_size=page_size, sort=sort_key, has_sso=has_sso
             )
             page_items = list(paged.get("accounts") or [])
             ids = [str(a.get("id")) for a in page_items if a.get("id")]
@@ -1096,6 +1113,7 @@ async def list_accounts_route(
                 "total_pages": paged.get("total_pages") or 1,
                 "q": (q or "").strip(),
                 "sort": paged.get("sort") or sort_key,
+                "has_sso": has_sso if has_sso is not None else paged.get("has_sso"),
                 "paged": True,
                 "fast_path": True,
             }
@@ -1149,12 +1167,18 @@ async def list_accounts_route(
                 "disabled 已禁用" if p.get("enabled") is False else "enabled 启用",
                 "cooldown 冷却" if p.get("in_cooldown") else "",
                 "quota 额度禁用 耗尽" if p.get("disabled_for_quota") else "",
+                "sso" if arow.get("has_sso") else "no-sso",
                 str(p.get("last_error") or ""),
                 " ".join(p.get("blocked_model_ids") or []),
             ]).lower()
             if query in hay:
                 filtered.append(arow)
         rows = filtered
+
+    if has_sso is True:
+        rows = [r for r in rows if bool(r.get("has_sso"))]
+    elif has_sso is False:
+        rows = [r for r in rows if not bool(r.get("has_sso"))]
 
     rows = _sort_account_rows(rows, sort_key)
 
@@ -1211,6 +1235,7 @@ async def list_accounts_route(
         "total_pages": total_pages,
         "q": (q or "").strip(),
         "sort": sort_key,
+        "has_sso": has_sso,
         "paged": True,
         "fast_path": False,
     }
@@ -1366,6 +1391,197 @@ def _parse_sso_lines(lines: list[str]) -> list[tuple[str, str]]:
     return out
 
 
+_sso_backup_lock = threading.Lock()
+_sso_backup_reconcile_at = 0.0
+
+
+def _sso_backup_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    for base in (
+        getattr(_config, "DATA_DIR", None),
+        Path(__file__).resolve().parent / "data",
+    ):
+        if not base:
+            continue
+        root = Path(base)
+        for name in ("import_sso", "register_sso"):
+            p = root / name
+            if p not in dirs:
+                dirs.append(p)
+    return dirs
+
+
+def _persist_import_sso_backup(*, email: str = "", sso: str = "", source: str = "sso-import") -> str:
+    cookie = str(sso or "").strip()
+    if not cookie:
+        return ""
+    try:
+        root = Path(getattr(_config, "DATA_DIR", Path(__file__).resolve().parent / "data")) / "import_sso"
+        root.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        safe_email = "".join(
+            ch if ch.isalnum() or ch in "._@+-" else "_"
+            for ch in str(email or "unknown")
+        )[:80]
+        path = root / f"{ts}_{safe_email}_{uuid.uuid4().hex[:8]}.json"
+        payload = {
+            "email": email,
+            "sso": cookie,
+            "sso_cookie": cookie,
+            "source": source,
+            "created_at": ts,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(path)
+    except Exception as e:  # noqa: BLE001
+        print(f"[sso-import] WARN: save SSO backup failed: {e}")
+        return ""
+
+
+def _load_saved_sso_records() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for root in _sso_backup_dirs():
+        try:
+            files = sorted(root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        except Exception:
+            continue
+        for path in files[:5000]:
+            try:
+                obj = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            sso = _account_sso_value(obj)
+            if not sso:
+                continue
+            rec = dict(obj)
+            rec["sso"] = sso
+            rec.setdefault("sso_cookie", sso)
+            rec["sso_backup_path"] = str(path)
+            records.append(rec)
+
+    # Registration-session export can see SSO cookies that predate account-payload
+    # persistence. Pull those live/Redis sessions too, then reconcile them back to
+    # the account table by imported account id, registration_session_id, or email.
+    try:
+        adapter = reg_adapter
+        if adapter is not None:
+            listed = adapter.list_registration_sessions() or {}
+            sessions = listed.get("sessions") if isinstance(listed, dict) else listed
+            if isinstance(sessions, list):
+                for sess in sessions:
+                    if not isinstance(sess, dict):
+                        continue
+                    sso = str(sess.get("sso") or "").strip()
+                    if not sso:
+                        cookies = sess.get("session_cookies")
+                        if isinstance(cookies, dict):
+                            sso = str(cookies.get("sso") or cookies.get("sso-rw") or "").strip()
+                    if not sso:
+                        continue
+                    account_ids: list[str] = []
+                    for aid in sess.get("imported_account_ids") or []:
+                        if aid:
+                            account_ids.append(str(aid))
+                    imported_accounts = sess.get("imported_accounts")
+                    if isinstance(imported_accounts, list):
+                        for acc in imported_accounts:
+                            if not isinstance(acc, dict):
+                                continue
+                            aid = acc.get("id")
+                            if aid:
+                                account_ids.append(str(aid))
+                    rec = {
+                        "source": "registration-session",
+                        "session_id": str(sess.get("id") or ""),
+                        "registration_session_id": str(sess.get("id") or ""),
+                        "batch_id": sess.get("batch_id"),
+                        "registration_batch_id": sess.get("batch_id"),
+                        "email": str(sess.get("email") or "").strip(),
+                        "password": str(sess.get("password") or "").strip(),
+                        "register_password": str(sess.get("password") or "").strip(),
+                        "sso": sso,
+                        "sso_cookie": sso,
+                        "account_ids": sorted(set(account_ids)),
+                    }
+                    records.append(rec)
+    except Exception as e:  # noqa: BLE001
+        print(f"[sso-reconcile] registration sessions skipped: {e}")
+    return records
+
+
+def _reconcile_saved_sso_to_accounts(*, force: bool = False) -> int:
+    """Attach saved import/register SSO backup files to matching account rows."""
+    global _sso_backup_reconcile_at
+    now = time.time()
+    if not force and now - _sso_backup_reconcile_at < 30.0:
+        return 0
+    with _sso_backup_lock:
+        now = time.time()
+        if not force and now - _sso_backup_reconcile_at < 30.0:
+            return 0
+        _sso_backup_reconcile_at = now
+        records = _load_saved_sso_records()
+    if not records:
+        return 0
+
+    by_id: dict[str, dict[str, Any]] = {}
+    by_email: dict[str, dict[str, Any]] = {}
+    by_session: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        for aid in rec.get("account_ids") or []:
+            if aid and str(aid) not in by_id:
+                by_id[str(aid)] = rec
+        for id_key in ("account_id", "id", "auth_key"):
+            aid = str(rec.get(id_key) or "").strip()
+            if aid and aid not in by_id:
+                by_id[aid] = rec
+        email = str(rec.get("email") or "").strip().lower()
+        if email and email not in by_email:
+            by_email[email] = rec
+        sid = str(rec.get("session_id") or rec.get("registration_session_id") or "").strip()
+        if sid and sid not in by_session:
+            by_session[sid] = rec
+
+    data = accounts.read_auth_map()
+    if not isinstance(data, dict) or not data:
+        return 0
+    changed = 0
+    try:
+        from accounts import get_sso_value, merge_durable_account_fields
+    except Exception:
+        get_sso_value = _account_sso_value  # type: ignore[assignment]
+        merge_durable_account_fields = None  # type: ignore[assignment]
+
+    for _aid, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        aid = str(_aid)
+        sid = str(entry.get("registration_session_id") or "").strip()
+        email = str(entry.get("email") or "").strip().lower()
+        rec = by_id.get(aid) or (by_session.get(sid) if sid else None) or (by_email.get(email) if email else None)
+        if not rec:
+            continue
+        before = json.dumps(entry, sort_keys=True, ensure_ascii=False, default=str)
+        if merge_durable_account_fields is not None:
+            merge_durable_account_fields(entry, rec)
+        else:
+            sso = _account_sso_value(rec)
+            if sso and not get_sso_value(entry):
+                entry["sso"] = sso
+                entry.setdefault("sso_cookie", sso)
+        after = json.dumps(entry, sort_keys=True, ensure_ascii=False, default=str)
+        if after != before:
+            changed += 1
+
+    if changed:
+        from auth_store import write_auth_map
+
+        write_auth_map(data)
+    return changed
+
+
 def _run_sso_import_job(
     job_id: str,
     *,
@@ -1430,6 +1646,10 @@ def _run_sso_import_job(
                 item["error"] = "device flow failed or invalid sso"
                 return item
             _key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
+            saved_sso_path = _persist_import_sso_backup(
+                email=str(entry.get("email") or email_hint or ""),
+                sso=sso,
+            )
             item["status"] = "converted"
             item["email"] = entry.get("email", email_hint)
             item["entry"] = {
@@ -1443,6 +1663,11 @@ def _run_sso_import_job(
                     "oidc_client_id", sso_import.GROK_CLI_CLIENT_ID
                 ),
                 "user_id": entry.get("user_id") or entry.get("principal_id"),
+                # Keep original SSO cookie on the account so admin UI can show/export it.
+                "sso": sso,
+                "sso_cookie": sso,
+                "source": "sso-import",
+                "sso_backup_path": saved_sso_path,
             }
             return item
         except TypeError:
@@ -1454,6 +1679,10 @@ def _run_sso_import_job(
                     item["error"] = "device flow failed or invalid sso"
                     return item
                 _key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
+                saved_sso_path = _persist_import_sso_backup(
+                    email=str(entry.get("email") or email_hint or ""),
+                    sso=sso,
+                )
                 item["status"] = "converted"
                 item["email"] = entry.get("email", email_hint)
                 item["entry"] = {
@@ -1467,6 +1696,10 @@ def _run_sso_import_job(
                         "oidc_client_id", sso_import.GROK_CLI_CLIENT_ID
                     ),
                     "user_id": entry.get("user_id") or entry.get("principal_id"),
+                    "sso": sso,
+                    "sso_cookie": sso,
+                    "source": "sso-import",
+                    "sso_backup_path": saved_sso_path,
                 }
                 return item
             except Exception as e:  # noqa: BLE001
@@ -2064,11 +2297,10 @@ async def export_registration_sso(
        (saved at import time after successful register-email)
     """
     require_admin(request, x_admin_token)
-    adapter = _require_register_adapter()
-    listed = adapter.list_registration_sessions() or {}
-    sessions = listed.get("sessions") if isinstance(listed, dict) else listed
-    if not isinstance(sessions, list):
-        sessions = []
+    try:
+        _reconcile_saved_sso_to_accounts(force=True)
+    except Exception:
+        pass
 
     want_ids = {str(x).strip() for x in (body.session_ids or []) if str(x).strip()}
     want_status = {str(x).strip().lower() for x in (body.status or []) if str(x).strip()}
@@ -2077,84 +2309,40 @@ async def export_registration_sso(
     if fmt not in {"sso", "cookie", "email_sso", "email_password_sso", "json"}:
         raise HTTPException(status_code=400, detail=f"unsupported format: {fmt}")
 
+    # SSO export is database/account-store authoritative. Registration sessions
+    # are only reconciled into accounts before this point; exported rows come from
+    # the same source that powers the account list/filter.
     rows: list[dict[str, Any]] = []
-    for sess in sessions:
-        if not isinstance(sess, dict):
+    auth = accounts.read_auth_map() or {}
+    for aid, entry in (auth if isinstance(auth, dict) else {}).items():
+        if not isinstance(entry, dict):
             continue
-        sid = str(sess.get("id") or "").strip()
-        if want_ids and sid not in want_ids:
-            continue
-        if want_batch and str(sess.get("batch_id") or "").strip() != want_batch:
-            continue
-        st = str(sess.get("status") or "").strip().lower()
-        if want_status and st not in want_status:
-            continue
-        sso = str(sess.get("sso") or "").strip()
-        if not sso:
-            cookies = sess.get("session_cookies")
-            if isinstance(cookies, dict):
-                sso = str(cookies.get("sso") or cookies.get("sso-rw") or "").strip()
+        sso = _account_sso_value(entry)
         if not sso:
             continue
-        email = str(sess.get("email") or "").strip()
-        password = str(sess.get("password") or "").strip()
+        sid_hit = str(entry.get("registration_session_id") or "").strip()
+        if want_ids and str(aid) not in want_ids and sid_hit not in want_ids:
+            continue
+        if want_batch:
+            bid = str(entry.get("registration_batch_id") or "").strip()
+            if bid != want_batch:
+                continue
+        if want_status and "done" not in want_status and "imported" not in want_status:
+            continue
+        email = str(entry.get("email") or "").strip()
+        password = str(entry.get("password") or entry.get("register_password") or "").strip()
         rows.append(
             {
-                "id": sid,
-                "batch_id": sess.get("batch_id"),
-                "batch_index": sess.get("batch_index"),
-                "status": sess.get("status"),
+                "id": str(sid_hit or aid),
+                "account_id": str(aid),
+                "batch_id": entry.get("registration_batch_id"),
+                "status": "imported",
                 "email": email,
                 "password": password if body.include_password else "",
                 "sso": sso,
-                "source": "session",
+                "source": "account-db",
             }
         )
-
-    # Fallback / supplement: durable accounts that already stored SSO at import.
-    # Used after process restart when registration sessions are gone.
-    try:
-        from accounts import load_auth_store
-
-        auth = load_auth_store() or {}
-        for aid, entry in (auth if isinstance(auth, dict) else {}).items():
-            if not isinstance(entry, dict):
-                continue
-            sso = str(entry.get("sso") or entry.get("sso_cookie") or "").strip()
-            if not sso:
-                continue
-            # Optional filters still apply when possible
-            if want_ids:
-                sid_hit = str(entry.get("registration_session_id") or "").strip()
-                if str(aid) not in want_ids and sid_hit not in want_ids:
-                    continue
-            if want_batch:
-                bid = str(entry.get("registration_batch_id") or "").strip()
-                if bid != want_batch:
-                    # Allow accounts without batch id only when no session rows
-                    # were found for this batch; otherwise skip non-matching.
-                    if bid:
-                        continue
-            if want_status and "done" not in want_status and "imported" not in want_status:
-                # Account-store SSO is always from completed imports
-                if want_status:
-                    continue
-            email = str(entry.get("email") or "").strip()
-            password = str(entry.get("password") or entry.get("register_password") or "").strip()
-            rows.append(
-                {
-                    "id": str(entry.get("registration_session_id") or aid),
-                    "account_id": aid,
-                    "batch_id": entry.get("registration_batch_id"),
-                    "status": "imported",
-                    "email": email,
-                    "password": password if body.include_password else "",
-                    "sso": sso,
-                    "source": "account",
-                }
-            )
-    except Exception as e:  # noqa: BLE001
-        print(f"[export-sso] account-store fallback skipped: {e}")
 
     if not rows:
         raise HTTPException(
@@ -3178,6 +3366,228 @@ async def export_accounts_batch(
     )
 
 
+
+class AccountSsoExportBody(BaseModel):
+    """Export SSO cookies for selected accounts, or all accounts that have SSO."""
+
+    ids: list[str] | None = None
+    only_with_sso: bool = True
+    format: str = "txt"  # txt | json | csv
+    include_password: bool = False
+
+
+def _account_sso_value(entry: dict) -> str:
+    try:
+        from accounts import get_sso_value
+
+        return get_sso_value(entry)
+    except Exception:
+        if not isinstance(entry, dict):
+            return ""
+        return str(entry.get("sso") or entry.get("sso_cookie") or entry.get("sso_token") or "").strip()
+
+
+def _account_password_value(entry: dict) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return str(entry.get("password") or entry.get("register_password") or "").strip()
+
+
+def _build_accounts_sso_export(
+    *,
+    account_ids: list[str] | None = None,
+    only_with_sso: bool = True,
+    fmt: str = "txt",
+    include_password: bool = False,
+) -> dict:
+    """Build SSO export payload from the auth map (PG hybrid / file)."""
+    auth_map = accounts.read_auth_map()
+    if not isinstance(auth_map, dict):
+        auth_map = {}
+
+    wanted: set[str] | None = None
+    if account_ids is not None:
+        wanted = {str(x).strip() for x in account_ids if str(x).strip()}
+
+    rows: list[dict] = []
+    seen_sso: set[str] = set()
+    for aid, entry in auth_map.items():
+        if not isinstance(entry, dict):
+            continue
+        if wanted is not None and str(aid) not in wanted:
+            continue
+        sso = _account_sso_value(entry)
+        if only_with_sso and not sso:
+            continue
+        if wanted is None and not sso and only_with_sso:
+            continue
+        # Export one line per SSO cookie. Multiple account rows can point at the
+        # same historical cookie after re-import/refresh; keep the first stable row.
+        if sso:
+            if sso in seen_sso:
+                continue
+            seen_sso.add(sso)
+        email = str(entry.get("email") or "").strip()
+        password = _account_password_value(entry) if include_password else ""
+        rows.append(
+            {
+                "id": str(aid),
+                "email": email,
+                "sso": sso,
+                "password": password,
+                "source": str(entry.get("source") or ""),
+            }
+        )
+
+    # Stable order: email then id
+    rows.sort(key=lambda r: ((r.get("email") or "").lower(), r.get("id") or ""))
+
+    fmt_l = (fmt or "txt").strip().lower()
+    if fmt_l not in {"txt", "json", "csv"}:
+        fmt_l = "txt"
+
+    if fmt_l == "json":
+        body_obj = {
+            "count": len(rows),
+            "include_password": bool(include_password),
+            "accounts": [
+                {
+                    "id": r["id"],
+                    "email": r["email"],
+                    "sso": r["sso"],
+                    **({"password": r["password"]} if include_password else {}),
+                    **({"source": r["source"]} if r.get("source") else {}),
+                }
+                for r in rows
+            ],
+        }
+        content = json.dumps(body_obj, ensure_ascii=False, indent=2)
+        media = "application/json; charset=utf-8"
+        ext = "json"
+    elif fmt_l == "csv":
+        import csv
+        import io
+
+        buf = io.StringIO()
+        fields = ["email", "sso"]
+        if include_password:
+            fields.append("password")
+        fields.extend(["id", "source"])
+        w = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        content = buf.getvalue()
+        media = "text/csv; charset=utf-8"
+        ext = "csv"
+    else:
+        # txt: one SSO per line (email----sso or email----password----sso when password requested)
+        lines: list[str] = []
+        for r in rows:
+            sso = r.get("sso") or ""
+            if not sso:
+                continue
+            email = r.get("email") or ""
+            password = r.get("password") or ""
+            if include_password and password:
+                if email:
+                    lines.append(f"{email}----{password}----{sso}")
+                else:
+                    lines.append(f"{password}----{sso}")
+            elif email:
+                lines.append(f"{email}----{sso}")
+            else:
+                lines.append(sso)
+        content = "\n".join(lines) + ("\n" if lines else "")
+        media = "text/plain; charset=utf-8"
+        ext = "txt"
+
+    return {
+        "count": len(rows),
+        "with_sso": sum(1 for r in rows if r.get("sso")),
+        "format": fmt_l,
+        "include_password": bool(include_password),
+        "content": content,
+        "media_type": media,
+        "ext": ext,
+    }
+
+
+@router.get("/accounts/export-sso")
+async def export_accounts_sso_all(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    format: str = Query(default="txt", description="txt|json|csv"),
+    include_password: int = Query(default=0),
+    download: int = Query(default=1),
+):
+    """Export SSO cookies for every account that has one."""
+    require_admin(request, x_admin_token)
+    result = _build_accounts_sso_export(
+        account_ids=None,
+        only_with_sso=True,
+        fmt=format,
+        include_password=bool(include_password),
+    )
+    if not result.get("count"):
+        raise HTTPException(status_code=404, detail="no accounts with SSO to export")
+    filename = f"grok2api-accounts-sso.{result['ext']}"
+    if download:
+        return Response(
+            content=result["content"],
+            media_type=result["media_type"],
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return {
+        "ok": True,
+        "count": result["count"],
+        "with_sso": result["with_sso"],
+        "format": result["format"],
+        "include_password": result["include_password"],
+        "content": result["content"],
+        "filename": filename,
+    }
+
+
+@router.post("/accounts/export-sso")
+async def export_accounts_sso_selected(
+    body: AccountSsoExportBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    download: int = Query(default=1),
+):
+    """Export SSO cookies for selected account ids (or all with SSO when ids omitted)."""
+    require_admin(request, x_admin_token)
+    ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()] or None
+    if ids is not None and len(ids) > 5000:
+        raise HTTPException(status_code=400, detail="too many ids (max 5000)")
+    result = _build_accounts_sso_export(
+        account_ids=ids,
+        only_with_sso=bool(body.only_with_sso) if ids is not None else True,
+        fmt=body.format or "txt",
+        include_password=bool(body.include_password),
+    )
+    if not result.get("count"):
+        raise HTTPException(status_code=404, detail="no matching accounts with SSO to export")
+    prefix = "grok2api-accounts-sso-selected" if ids is not None else "grok2api-accounts-sso"
+    filename = f"{prefix}.{result['ext']}"
+    if download:
+        return Response(
+            content=result["content"],
+            media_type=result["media_type"],
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return {
+        "ok": True,
+        "count": result["count"],
+        "with_sso": result["with_sso"],
+        "format": result["format"],
+        "include_password": result["include_password"],
+        "content": result["content"],
+        "filename": filename,
+    }
+
+
 @router.get("/accounts/export/jobs/{job_id}")
 async def get_json_export_job(
     job_id: str,
@@ -3982,14 +4392,11 @@ async def get_settings(
     return {"ok": True, "settings": get_public_settings()}
 
 
-@router.put("/settings")
-async def put_settings(
+async def _apply_runtime_settings_patch(
     body: RuntimeSettingsBody,
     request: Request,
-    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
-):
-    """Update one or more runtime settings from admin UI."""
-    require_admin(request, x_admin_token)
+) -> dict[str, Any]:
+    """Shared DB-backed runtime settings writer for current and legacy routes."""
     patch = body.model_dump(exclude_unset=True)
     if not patch:
         raise HTTPException(status_code=400, detail="没有可更新的字段")
@@ -4005,6 +4412,50 @@ async def put_settings(
         detail={"keys": sorted(list(patch.keys()))[:40]},
     )
     return {"ok": True, "settings": settings}
+
+
+@router.put("/settings")
+async def put_settings(
+    body: RuntimeSettingsBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Update one or more runtime settings from admin UI."""
+    require_admin(request, x_admin_token)
+    return await _apply_runtime_settings_patch(body, request)
+
+
+@router.patch("/settings")
+async def patch_settings(
+    body: RuntimeSettingsBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """PATCH alias for clients that expect partial runtime settings updates."""
+    require_admin(request, x_admin_token)
+    return await _apply_runtime_settings_patch(body, request)
+
+
+@router.patch("/settings/runtime")
+async def patch_runtime_settings(
+    body: RuntimeSettingsBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Legacy route: persist runtime settings in the same DB-backed store."""
+    require_admin(request, x_admin_token)
+    return await _apply_runtime_settings_patch(body, request)
+
+
+@router.put("/settings/runtime")
+async def put_runtime_settings(
+    body: RuntimeSettingsBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Legacy route: persist runtime settings in the same DB-backed store."""
+    require_admin(request, x_admin_token)
+    return await _apply_runtime_settings_patch(body, request)
 
 
 @router.put("/settings/password")
@@ -4119,12 +4570,13 @@ async def refresh_accounts(
             raise HTTPException(status_code=400, detail="ids is empty")
         if len(ids) > 2000:
             raise HTTPException(status_code=400, detail="too many ids (max 2000)")
-    result = accounts.do_refresh_all(force=force, account_ids=ids)
-    # also kick background maintainer
-    try:
-        token_maintainer.request_run_soon()
-    except Exception:
-        pass
+    # Keep large-pool manual refresh responses slim; the frontend patches rows from
+    # results and can reload the account page when it needs fresh full rows.
+    result = accounts.do_refresh_all(
+        force=force,
+        account_ids=ids,
+        include_accounts=False,
+    )
     # Prefer maintainer cycle summary when available for overview widgets.
     try:
         result["maintainer"] = token_maintainer.status(light=True)

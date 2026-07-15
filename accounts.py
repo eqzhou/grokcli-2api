@@ -9,6 +9,7 @@ Supports:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 import time
@@ -36,6 +37,86 @@ def _mask_token(token: str | None) -> str:
     if len(token) <= 12:
         return "****"
     return token[:6] + "..." + token[-4:]
+
+
+_SSO_COOKIE_RE = re.compile(r"(?:^|[;,\s])sso(?:-rw)?=([^;,\s]+)", re.IGNORECASE)
+
+
+def get_sso_value(entry: dict[str, Any] | None) -> str:
+    """Return a saved xAI SSO cookie from known account payload shapes."""
+    if not isinstance(entry, dict):
+        return ""
+    for key in ("sso", "sso_cookie", "sso_token"):
+        val = entry.get(key)
+        if isinstance(val, str) and val.strip():
+            text = val.strip()
+            if text.lower().startswith("sso="):
+                return text.split("=", 1)[1].strip()
+            return text
+    for key in ("session_cookies", "cookies"):
+        val = entry.get(key)
+        if isinstance(val, dict):
+            for cookie_key in ("sso", "sso-rw"):
+                cookie_val = val.get(cookie_key)
+                if isinstance(cookie_val, str) and cookie_val.strip():
+                    return cookie_val.strip()
+    for key in ("cookie", "cookies", "set_cookie", "set-cookie", "set_cookies"):
+        val = entry.get(key)
+        if isinstance(val, str):
+            match = _SSO_COOKIE_RE.search(val)
+            if match:
+                return match.group(1).strip()
+    return ""
+
+
+def has_sso_value(entry: dict[str, Any] | None) -> bool:
+    return bool(get_sso_value(entry))
+
+
+_DURABLE_ACCOUNT_FIELDS = (
+    "sso",
+    "sso_cookie",
+    "sso_token",
+    "session_cookies",
+    "cookies",
+    "cookie",
+    "set_cookie",
+    "set-cookie",
+    "set_cookies",
+    "password",
+    "register_password",
+    "registration_session_id",
+    "registration_batch_id",
+    "sso_backup_path",
+    "source",
+)
+
+
+def merge_durable_account_fields(
+    entry: dict[str, Any], old_entry: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Carry durable SSO/register metadata across token refresh/import overwrites."""
+    if not isinstance(entry, dict):
+        return entry
+    if isinstance(old_entry, dict):
+        old_sso = get_sso_value(old_entry)
+        if not get_sso_value(entry) and old_sso:
+            entry["sso"] = old_sso
+            entry.setdefault("sso_cookie", old_sso)
+        for key in _DURABLE_ACCOUNT_FIELDS:
+            old_v = old_entry.get(key)
+            new_v = entry.get(key)
+            if (new_v is None or new_v == "") and old_v not in (None, ""):
+                entry[key] = old_v
+    sso_val = get_sso_value(entry)
+    if sso_val:
+        entry["sso"] = sso_val
+        entry.setdefault("sso_cookie", sso_val)
+    if not entry.get("password") and entry.get("register_password"):
+        entry["password"] = entry.get("register_password")
+    if not entry.get("register_password") and entry.get("password"):
+        entry["register_password"] = entry.get("password")
+    return entry
 
 
 def _accounts_store_source() -> str:
@@ -82,13 +163,7 @@ def list_accounts() -> list[dict[str, Any]]:
                 "expires_at": exp_f,
                 "expired": expired,
                 "has_refresh_token": bool(entry.get("refresh_token")),
-                "has_sso": bool(
-                    (isinstance(entry.get("sso"), str) and entry.get("sso").strip())
-                    or (
-                        isinstance(entry.get("sso_cookie"), str)
-                        and entry.get("sso_cookie").strip()
-                    )
-                ),
+                "has_sso": has_sso_value(entry),
                 "token_hint": _mask_token(token if isinstance(token, str) else None),
                 "first_name": entry.get("first_name"),
                 "last_name": entry.get("last_name"),
@@ -500,10 +575,10 @@ def _normalize_entry(
         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
     # Normalize SSO aliases into a single durable field on the account payload.
-    sso_val = entry.get("sso") or entry.get("sso_cookie") or entry.get("sso_token")
-    if isinstance(sso_val, str) and sso_val.strip():
-        entry["sso"] = sso_val.strip()
-        entry.setdefault("sso_cookie", entry["sso"])
+    sso_val = get_sso_value(entry)
+    if sso_val:
+        entry["sso"] = sso_val
+        entry.setdefault("sso_cookie", sso_val)
     pwd_val = entry.get("password") or entry.get("register_password")
     if isinstance(pwd_val, str) and pwd_val.strip():
         entry["password"] = pwd_val.strip()
@@ -584,10 +659,7 @@ def export_auth_payload(
             if isinstance(tok, str):
                 safe["token_hint"] = _mask_token(tok)
             safe["has_refresh_token"] = bool(v.get("refresh_token"))
-            safe["has_sso"] = bool(
-                (isinstance(v.get("sso"), str) and v.get("sso").strip())
-                or (isinstance(v.get("sso_cookie"), str) and v.get("sso_cookie").strip())
-            )
+            safe["has_sso"] = has_sso_value(v)
             out[k] = safe
     result = {
         "ok": True,
@@ -702,16 +774,27 @@ def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
             # Persist registration SSO so it survives process restarts.
             "sso",
             "sso_cookie",
+            "sso_token",
+            "session_cookies",
+            "cookies",
+            "cookie",
+            "set_cookie",
+            "set-cookie",
+            "set_cookies",
             "password",
             "register_password",
             "source",
             "registration_session_id",
             "registration_batch_id",
+            "sso_backup_path",
         ):
             if parsed.get(field) is not None and parsed.get(field) != "":
                 entry[field] = parsed[field]
-        if not entry.get("sso") and entry.get("sso_cookie"):
-            entry["sso"] = entry.get("sso_cookie")
+        if not entry.get("sso"):
+            _sso_val = get_sso_value(entry)
+            if _sso_val:
+                entry["sso"] = _sso_val
+                entry.setdefault("sso_cookie", _sso_val)
         if not entry.get("password") and entry.get("register_password"):
             entry["password"] = entry.get("register_password")
         raw_entries.append((str(account_id) if account_id else None, entry))
@@ -762,6 +845,8 @@ def merge_normalized_accounts(
                     continue
                 if str(v.get("user_id") or v.get("principal_id") or "") == str(uid) and k != aid:
                     existing.pop(k, None)
+        for aid, nent in normalized.items():
+            merge_durable_account_fields(nent, existing.get(aid))
         existing.update(normalized)
         write_auth_map(existing)
         total = len(existing)
@@ -957,16 +1042,27 @@ def import_auth_payload(
             # Persist registration SSO so it survives process restarts.
             "sso",
             "sso_cookie",
+            "sso_token",
+            "session_cookies",
+            "cookies",
+            "cookie",
+            "set_cookie",
+            "set-cookie",
+            "set_cookies",
             "password",
             "register_password",
             "source",
             "registration_session_id",
             "registration_batch_id",
+            "sso_backup_path",
         ):
             if parsed.get(field) is not None and parsed.get(field) != "":
                 entry[field] = parsed[field]
-        if not entry.get("sso") and entry.get("sso_cookie"):
-            entry["sso"] = entry.get("sso_cookie")
+        if not entry.get("sso"):
+            _sso_val = get_sso_value(entry)
+            if _sso_val:
+                entry["sso"] = _sso_val
+                entry.setdefault("sso_cookie", _sso_val)
         if not entry.get("password") and entry.get("register_password"):
             entry["password"] = entry.get("register_password")
         raw_entries.append((str(account_id) if account_id else None, entry))
@@ -1063,6 +1159,8 @@ def import_auth_payload(
                     continue
                 if v.get("user_id") == uid or v.get("principal_id") == uid:
                     del existing[k]
+        for aid, nent in normalized.items():
+            merge_durable_account_fields(nent, existing.get(aid))
         existing.update(normalized)
         final = existing
     else:
@@ -1112,11 +1210,13 @@ def do_refresh_all(
     *,
     force: bool = True,
     account_ids: list[str] | None = None,
+    include_accounts: bool = True,
 ) -> dict[str, Any]:
     """
     Refresh accounts that have refresh_token.
     force=True: refresh all; force=False: only near-expiry.
     account_ids: optional subset to renew (single / multi-select).
+    include_accounts=False keeps large-pool admin refresh responses slim.
     """
     from config import TOKEN_REFRESH_SKEW
 
@@ -1130,7 +1230,8 @@ def do_refresh_all(
         exp = r.get("expires_at")
         if isinstance(exp, (int, float)):
             r["remaining_sec"] = max(0, int(float(exp) - now))
-    result["accounts"] = list_accounts()
+    if include_accounts:
+        result["accounts"] = list_accounts()
     result["force"] = force
     if account_ids is not None:
         result["requested_ids"] = [str(x).strip() for x in account_ids if str(x).strip()]

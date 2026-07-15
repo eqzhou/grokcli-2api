@@ -332,6 +332,21 @@ def _hard_delete_invalid_refresh_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _summarize_refresh_error_body(status_code: int, body: str) -> str:
+    """Compact upstream token-refresh errors before returning them to admin UI."""
+    text = (body or "").strip()
+    low = text.lower()
+    if low.startswith("<!doctype html") or low.startswith("<html") or "<html" in low[:200]:
+        if "cloudflare" in low or "/cdn-cgi/" in low or "cf-error" in low:
+            kind = "Cloudflare HTML challenge/error"
+        else:
+            kind = "HTML error page"
+        return f"refresh failed {status_code}: upstream returned {kind}; check outbound proxy / xAI access"
+    if len(text) > 400:
+        text = text[:400]
+    return f"refresh failed {status_code}: {text}"
+
+
 def _is_permanent_refresh_failure(status_code: int, body: str) -> bool:
     """Return True only for clearly permanent refresh-token rejections.
 
@@ -592,9 +607,10 @@ def refresh_access_token(
                 pass
     if resp.status_code >= 400:
         body = resp.text[:400]
+        summary = _summarize_refresh_error_body(resp.status_code, body)
         if _is_permanent_refresh_failure(resp.status_code, body):
-            raise RefreshRevokedError(f"refresh failed {resp.status_code}: {body}")
-        raise ValueError(f"refresh failed {resp.status_code}: {body}")
+            raise RefreshRevokedError(summary)
+        raise ValueError(summary)
     data = resp.json()
     if not isinstance(data, dict) or not data.get("access_token"):
         raise ValueError("invalid refresh response")
@@ -616,6 +632,7 @@ def refresh_and_persist(
     *,
     client: httpx.Client | None = None,
     persist: bool = True,
+    recheck_latest: bool = True,
 ) -> dict[str, Any]:
     """
     Refresh one account under a per-account lock (multi-account safe).
@@ -623,25 +640,29 @@ def refresh_and_persist(
     When `persist=False`, only performs the OIDC exchange and returns the new
     entry — caller is responsible for a single batched write (startup bulk
     refresh). This avoids rewriting a multi-MB auth.json once per account.
+    `recheck_latest=False` lets a batch caller reuse its already-read snapshot
+    and avoid one full auth-map read per account in large pools.
     """
     lock = _account_refresh_lock(account_id)
     with lock:
-        # re-read latest entry — another thread may have just refreshed
-        latest_map = read_auth_map()
-        latest = latest_map.get(account_id)
-        if not isinstance(latest, dict):
-            # try by user_id
-            uid = entry.get("user_id") or entry.get("principal_id")
-            if uid:
-                for k, v in latest_map.items():
-                    if isinstance(v, dict) and (
-                        v.get("user_id") == uid or v.get("principal_id") == uid
-                    ):
-                        latest = v
-                        account_id = k
-                        break
+        latest = entry
+        if recheck_latest:
+            # re-read latest entry — another thread may have just refreshed
+            latest_map = read_auth_map()
+            latest = latest_map.get(account_id)
             if not isinstance(latest, dict):
-                latest = entry
+                # try by user_id
+                uid = entry.get("user_id") or entry.get("principal_id")
+                if uid:
+                    for k, v in latest_map.items():
+                        if isinstance(v, dict) and (
+                            v.get("user_id") == uid or v.get("principal_id") == uid
+                        ):
+                            latest = v
+                            account_id = k
+                            break
+                if not isinstance(latest, dict):
+                    latest = entry
         token_data = refresh_access_token(latest, client=client)
         new_id, new_entry = entry_from_token_response(token_data, previous=latest)
         uid = new_entry.get("user_id")
@@ -651,6 +672,12 @@ def refresh_and_persist(
             new_id = account_id
         if persist:
             upsert_entry(new_id, new_entry)
+            try:
+                import account_pool as _pool
+
+                _pool.record_renew_success(new_id, source="refresh_token")
+            except Exception:
+                pass
         return {"account_id": new_id, "entry": new_entry}
 
 
@@ -667,7 +694,8 @@ def ensure_fresh_entry(
     ``raise_on_error=True`` when the access token is already expired and the
     caller cannot proceed with a stale token.
 
-    Permanent RT failures (invalid_grant / revoked) delete the account immediately.
+    Permanent RT failures soft-expire the account; after two consecutive failures the
+maintainer tries SSO reauth (if present) or removes the account from the pool.
     """
     token = entry.get("key")
     exp = parse_expires_at(entry.get("expires_at"), token if isinstance(token, str) else None)
@@ -677,14 +705,52 @@ def ensure_fresh_entry(
         return entry
     if not entry.get("refresh_token"):
         return entry
+
+    # Access token already expired: immediately leave request rotation so the
+    # pool stops polling this account while renewal is attempted.
+    if already_expired:
+        try:
+            import account_pool as _pool
+
+            _pool.mark_account_expired(account_id, reason="access_token_expired")
+        except Exception:
+            pass
+
     try:
         result = refresh_and_persist(account_id, entry)
+        try:
+            import account_pool as _pool
+
+            _pool.record_renew_success(result.get("account_id") or account_id, source="refresh_token")
+        except Exception:
+            pass
         return result["entry"]
     except RefreshRevokedError as e:
-        # Soft-disable by default; never hard-delete on request path unless opted in.
-        mark_refresh_invalid(account_id, reason=str(e))
+        # Soft-expire first so request polling skips this account. Permanent
+        # invalidation is owned by the background maintainer (2 fails + SSO/no-SSO).
+        try:
+            import account_pool as _pool
+
+            _pool.record_renew_failure(account_id, str(e), source="refresh_token")
+        except Exception:
+            try:
+                import account_pool as _pool
+
+                _pool.mark_account_expired(account_id, reason=str(e)[:200])
+            except Exception:
+                pass
         raise
-    except Exception:
+    except Exception as e:
+        # Soft-mark expired so pool rotation skips broken RT accounts.
+        try:
+            import account_pool as _pool
+
+            if already_expired or raise_on_error:
+                _pool.record_renew_failure(account_id, e, source="refresh_token")
+            else:
+                _pool.mark_account_expired(account_id, reason=str(e)[:200] or "renew_failed")
+        except Exception:
+            pass
         if raise_on_error or already_expired:
             raise
         return entry
@@ -711,7 +777,7 @@ def start_device_authorization(
         if resp.status_code >= 400:
             return {
                 "ok": False,
-                "error": f"device code request failed {resp.status_code}: {resp.text[:400]}",
+                "error": "device code request " + _summarize_refresh_error_body(resp.status_code, resp.text[:400]),
             }
         data = resp.json()
 
@@ -1087,6 +1153,38 @@ def _refresh_sweep_mark(ids: list[str]) -> int:
         return len(cov)
 
 
+def _try_sso_reauth(account_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """Try to recover an account by converting its saved SSO cookie to tokens."""
+    try:
+        import accounts as _accounts
+
+        sso = _accounts.get_sso_value(entry)
+    except Exception:
+        sso = ""
+    if not sso:
+        return {"ok": False, "reason": "no_sso", "error": "no saved SSO cookie"}
+    try:
+        import sso_to_auth_json as _sso
+        import accounts as _accounts
+
+        token = _sso.sso_to_token(sso, quiet=True)
+        if not isinstance(token, dict) or not (token.get("access_token") or token.get("key")):
+            return {"ok": False, "reason": "sso_failed", "error": "SSO conversion returned no token"}
+        _sso_key, new_entry = _sso.token_to_auth_entry(
+            token,
+            email=str(entry.get("email") or ""),
+        )
+        new_entry = _accounts.merge_durable_account_fields(dict(new_entry), entry)
+        new_id = account_storage_id(
+            user_id=str(new_entry.get("user_id") or new_entry.get("principal_id") or "") or None,
+            client_id=str(new_entry.get("oidc_client_id") or "") or None,
+            fallback=account_id,
+        )
+        return {"ok": True, "account_id": new_id, "entry": new_entry, "source": "sso"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "sso_failed", "error": str(e)[:300]}
+
+
 def refresh_all_accounts(
     *,
     only_near_expiry: bool = True,
@@ -1150,8 +1248,23 @@ def refresh_all_accounts(
             continue
         if wanted is not None and aid not in wanted:
             continue
+        token = entry.get("key")
+        exp = parse_expires_at(
+            entry.get("expires_at"), token if isinstance(token, str) else None
+        )
+        is_expired = bool(exp is not None and float(exp) <= now)
+        if is_expired:
+            try:
+                import account_pool as _pool
+
+                _pool.mark_account_expired(aid, reason="access_token_expired")
+            except Exception:
+                pass
         if not entry.get("refresh_token"):
-            results.append({"id": aid, "ok": False, "error": "no refresh_token"})
+            if is_expired:
+                candidates.append((aid, entry))
+            else:
+                results.append({"id": aid, "ok": False, "error": "no refresh_token"})
             continue
         if entry.get("refresh_invalid"):
             results.append(
@@ -1164,10 +1277,6 @@ def refresh_all_accounts(
                 }
             )
             continue
-        token = entry.get("key")
-        exp = parse_expires_at(
-            entry.get("expires_at"), token if isinstance(token, str) else None
-        )
         if only_near_expiry and exp is not None and exp > now + skew_seconds:
             results.append(
                 {"id": aid, "ok": True, "skipped": True, "reason": "still_valid"}
@@ -1254,6 +1363,7 @@ def refresh_all_accounts(
             candidates = candidates[:max_accounts]
 
     updates: dict[str, dict[str, Any]] = {}
+    remount_deletes: set[str] = set()
     invalid_marks: dict[str, str] = {}
     updates_lock = threading.Lock()
     # One shared client per worker thread instead of opening a fresh TCP/TLS
@@ -1294,11 +1404,169 @@ def refresh_all_accounts(
                 _clients.append(client)
         return client
 
+    def _handle_refresh_failure(
+        aid: str,
+        entry: dict[str, Any],
+        err: BaseException,
+        *,
+        permanent: bool = False,
+    ) -> dict[str, Any]:
+        """Handle a failed RT renew.
+
+        Rules (accounts still have RT, but RT is broken):
+          1) always soft-mark expired so request polling skips the account
+          2) first consecutive failure: wait for next maintainer cycle
+          3) second consecutive failure:
+               - if SSO exists: try SSO re-conversion once
+               - if no SSO: hard-remove from pool rotation (keep credentials)
+        """
+        reason = str(err or "renew_failed")[:300]
+        try:
+            import account_pool as _pool
+            import accounts as _accounts
+
+            fail_count = _pool.record_renew_failure(aid, reason, source="refresh_token")
+            sso = _accounts.get_sso_value(entry)
+        except Exception:
+            fail_count = 1
+            sso = ""
+
+        # First failure: only leave request rotation; keep trying RT next cycle.
+        if fail_count < 2:
+            print(
+                f"  [token-refresh] renew fail #{fail_count} account={aid[:48]} "
+                f"(still has RT; skip pool until next cycle) err={reason[:120]}",
+                flush=True,
+            )
+            return {
+                "id": aid,
+                "ok": False,
+                "error": reason,
+                "reason": "renew_failed",
+                "permanent": bool(permanent),
+                "renew_fail_count": fail_count,
+                "removed_from_pool": False,
+            }
+
+        if sso:
+            try:
+                import account_pool as _pool
+
+                meta = _pool.get_account_pool_meta(aid) or {}
+                next_at = float(meta.get("sso_reauth_next_at") or 0)
+            except Exception:
+                next_at = 0.0
+            if next_at and next_at > time.time():
+                return {
+                    "id": aid,
+                    "ok": False,
+                    "error": reason,
+                    "reason": "sso_reauth_cooling",
+                    "renew_fail_count": fail_count,
+                    "sso_fallback": False,
+                    "sso_reauth_next_at": next_at,
+                    "removed_from_pool": False,
+                }
+            try:
+                import account_pool as _pool
+
+                _pool.mark_sso_reauth_attempt(aid)
+            except Exception:
+                pass
+            print(
+                f"  [token-refresh] renew fail #{fail_count}; trying SSO reauth "
+                f"account={aid[:48]}",
+                flush=True,
+            )
+            sso_res = _try_sso_reauth(aid, entry)
+            if sso_res.get("ok") and isinstance(sso_res.get("entry"), dict):
+                new_id = str(sso_res.get("account_id") or aid)
+                new_entry = dict(sso_res["entry"])
+                new_entry.pop("refresh_invalid", None)
+                new_entry.pop("refresh_invalid_at", None)
+                new_entry.pop("refresh_invalid_reason", None)
+                with updates_lock:
+                    updates[new_id] = new_entry
+                    if new_id != aid:
+                        remount_deletes.add(aid)
+                try:
+                    import account_pool as _pool
+
+                    _pool.record_renew_success(new_id, source="sso")
+                    if new_id != aid:
+                        # Old id should not remain rotation-eligible.
+                        _pool.remove_from_pool_after_renew_failure(
+                            aid,
+                            reason="sso_reauth remounted account id",
+                        )
+                except Exception:
+                    pass
+                print(
+                    f"  [token-refresh] SSO reauth recovered account={new_id[:48]}",
+                    flush=True,
+                )
+                return {
+                    "id": new_id,
+                    "ok": True,
+                    "email": new_entry.get("email"),
+                    "expires_at": new_entry.get("expires_at"),
+                    "renew_source": "sso",
+                    "sso_fallback": True,
+                    "renew_fail_count": 0,
+                    "removed_from_pool": False,
+                }
+            try:
+                import account_pool as _pool
+
+                _pool.mark_sso_reauth_failure(aid, sso_res.get("error") or reason)
+            except Exception:
+                pass
+            # Keep credentials; stay out of rotation until SSO cooldown ends.
+            return {
+                "id": aid,
+                "ok": False,
+                "error": sso_res.get("error") or reason,
+                "reason": "sso_reauth_failed",
+                "renew_fail_count": fail_count,
+                "sso_fallback": True,
+                "removed_from_pool": False,
+            }
+
+        # No SSO after two consecutive RT failures: remove from pool rotation.
+        try:
+            import account_pool as _pool
+
+            _pool.remove_from_pool_after_renew_failure(
+                aid,
+                reason="连续续期失败且无 SSO，已移出号池",
+            )
+        except Exception:
+            pass
+        print(
+            f"  [token-refresh] renew fail #{fail_count}; no SSO — removed from pool "
+            f"account={aid[:48]} err={reason[:120]}",
+            flush=True,
+        )
+        return {
+            "id": aid,
+            "ok": False,
+            "error": reason,
+            "reason": "no_sso_removed",
+            "renew_fail_count": fail_count,
+            "sso_fallback": False,
+            "removed_from_pool": True,
+            "permanent": bool(permanent),
+        }
+
     def _refresh_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
         aid, entry = item
         try:
             r = refresh_and_persist(
-                aid, entry, client=_thread_client(aid), persist=False
+                aid,
+                entry,
+                client=_thread_client(aid),
+                persist=False,
+                recheck_latest=False,
             )
             # Successful refresh clears any previous invalid mark.
             new_entry = dict(r["entry"])
@@ -1307,39 +1575,25 @@ def refresh_all_accounts(
             new_entry.pop("refresh_invalid_reason", None)
             with updates_lock:
                 updates[r["account_id"]] = new_entry
-                # Drop old key if remounted to a different storage id
                 if r["account_id"] != aid:
-                    updates.setdefault("__delete__", {})  # type: ignore[arg-type]
+                    remount_deletes.add(aid)
+            try:
+                import account_pool as _pool
+
+                _pool.record_renew_success(r["account_id"], source="refresh_token")
+            except Exception:
+                pass
             return {
                 "id": r["account_id"],
                 "ok": True,
                 "email": new_entry.get("email"),
                 "expires_at": new_entry.get("expires_at"),
+                "renew_source": "refresh_token",
             }
         except RefreshRevokedError as e:
-            reason = str(e)[:300]
-            with updates_lock:
-                invalid_marks[aid] = reason
-            # Permanent RT failure: hard-delete by default so dead accounts leave
-            # the pool immediately (opt out with DELETE_INVALID_REFRESH=0).
-            action = "deleted"
-            try:
-                res = mark_refresh_invalid(aid, reason=reason)
-                action = str((res or {}).get("action") or "deleted")
-            except Exception:
-                pass
-            return {
-                "id": aid,
-                "ok": False,
-                "error": reason,
-                "permanent": True,
-                "reason": "refresh_invalid",
-                "deleted": action == "deleted",
-                "disabled": action != "deleted",
-                "action": action,
-            }
+            return _handle_refresh_failure(aid, entry, e, permanent=True)
         except Exception as e:  # noqa: BLE001
-            return {"id": aid, "ok": False, "error": str(e)[:300]}
+            return _handle_refresh_failure(aid, entry, e, permanent=False)
 
     workers = max(1, min(int(max_workers or 1), max(1, len(candidates))))
     if candidates:
@@ -1363,41 +1617,15 @@ def refresh_all_accounts(
                         pass
                 _clients.clear()
 
-    # Permanent refresh failures: default hard-delete (handled inside
-    # mark_refresh_invalid). Soft-disable only when env explicitly opts out.
-    # Temporary failures keep the account.
+    # Failure handling is soft by default: accounts stay stored but are kept out
+    # of request rotation via pool_status=expired until refresh/SSO recovery works.
     disabled_ids: list[str] = []
     deleted_ids: list[str] = []
     deleted_reasons: dict[str, str] = {}
-    if invalid_marks:
-        hard = _hard_delete_invalid_refresh_enabled()
-        for aid, reason in invalid_marks.items():
-            deleted_reasons[aid] = reason
-            if hard:
-                deleted_ids.append(aid)
-            else:
-                disabled_ids.append(aid)
-            for r in results:
-                if r.get("id") == aid and (
-                    r.get("permanent") or r.get("reason") == "refresh_invalid"
-                ):
-                    if hard:
-                        r["deleted"] = True
-                        r["disabled"] = False
-                        r["reason"] = "refresh_invalid_deleted"
-                        r["action"] = "deleted"
-                    else:
-                        r["deleted"] = False
-                        r["disabled"] = True
-                        r["reason"] = "refresh_invalid_disabled"
-                        r["action"] = "disabled"
-                    r["error"] = (
-                        reason or r.get("error") or "refresh_token permanently invalid"
-                    )[:300]
 
     # Single batched write for successful refreshes (+ optional hard deletes).
-    if updates or deleted_ids:
-        delete_set = set(deleted_ids)
+    if updates or deleted_ids or remount_deletes:
+        delete_set = set(deleted_ids) | set(remount_deletes)
 
         def _apply(m: dict[str, Any]) -> None:
             for aid, entry in updates.items():

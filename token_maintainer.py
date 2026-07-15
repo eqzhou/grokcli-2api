@@ -135,14 +135,19 @@ def _min_remaining_seconds(*, force: bool = False) -> float | None:
         return None
 
 
-def _adaptive_batch(*, force: bool = False, rem: float | None = None) -> int:
+def _adaptive_batch(
+    *,
+    force: bool = False,
+    rem: float | None = None,
+    stats: dict[str, Any] | None = None,
+) -> int:
     """Scale per-cycle refresh batch with pool pressure (still hard-capped)."""
     try:
         from config import TOKEN_REFRESH_BATCH
     except Exception:
         TOKEN_REFRESH_BATCH = 40
     base = max(1, int(TOKEN_REFRESH_BATCH or 40))
-    stats = _remaining_stats(force=True)
+    stats = dict(stats or _remaining_stats(force=True))
     if rem is None:
         rem = stats.get("min_remaining_sec")
         try:
@@ -182,7 +187,11 @@ def _adaptive_batch(*, force: bool = False, rem: float | None = None) -> int:
     return base
 
 
-def _adaptive_skew(*, force: bool = False) -> float:
+def _adaptive_skew(
+    *,
+    force: bool = False,
+    stats: dict[str, Any] | None = None,
+) -> float:
     """Background refresh horizon.
 
     Request-path skew stays small (TOKEN_REFRESH_SKEW). Background uses a wider
@@ -194,7 +203,7 @@ def _adaptive_skew(*, force: bool = False) -> float:
     if force:
         return 365 * 86400.0
 
-    stats = _remaining_stats(force=False)
+    stats = dict(stats or _remaining_stats(force=False))
     live = int(stats.get("live") or 0)
     le30 = int(stats.get("le_30m") or 0)
     le60 = int(stats.get("le_60m") or 0)
@@ -280,7 +289,6 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
             print("  [token-maintainer] deferred: maintenance slot busy")
             return result
         try:
-            from accounts import list_accounts
             from oidc_auth import normalize_auth_file_keys, refresh_all_accounts
 
             result["normalized"] = normalize_auth_file_keys()
@@ -320,8 +328,8 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                 rem = float(rem) if rem is not None else None
             except (TypeError, ValueError):
                 rem = None
-            skew = _adaptive_skew(force=force)
-            force_batch = _adaptive_batch(force=force, rem=rem)
+            skew = _adaptive_skew(force=force, stats=pre_stats)
+            force_batch = _adaptive_batch(force=force, rem=rem, stats=pre_stats)
             refresh = refresh_all_accounts(
                 only_near_expiry=not force,
                 skew_seconds=skew,
@@ -358,9 +366,13 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                     or 0
                 )
             result["refresh"] = slim_refresh
-            accounts = list_accounts()
             result["accounts"] = []  # never embed full account list in status cache
-            result["accounts_total"] = len(accounts)
+            result["accounts_total"] = int(pre_stats.get("live") or 0)
+            # Refresh changed expiries; invalidate the pre-scan cache so wait/status
+            # use a fresh one-pass scan instead of looping on stale near-expiry data.
+            if int(slim_refresh.get("attempted") or 0) or int(slim_refresh.get("refreshed") or 0):
+                _remaining_stats_cache["at"] = 0.0
+                _remaining_stats_cache["stats"] = None
             result["min_remaining_sec"] = _min_remaining_seconds(force=True)
             # Attach full refresh only on the returned object for admin force-run.
             result_full = dict(result)

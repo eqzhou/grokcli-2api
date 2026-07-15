@@ -715,6 +715,18 @@ def _pool_meta(
         "last_quota": meta.get("last_quota"),
         "last_probe": meta.get("last_probe"),
         "last_probe_status": meta.get("last_probe_status"),
+        "token_expired_at": meta.get("token_expired_at"),
+        "token_expired_reason": meta.get("token_expired_reason"),
+        "renew_fail_count": int(meta.get("renew_fail_count") or 0),
+        "last_renew_fail_at": meta.get("last_renew_fail_at"),
+        "last_renew_error": meta.get("last_renew_error"),
+        "last_renew_status": meta.get("last_renew_status"),
+        "last_renew_source": meta.get("last_renew_source"),
+        "last_renew_ok_at": meta.get("last_renew_ok_at"),
+        "sso_reauth_attempted_at": meta.get("sso_reauth_attempted_at"),
+        "sso_reauth_failed_at": meta.get("sso_reauth_failed_at"),
+        "sso_reauth_error": meta.get("sso_reauth_error"),
+        "sso_reauth_next_at": meta.get("sso_reauth_next_at"),
         "blocked_models": blocked,
         "blocked_model_ids": list(blocked.keys()),
         # Probe escalation (stored in account_pool.extra JSONB)
@@ -746,7 +758,19 @@ def _pool_meta(
     # Count-based cooling OR legacy until-based cooling.
     cooling = is_in_cooldown(out)
     out["in_cooldown"] = cooling
-    if not out.get("pool_status"):
+    status = str(out.get("pool_status") or meta.get("pool_status") or "").strip().lower()
+    renew_status = str(out.get("last_renew_status") or meta.get("last_renew_status") or "")
+    # Token/renewal expiry outranks disabled/cooldown so broken RT accounts
+    # stay labeled "过期" after remove-from-pool.
+    if status == "expired" or renew_status in {
+        "failed",
+        "expired",
+        "sso_failed",
+        "no_sso_removed",
+        "sso_attempt",
+    }:
+        out["pool_status"] = "expired"
+    elif not out.get("pool_status"):
         if out.get("disabled_for_quota"):
             out["pool_status"] = "quota_disabled"
         elif out.get("enabled") is False:
@@ -1048,15 +1072,16 @@ def _eligible(
     allow_refreshable_expired: bool = False,
     redis_overlay: bool = False,
 ) -> bool:
-    # Expired access tokens are normally ineligible. When the caller will
-    # immediately refresh (acquire path), keep accounts that still have a
-    # refresh_token so auto-renew can revive them instead of reporting
-    # "all expired".
-    if creds.expired and not (allow_refreshable_expired and creds.refresh_token):
+    # Expired access tokens never enter request rotation. Background/manual
+    # renewal is responsible for recovery (and optional SSO fallback), keeping
+    # request TTFT free of token/SSO recovery work.
+    if creds.expired:
         return False
     aid = creds.auth_key or ""
     # Request-path scheduling uses durable meta only (no per-account Redis).
     meta = _pool_meta(aid, state, redis_overlay=redis_overlay)
+    if str(meta.get("pool_status") or "").strip().lower() == "expired":
+        return False
     if not meta["enabled"]:
         return False
     # Active wall-clock cooldown still running → skip.
@@ -1090,6 +1115,234 @@ def _eligible(
     if model and is_model_blocked(aid, model, state, meta=meta):
         return False
     return True
+
+
+def mark_account_expired(
+    account_id: str | None,
+    *,
+    reason: str = "access_token_expired",
+) -> dict[str, Any] | None:
+    """Mark an account out of request rotation because its access token expired.
+
+    This only removes the account from live request polling. Credentials stay
+    stored so background renewal / SSO reauth can still recover the account.
+    """
+    if not account_id:
+        return None
+    now = _now()
+    try:
+        cur = get_account_pool_meta(account_id) or {}
+    except Exception:
+        cur = {}
+    # Preserve consecutive renew-fail counters; only mark rotation-expired.
+    patch = {
+        "pool_status": "expired",
+        "token_expired_at": (cur or {}).get("token_expired_at") or now,
+        "token_expired_reason": reason,
+        "last_renew_status": (cur or {}).get("last_renew_status") or "expired",
+        "last_error": reason,
+    }
+    try:
+        return patch_account_pool_meta(account_id, patch)
+    except Exception:
+        return None
+
+
+def clear_account_expired(
+    account_id: str | None,
+    *,
+    source: str = "refresh_token",
+) -> dict[str, Any] | None:
+    """Clear expired/renewal-failure markers after a successful renewal.
+
+    Also re-enables the account for pool rotation when it was hard-removed after
+    consecutive renew failures (no-SSO path). Quota-disabled accounts stay
+    disabled.
+    """
+    if not account_id:
+        return None
+    now = _now()
+    try:
+        cur = get_account_pool_meta(account_id) or {}
+    except Exception:
+        cur = {}
+    patch = {
+        "pool_status": "normal",
+        "token_expired_at": None,
+        "token_expired_reason": None,
+        "renew_fail_count": 0,
+        "last_renew_fail_at": None,
+        "last_renew_error": None,
+        "last_renew_status": "ok",
+        "last_renew_source": source,
+        "last_renew_ok_at": now,
+        "sso_reauth_attempted_at": None,
+        "sso_reauth_failed_at": None,
+        "sso_reauth_error": None,
+        "sso_reauth_next_at": None,
+        "last_error": None,
+    }
+    # Re-enter pool after recovery unless the account is quota-disabled.
+    if not cur.get("disabled_for_quota"):
+        patch["enabled"] = True
+        # Clear no-SSO hard-remove markers.
+        if str(cur.get("disabled_source") or "") in {"renew_fail_no_sso", "kick"} or str(
+            cur.get("last_renew_status") or ""
+        ) == "no_sso_removed":
+            patch["disabled_reason"] = None
+            patch["disabled_source"] = None
+    try:
+        return patch_account_pool_meta(account_id, patch)
+    except Exception:
+        return None
+
+
+def record_renew_failure(
+    account_id: str | None,
+    error: str | BaseException | None,
+    *,
+    source: str = "refresh_token",
+) -> int:
+    """Increment durable consecutive renewal failure count.
+
+    One failure only marks the account rotation-expired so request polling skips
+    it. Two consecutive failures is the threshold used by the maintainer for
+    SSO reauth (when available) or permanent removal from the pool.
+    """
+    if not account_id:
+        return 0
+    try:
+        cur = get_account_pool_meta(account_id) or {}
+    except Exception:
+        cur = {}
+    try:
+        n = int((cur or {}).get("renew_fail_count") or 0) + 1
+    except Exception:
+        n = 1
+    msg = str(error or "renew_failed")[:300]
+    patch = {
+        "pool_status": "expired",
+        "token_expired_at": (cur or {}).get("token_expired_at") or _now(),
+        "token_expired_reason": (cur or {}).get("token_expired_reason") or "renew_failed",
+        "renew_fail_count": n,
+        "last_renew_fail_at": _now(),
+        "last_renew_error": msg,
+        "last_renew_status": "failed",
+        "last_renew_source": source,
+        "last_error": msg,
+    }
+    try:
+        patch_account_pool_meta(account_id, patch)
+    except Exception:
+        pass
+    return n
+
+
+def record_renew_success(
+    account_id: str | None,
+    *,
+    source: str = "refresh_token",
+) -> None:
+    clear_account_expired(account_id, source=source)
+
+
+def mark_sso_reauth_attempt(
+    account_id: str | None,
+) -> None:
+    if not account_id:
+        return
+    try:
+        patch_account_pool_meta(
+            account_id,
+            {
+                "sso_reauth_attempted_at": _now(),
+                "last_renew_status": "sso_attempt",
+                "last_renew_source": "sso",
+            },
+        )
+    except Exception:
+        pass
+
+
+def mark_sso_reauth_failure(
+    account_id: str | None,
+    error: str | BaseException | None,
+    *,
+    cooldown_sec: float = 3600.0,
+) -> None:
+    if not account_id:
+        return
+    now = _now()
+    try:
+        patch_account_pool_meta(
+            account_id,
+            {
+                "pool_status": "expired",
+                "sso_reauth_failed_at": now,
+                "sso_reauth_error": str(error or "sso_reauth_failed")[:300],
+                "sso_reauth_next_at": now + max(60.0, float(cooldown_sec or 3600.0)),
+                "last_renew_status": "sso_failed",
+                "last_renew_source": "sso",
+                "last_error": str(error or "sso_reauth_failed")[:300],
+            },
+        )
+    except Exception:
+        pass
+
+
+def remove_from_pool_after_renew_failure(
+    account_id: str | None,
+    *,
+    reason: str = "连续续期失败且无 SSO，已移出号池",
+) -> dict[str, Any] | None:
+    """Keep credentials, but hard-remove the account from request rotation.
+
+    Used when RT is present but broken, renew failed twice, and no usable SSO
+    is available for re-conversion.
+    """
+    if not account_id:
+        return None
+    msg = str(reason or "连续续期失败且无 SSO，已移出号池")[:300]
+    # Prefer a direct meta patch so pool_status stays "expired" (not plain
+    # disabled). Credentials remain in auth storage.
+    try:
+        return patch_account_pool_meta(
+            account_id,
+            {
+                "enabled": False,
+                "disabled_for_quota": False,
+                "pool_status": "expired",
+                "token_expired_at": _now(),
+                "token_expired_reason": msg,
+                "last_renew_status": "no_sso_removed",
+                "last_renew_error": msg,
+                "last_error": msg,
+                "disabled_reason": msg,
+                "disabled_source": "renew_fail_no_sso",
+                # Clear temporary cooldown so UI shows expired, not cooling.
+                "cooldown_until": None,
+                "cooldown_count": 0,
+            },
+        )
+    except Exception:
+        try:
+            kick_from_pool(account_id, reason=msg, cooldown_sec=None)
+        except Exception:
+            pass
+        try:
+            return patch_account_pool_meta(
+                account_id,
+                {
+                    "enabled": False,
+                    "pool_status": "expired",
+                    "last_renew_status": "no_sso_removed",
+                    "last_renew_error": msg,
+                    "last_error": msg,
+                    "disabled_reason": msg,
+                },
+            )
+        except Exception:
+            return None
 
 
 def _pick_round_robin(eligible: list[GrokCredentials]) -> GrokCredentials:
@@ -1350,13 +1603,14 @@ def acquire(
     # re-introduced into live rotation — they stay out until a successful probe
     # or admin clear (PROBE_ONLY_COOLDOWN_RECOVERY).
     def _usable(c: GrokCredentials) -> bool:
-        return (not c.expired) or (bool(auto_refresh) and bool(c.refresh_token))
+        return not c.expired
 
     def _meta_local(c: GrokCredentials) -> dict[str, Any]:
         return _pool_meta(c.auth_key or "", state, redis_overlay=False)
 
     def _not_cooling(c: GrokCredentials) -> bool:
-        return not is_in_cooldown(_meta_local(c))
+        meta = _meta_local(c)
+        return not is_in_cooldown(meta) and str(meta.get("pool_status") or "").strip().lower() != "expired"
 
     if not eligible:
         # 1) ignore temporary model soft-blocks (keep durable permanent blocks + cooldown)
@@ -1444,10 +1698,14 @@ def report_success(account_id: str | None, *, model: str | None = None) -> None:
     if not account_id:
         return
     release_account_pick(account_id)
-    meta = _pool_meta(account_id, get_account_pool_state())
+    try:
+        meta = get_account_pool_meta(account_id) or {}
+    except Exception:
+        meta = {}
+    meta = _pool_meta(account_id, {account_id: meta}, redis_overlay=False)
     still_cooling = is_in_cooldown(meta)
     # Live traffic never clears cooldown (clear_cooldown always False).
-    touch_account_stats(
+    saved = touch_account_stats(
         account_id,
         success=True,
         clear_cooldown=False,
@@ -1455,23 +1713,27 @@ def report_success(account_id: str | None, *, model: str | None = None) -> None:
         # Preserve durable cooldown fields; do not let success path stamp
         # pool_status=normal while still cooling.
         preserve_cooldown=True,
+        current_meta=meta,
     )
+    if isinstance(saved, dict):
+        meta = _pool_meta(account_id, {account_id: saved}, redis_overlay=False)
     # While cooling: do not touch status-bearing meta at all (no streak patch,
     # no soft-unblock) so UI/DB cooldown state is not "refreshed" to normal.
     if still_cooling:
         return
-    # Not cooling: safe to clear probe fail streak for healthy live traffic.
+    # Not cooling: safe to clear probe fail streak for healthy live traffic, but
+    # avoid a durable write when the streak is already clear.
     try:
-        patch_account_pool_meta(account_id, {"probe_fail_streak": 0})
+        if int(meta.get("probe_fail_streak") or 0) != 0:
+            patch_account_pool_meta(account_id, {"probe_fail_streak": 0})
+            meta["probe_fail_streak"] = 0
     except Exception:
         pass
     # Soft model blocks may clear on live success only when account is NOT in
     # account-level cooldown (cooldown recovery is probe-only).
     if model:
         try:
-            state = get_account_pool_state()
-            meta2 = state.get(account_id) or {}
-            blocked = meta2.get("blocked_models") if isinstance(meta2, dict) else None
+            blocked = meta.get("blocked_models") if isinstance(meta, dict) else None
             if isinstance(blocked, dict) and model in blocked:
                 entry = blocked.get(model) or {}
                 src = str((entry or {}).get("source") or "") if isinstance(entry, dict) else ""
@@ -2107,33 +2369,43 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
     routes on large multi-account pools (hundreds of entries) and avoids
     building the full admin account dict list.
 
-    Cooldown counts always come from durable DB/meta (not Redis TTL alone).
-    Expired cooldowns are pruned lazily; active ones are never zeroed by
-    status polling.
+    Counts are derived from durable account status fields
+    (`pool_status` / enabled / disabled_for_quota) — same source as the
+    account list badges.
     """
     if include_accounts:
-        try:
-            # Only clear cooldowns whose until timestamp already elapsed.
-            if random.random() < 0.25:
-                prune_expired_cooldowns()
-        except Exception:
-            pass
         accounts = list_pool_accounts()
-        live = [a for a in accounts if not a.get("expired")]
-        enabled = [a for a in live if a.get("enabled")]
-        cooling = [a for a in enabled if a.get("in_cooldown")]
-        quota_disabled = [a for a in accounts if a.get("disabled_for_quota")]
-        model_blocked = [
-            a for a in accounts if (a.get("blocked_model_ids") or a.get("blocked_models"))
-        ]
+        # Count by durable account status only (pool_status on the row).
+        total = len(accounts)
+        expired = cooling = quota_disabled = model_blocked = disabled = enabled = 0
+        for a in accounts:
+            status = str(a.get("pool_status") or "normal").strip().lower()
+            if status == "expired":
+                expired += 1
+                continue
+            if status == "quota_disabled" or a.get("disabled_for_quota"):
+                quota_disabled += 1
+                continue
+            if status == "cooldown":
+                cooling += 1
+                continue
+            if status == "model_blocked" or a.get("blocked_model_ids") or a.get("blocked_models"):
+                model_blocked += 1
+                continue
+            if status == "disabled" or a.get("enabled") is False:
+                disabled += 1
+                continue
+            enabled += 1
         return {
             "mode": get_account_mode(),
-            "total": len(accounts),
-            "live": len(live),
-            "enabled": len(enabled),
-            "in_cooldown": len(cooling),
-            "quota_disabled": len(quota_disabled),
-            "model_blocked": len(model_blocked),
+            "total": total,
+            "live": total - expired,
+            "enabled": enabled,
+            "in_cooldown": cooling,
+            "quota_disabled": quota_disabled,
+            "model_blocked": model_blocked,
+            "expired": expired,
+            "disabled": disabled,
             "accounts": accounts,
             "source": "durable",
         }
@@ -2178,10 +2450,12 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
                 "mode": get_account_mode(),
                 "total": int(counts.get("total") or count_accounts() or 0),
                 "live": int(counts.get("live") or counts.get("total") or 0),
-                "enabled": int(counts.get("enabled") or counts.get("live") or 0),
+                "enabled": int(counts.get("enabled") or 0),
                 "in_cooldown": int(counts.get("in_cooldown") or 0),
                 "quota_disabled": int(counts.get("quota_disabled") or 0),
                 "model_blocked": int(counts.get("model_blocked") or 0),
+                "expired": int(counts.get("expired") or 0),
+                "disabled": int(counts.get("disabled") or 0),
                 "source": "postgres",
             }
             _pool_summary_light_cache = dict(out)
@@ -2189,23 +2463,30 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
             return out
     except Exception:
         pass
+    # Fallback: count durable status fields from account_pool meta.
     state = get_account_pool_state()
-    total = live = enabled = cooling = quota_disabled = model_blocked = 0
+    total = live = enabled = cooling = quota_disabled = model_blocked = expired = disabled = 0
     for creds in list_live_credentials(include_expired=True, auto_refresh=False):
         total += 1
         meta = _pool_meta(creds.auth_key or "", state)
-        if meta.get("disabled_for_quota"):
-            quota_disabled += 1
-        if meta.get("blocked_model_ids") or meta.get("blocked_models"):
-            model_blocked += 1
-        if creds.expired:
+        status = str(meta.get("pool_status") or "").strip().lower() or "normal"
+        if status == "expired":
+            expired += 1
             continue
         live += 1
-        if not meta["enabled"]:
+        if status == "quota_disabled" or meta.get("disabled_for_quota"):
+            quota_disabled += 1
+            continue
+        if status == "cooldown":
+            cooling += 1
+            continue
+        if status == "model_blocked" or meta.get("blocked_model_ids") or meta.get("blocked_models"):
+            model_blocked += 1
+            continue
+        if status == "disabled" or meta.get("enabled") is False:
+            disabled += 1
             continue
         enabled += 1
-        if is_in_cooldown(meta):
-            cooling += 1
     out = {
         "mode": get_account_mode(),
         "total": total,
@@ -2214,6 +2495,8 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
         "in_cooldown": cooling,
         "quota_disabled": quota_disabled,
         "model_blocked": model_blocked,
+        "expired": expired,
+        "disabled": disabled,
     }
     _pool_summary_light_cache = dict(out)
     _pool_summary_light_at = now
@@ -2294,6 +2577,7 @@ def try_acquire_sequence(
                 bool(sm.get("enabled", True))
                 and not sm.get("disabled_for_quota")
                 and not is_in_cooldown(sm)
+                and str(sm.get("pool_status") or "").strip().lower() != "expired"
                 and not sticky_blocked
                 and int(sm.get("consecutive_fails") or 0) < 2
                 and not sticky.expired
@@ -2366,23 +2650,15 @@ def try_acquire_sequence(
     if state is None:
         state = {}
         state_is_partial = True
-    # Prefer non-expired first (no network). Include expired-but-refreshable so
-    # the chain can still revive them if every live account is cooling/blocked.
+    # Request rotation only uses non-expired credentials. Background/manual token
+    # maintainer owns expired-account renewal and SSO fallback.
     all_live = list_live_credentials(include_expired=True, auto_refresh=False)
 
     def _usable(c: GrokCredentials) -> bool:
-        return (not c.expired) or bool(c.refresh_token)
+        return not c.expired
 
-    # Prefer already-fresh accounts for TTFT; expired ones stay as fallback.
     # Keep this cheap: avoid multiple full-list passes + repeated meta lookups.
-    fresh: list[GrokCredentials] = []
-    refreshable: list[GrokCredentials] = []
-    for c in all_live:
-        if not c.expired:
-            fresh.append(c)
-        elif c.refresh_token:
-            refreshable.append(c)
-    pool_order = fresh + refreshable
+    pool_order: list[GrokCredentials] = [c for c in all_live if not c.expired]
 
     # Candidate window — we only need a short failover chain, not a ranked full
     # pool. On cold meta, hydrate just this window via WHERE id = ANY(...).
@@ -2637,19 +2913,10 @@ def try_acquire_sequence(
             limit = max(int(limit or 1), min(8, max(4, ready or 4)))
     if limit is not None:
         ordered = ordered[: max(1, int(limit))] if ordered else []
-    # Only refresh the first candidate if it is already expired. Refreshing the
-    # whole chain here serializes OIDC RTs before any upstream byte is sent.
-    if ordered:
-        first = _ensure_fresh_creds(ordered[0], auto_refresh=True)
-        if first.expired and not first.refresh_token:
-            # First account unusable and no refresh path — drop it and try next
-            # without paying OIDC for the rest of the chain yet.
-            rest = [c for c in ordered[1:] if (not c.expired) or c.refresh_token]
-            if rest:
-                note_account_pick(rest[0].auth_key or "")
-            return rest
-        ordered = [first] + list(ordered[1:])
-    out = [c for c in ordered if (not c.expired) or c.refresh_token]
+    # Request rotation must not perform token recovery. Drop any account that
+    # became expired while this chain was being built; the maintainer/manual
+    # renewal path will restore it if possible.
+    out = [c for c in ordered if not c.expired]
     if out:
         # Soft-mark the head so concurrent requests diversify immediately.
         # Failover tails are marked when the caller actually switches (via

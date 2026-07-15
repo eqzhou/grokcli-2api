@@ -23,6 +23,18 @@ from config import CLI_VERSION, DEFAULT_MODEL, UPSTREAM_BASE
 # Upstream returns amounts as {"val": number}. Unit is USD (often 0 on free/promo).
 _QUOTA_TIMEOUT = 20.0
 
+
+def _compact_http_body(status_code: int, body: str, *, source: str = "upstream") -> str:
+    """Return a short operator-safe summary for non-JSON upstream bodies."""
+    text = (body or "").strip()
+    low = text.lower()
+    if low.startswith("<!doctype html") or low.startswith("<html") or "<html" in low[:240]:
+        if "cloudflare" in low or "/cdn-cgi/" in low or "cf-error" in low:
+            return f"{source} HTTP {status_code}: Cloudflare/HTML challenge; lower concurrency or check outbound proxy"
+        return f"{source} HTTP {status_code}: HTML error page"
+    return f"{source} HTTP {status_code}: {text[:200]}"
+
+
 # Hard quota / credit exhaustion signals from upstream error bodies.
 # (Pure rate-limit 429 alone is temporary cooldown — not permanent disable.)
 _QUOTA_ERROR_RE = re.compile(
@@ -404,7 +416,7 @@ def fetch_quota_for_creds(creds: GrokCredentials) -> dict[str, Any]:
             return {
                 **base,
                 "ok": False,
-                "error": f"billing HTTP {br.status_code}: {(br.text or '')[:200]}",
+                "error": _compact_http_body(br.status_code, br.text or "", source="billing"),
                 "status_code": br.status_code,
             }
     except Exception as e:  # noqa: BLE001
@@ -450,7 +462,7 @@ async def fetch_quota_for_creds_async(creds: GrokCredentials) -> dict[str, Any]:
             return {
                 **base,
                 "ok": False,
-                "error": f"billing HTTP {br.status_code}: {(br.text or '')[:200]}",
+                "error": _compact_http_body(br.status_code, br.text or "", source="billing"),
                 "status_code": br.status_code,
             }
         billing_raw = br.json()

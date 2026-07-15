@@ -123,6 +123,18 @@ _POOL_STATUS_EXTRA_KEYS = (
     "last_probe_fail_at",
     "status_stack",
     "cooldown_detail",
+    "token_expired_at",
+    "token_expired_reason",
+    "renew_fail_count",
+    "last_renew_fail_at",
+    "last_renew_error",
+    "last_renew_status",
+    "last_renew_source",
+    "last_renew_ok_at",
+    "sso_reauth_attempted_at",
+    "sso_reauth_failed_at",
+    "sso_reauth_error",
+    "sso_reauth_next_at",
 )
 
 
@@ -326,10 +338,11 @@ def get_pool_meta(account_id: str) -> dict[str, Any]:
 
 
 def pool_counts(*, maintain: bool = False) -> dict[str, int]:
-    """Live SQL aggregate counts from accounts + account_pool.
+    """Count accounts by durable account_pool status fields.
 
-    Always counts current DB state (no snapshot). Optional maintain=True purges
-    orphan pool rows and clears expired cooldowns before counting.
+    Status is stored on each account row (`pool_status` / `disabled_for_quota` /
+    `enabled`). Overview numbers are just SQL GROUP counts of that state —
+    no wall-clock re-derivation from cooldown_until / token expiry.
     """
     if not enabled():
         return {
@@ -339,6 +352,8 @@ def pool_counts(*, maintain: bool = False) -> dict[str, int]:
             "in_cooldown": 0,
             "model_blocked": 0,
             "live": 0,
+            "expired": 0,
+            "disabled": 0,
         }
     with connection() as conn:
         with conn.cursor() as cur:
@@ -354,70 +369,67 @@ def pool_counts(*, maintain: bool = False) -> dict[str, int]:
                     )
                 except Exception:
                     pass
-                try:
-                    cur.execute(
-                        """
-                        UPDATE account_pool
-                        SET cooldown_until = NULL
-                        WHERE cooldown_until IS NOT NULL
-                          AND cooldown_until <= now()
-                        """
-                    )
-                except Exception:
-                    pass
+            # Count every account once by its durable pool_status.
+            # Missing pool row → treat as normal (eligible for rotation).
             cur.execute(
                 """
                 SELECT
                   COUNT(*) AS total,
                   COUNT(*) FILTER (
-                    WHERE (a.expires_at IS NULL OR a.expires_at > now())
-                      AND COALESCE(ap.disabled_for_quota, false) = false
+                    WHERE COALESCE(ap.pool_status, 'normal') = 'normal'
                       AND COALESCE(ap.enabled, true) = true
+                      AND COALESCE(ap.disabled_for_quota, false) = false
                   ) AS enabled,
-                  COUNT(*) FILTER (WHERE COALESCE(ap.disabled_for_quota, false) = true) AS quota_disabled,
                   COUNT(*) FILTER (
-                    WHERE ap.cooldown_until IS NOT NULL
-                      AND ap.cooldown_until > now()
-                      AND COALESCE(ap.enabled, true) = true
-                      AND COALESCE(ap.disabled_for_quota, false) = false
-                      AND (a.expires_at IS NULL OR a.expires_at > now())
+                    WHERE COALESCE(ap.disabled_for_quota, false) = true
+                       OR COALESCE(ap.pool_status, 'normal') = 'quota_disabled'
+                  ) AS quota_disabled,
+                  COUNT(*) FILTER (
+                    WHERE COALESCE(ap.pool_status, 'normal') = 'cooldown'
                   ) AS in_cooldown,
                   COUNT(*) FILTER (
-                    WHERE ap.blocked_models IS NOT NULL
-                      AND ap.blocked_models <> '{}'::jsonb
-                      AND ap.blocked_models <> 'null'::jsonb
+                    WHERE COALESCE(ap.pool_status, 'normal') = 'model_blocked'
+                       OR (
+                         ap.blocked_models IS NOT NULL
+                         AND ap.blocked_models <> '{}'::jsonb
+                         AND ap.blocked_models <> 'null'::jsonb
+                       )
                   ) AS model_blocked,
                   COUNT(*) FILTER (
-                    WHERE a.expires_at IS NULL OR a.expires_at > now()
-                  ) AS live
+                    WHERE COALESCE(ap.pool_status, 'normal') <> 'expired'
+                  ) AS live,
+                  COUNT(*) FILTER (
+                    WHERE COALESCE(ap.pool_status, 'normal') = 'expired'
+                  ) AS expired,
+                  COUNT(*) FILTER (
+                    WHERE COALESCE(ap.pool_status, 'normal') = 'disabled'
+                       OR (
+                         COALESCE(ap.enabled, true) = false
+                         AND COALESCE(ap.disabled_for_quota, false) = false
+                         AND COALESCE(ap.pool_status, 'normal') NOT IN (
+                           'expired', 'quota_disabled', 'cooldown', 'model_blocked'
+                         )
+                       )
+                  ) AS disabled
                 FROM accounts a
                 LEFT JOIN account_pool ap ON ap.account_id = a.id
                 """
             )
-            r = cur.fetchone() or (0, 0, 0, 0, 0, 0)
+            r = cur.fetchone() or (0, 0, 0, 0, 0, 0, 0, 0)
         if maintain:
             try:
                 conn.commit()
             except Exception:
                 pass
-    total = int(r[0] or 0)
-    enabled_n = int(r[1] or 0)
-    live = int(r[5] or 0)
-    if enabled_n == 0 and live > 0:
-        enabled_n = live
-    if enabled_n < live:
-        try:
-            quota_disabled = int(r[2] or 0)
-        except Exception:
-            quota_disabled = 0
-        enabled_n = max(enabled_n, max(0, live - quota_disabled))
     return {
-        "total": total,
-        "enabled": enabled_n,
+        "total": int(r[0] or 0),
+        "enabled": int(r[1] or 0),
         "quota_disabled": int(r[2] or 0),
         "in_cooldown": int(r[3] or 0),
         "model_blocked": int(r[4] or 0),
-        "live": live,
+        "live": int(r[5] or 0),
+        "expired": int(r[6] or 0),
+        "disabled": int(r[7] or 0) if len(r) > 7 else 0,
     }
 
 
@@ -439,6 +451,8 @@ def refresh_pool_summary_snapshot() -> dict[str, Any]:
         "in_cooldown": int(counts.get("in_cooldown") or 0),
         "quota_disabled": int(counts.get("quota_disabled") or 0),
         "model_blocked": int(counts.get("model_blocked") or 0),
+        "expired": int(counts.get("expired") or 0),
+        "disabled": int(counts.get("disabled") or 0),
         "updated_at": _time(),
         "source": "postgres",
     }
@@ -538,6 +552,27 @@ def _derive_pool_status(meta: dict[str, Any]) -> str:
     """Canonical status from durable DB fields (no Redis refresh)."""
     if not isinstance(meta, dict):
         return "normal"
+    # Token/renewal expiry outranks disabled: broken RT accounts stay labeled
+    # expired even after kick_from_pool sets enabled=False.
+    if str(meta.get("pool_status") or "").strip().lower() == "expired":
+        return "expired"
+    if meta.get("token_expired_at") is not None and not meta.get("disabled_for_quota"):
+        # Soft-expire path may only stamp token_expired_at before pool_status.
+        if meta.get("enabled") is not False or meta.get("last_renew_status") in {
+            "failed",
+            "expired",
+            "sso_failed",
+            "no_sso_removed",
+            "sso_attempt",
+        }:
+            if str(meta.get("last_renew_status") or "") in {
+                "failed",
+                "expired",
+                "sso_failed",
+                "no_sso_removed",
+                "sso_attempt",
+            } or meta.get("renew_fail_count"):
+                return "expired"
     if meta.get("disabled_for_quota"):
         return "quota_disabled"
     if meta.get("enabled") is False:

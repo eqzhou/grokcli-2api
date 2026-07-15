@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.86** · 没额度直接冷却踢出 · 轮询负载分散 · 冷却池硬排除
+**当前版本：v1.9.87** · Token 过期移出轮询 · 连续续期失败 SSO 自愈 · 首页按账号状态统计
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.86` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.87` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -31,7 +31,7 @@
         ▼
   grokcli-2api  (FastAPI · multi-worker · TZ=Asia/Shanghai)
         │  管理台 /admin
-        │  账号轮询 · 冷却踢出 · inflight 分散 · Prompt Cache 会话粘性
+        │  账号轮询 · 冷却/过期踢出 · inflight 分散 · Prompt Cache 会话粘性
         │  任务日志（注册 / SSO / JSON / 测活 / 续期）
         │  PostgreSQL（账号 / Key / 设置 / 冷却 / 任务日志）—— 容器内网
         │  Redis（粘性 / 计数 / 锁 / 会话 / 任务进度）—— 容器内网
@@ -55,6 +55,8 @@
 | 多账号轮询 | `round_robin` / `least_used` / `random`；**pick-time inflight 分散**；可选**出站代理池** |
 | 会话粘性 | `prompt_cache_key` / `previous_response_id` 粘同一账号；**TTL 可热改** |
 | 冷却状态 | **没额度立即冷却踢出**（任意轮询策略）；live 硬排除；仅测活成功 / 手动解除才回池 |
+| Token 过期 / 续期失败 | access token 过期立刻 `pool_status=expired` 移出轮询；连续 2 次 RT 失败 → 有 SSO 则重转，无 SSO 则移出号池 |
+| 号池统计 | 首页冷却 / 过期 / 禁用 **直接数库里 `pool_status` 等账号状态字段** |
 | Token 续期 | 后台 leader 维护；**维护间隔 / 提前刷新窗口可配置** |
 | 模型探测 | 单账号 / 多选批量 / 全量；**探测模型列表 / 间隔 / 自动踢出可配置** |
 | 协议注册 | MoeMail / YYDS / GPTMail / CF Temp Email + 内联过盾 / YesCaptcha；代理池；入池后延迟测活 |
@@ -66,15 +68,18 @@
 
 ---
 
-## 本版本重点（v1.9.86）
+## 本版本重点（v1.9.87）
 
 | 能力 | 行为 |
 |------|------|
-| **没额度冷却踢出** | free-usage / 额度耗尽 / 429 → 立刻进冷却池，**任意轮询策略都不再选它** |
-| **冷却池硬排除** | soft recovery 不再把冷却号拉回 live 链；粘账号冷却也不注入 |
-| **轮询负载分散** | pick 时 soft-mark inflight + soft last_used；多 worker 共享，防扎堆 |
-| **会话粘性增强** | Claude `session_<uuid>`、messages hash 兜底、model 隔离、失效清绑定 |
-| **回池条件** | 仅 **测活成功** 或 **管理员解除**（墙钟不会自动恢复 free-usage 冷却） |
+| **过期移出轮询** | access token 过期 / 续期失败 → 立刻 `pool_status=expired`，**不再进入请求轮询**；凭证保留 |
+| **连续 2 次续期失败** | 仍有 RT 但 RT 坏了：第 1 次只软过期；第 2 次 → **有 SSO 则尝试 SSO 重转**，成功回池 |
+| **无 SSO 移出号池** | 连续 2 次续期失败且无可用 SSO → `enabled=false` + `pool_status=expired`，移出号池（不删凭证） |
+| **续期成功回池** | 清过期/失败计数；若此前被无 SSO 踢出，自动 `enabled=true` 回到轮询（额度禁用除外） |
+| **首页状态统计** | 冷却 / 过期 / 禁用 / 轮询中 **直接数库里账号状态字段**（`pool_status` 等），不再用墙钟二次推算 |
+| **管理台** | 账号列表显示红色「过期」标签；概览展示过期数量 |
+
+继承 v1.9.86：没额度直接冷却踢出 · 轮询负载分散 · 冷却池硬排除 · CPA 会话粘性。
 
 本地回归：
 
@@ -169,7 +174,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.86
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.87
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -208,7 +213,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.86
+    image: ghcr.io/hm2899/grokcli-2api:1.9.87
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -457,15 +462,15 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) app.py 中 APP_VERSION 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v1.9.82"
+git add -A && git commit -m "release: v1.9.87"
 git push origin main
-git tag -a v1.9.86 -m "v1.9.86"
-git push origin v1.9.86
-gh release create v1.9.86 --title "v1.9.86 没额度直接冷却踢出轮询" --notes-file - <<'EOF'
+git tag -a v1.9.87 -m "v1.9.87"
+git push origin v1.9.87
+gh release create v1.9.87 --title "v1.9.87 Token 过期移出轮询 · SSO 续期自愈" --notes-file - <<'EOF'
 ## Highlights
-- Update/Edit both-complete：后到完整 path 覆盖先到错误 file_path（修 Error editing file）
-- 注册成功后可选自动推送 sub2api（auto_push_on_register）
-- 注册 SSO 入库 / 导出走账号库；sub2api 账号容量可配置
+- Token 过期立刻标记 expired 并移出请求轮询
+- 连续两次续期失败：有 SSO 则重转，无 SSO 则移出号池
+- 首页冷却/过期/禁用统计直接按库内账号状态字段计数
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -474,7 +479,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.86
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.87
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -532,7 +537,14 @@ turnstile-solver/                        # 本地过盾（内联）
 
 ## 版本
 
-- **v1.9.86**（当前）
+- **v1.9.87**（当前）
+  - **Token 过期移出轮询**：access token 过期 / 续期失败立刻 `pool_status=expired`，请求轮询硬排除；凭证保留
+  - **连续 2 次 RT 续期失败**：第 1 次仅软过期；第 2 次有 SSO 则 `sso_to_auth_json` 重转回池；无 SSO 则移出号池
+  - **续期成功回池**：清失败计数；此前因无 SSO 被踢也会自动 re-enable
+  - **首页状态统计**：冷却 / 过期 / 禁用 / 轮询中直接数 `account_pool.pool_status` 等字段，不再用墙钟推算
+  - 管理台账号列表「过期」标签 + 概览过期数量
+  - 继承 v1.9.86：没额度直接冷却踢出
+- **v1.9.86**
   - **没额度直接冷却踢出**：free-usage / 额度耗尽 / 429 rate-limit 命中后立即 `pool_status=cooldown` 踢出 live 轮询（与 round_robin/least_used/random 无关）
   - 清 affinity、放 inflight、软封模型；恢复仅测活成功或管理员解除
   - 识别范围扩大（中文额度/配额、quota exceeded、rate limit 等）

@@ -13,6 +13,12 @@ window.G2A = window.G2A || {};
   const currentOrigin = () => (window.G2A && G2A.currentOrigin ? G2A.currentOrigin() : (location.origin || ""));
   const currentAdminUrl = () => (window.G2A && G2A.currentAdminUrl ? G2A.currentAdminUrl() : ((location.origin || "") + "/admin"));
   const TOKEN_KEY = (window.G2A && G2A.TOKEN_KEY) || "g2a_admin_token";
+  const adminBasePath = () => {
+    const path = String(location.pathname || "");
+    const i = path.indexOf("/admin");
+    return (i >= 0 ? path.slice(0, i) : "") + "/admin";
+  };
+  const API_BASE = (window.G2A && G2A.API_BASE) || (adminBasePath() + "/api");
   let token = (window.G2A && G2A.getToken) ? G2A.getToken() : (localStorage.getItem(TOKEN_KEY) || "");
   let statusCache = null;
   let dashCache = null;
@@ -45,6 +51,8 @@ window.G2A = window.G2A || {};
   let accountsPageSize = 25;
   let accountsSearchQuery = "";
   let accountsSort = "newest";
+  // "" | "1" | "0" — server-side has_sso filter
+  let accountsSsoFilter = "";
   let selectedAccountIds = new Set();
   function syncToken() { token = (window.G2A && G2A.getToken) ? G2A.getToken() : token; }
   function headers(json = true) {
@@ -60,13 +68,25 @@ window.G2A = window.G2A || {};
       try { return await G2A.api(path, opts); }
       catch (e) { if (e && e.status === 401) token = ""; throw e; }
     }
-    const res = await fetch("/admin/api" + path, {
+    const res = await fetch(API_BASE + path, {
       ...opts,
       credentials: "same-origin",
       headers: { ...headers(!(opts.body instanceof FormData) && opts.method !== "GET"), ...(opts.headers || {}) },
     });
     let data = null;
-    try { data = await res.json(); } catch { data = null; }
+    try {
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      if (ct.includes("application/json")) data = await res.json();
+      else {
+        const text = await res.text();
+        if (/^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text || "")) {
+          const err = new Error("Admin API 返回了 HTML 页面，请检查 " + API_BASE + path + " 的反向代理/部署路径。响应片段：" + String(text || "").replace(/\s+/g, " ").trim().slice(0, 180));
+          err.status = res.status;
+          throw err;
+        }
+        data = text ? { detail: text.slice(0, 300) } : null;
+      }
+    } catch (e) { if (e && e.status != null) throw e; data = null; }
     if (!res.ok) {
       const msg = (data && (data.detail || data.error || data.message)) || res.statusText;
       const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
@@ -631,6 +651,25 @@ function rebindPageControls() {
       loadAccountsPage({ reset: true });
     };
   }
+  if ($("acc-filter-sso")) {
+    try {
+      const savedSso = localStorage.getItem("g2a_accounts_sso_filter");
+      if (savedSso === "1" || savedSso === "0" || savedSso === "") {
+        accountsSsoFilter = savedSso || "";
+        $("acc-filter-sso").value = accountsSsoFilter;
+      } else {
+        accountsSsoFilter = $("acc-filter-sso").value || "";
+      }
+    } catch (_) {
+      accountsSsoFilter = $("acc-filter-sso").value || "";
+    }
+    $("acc-filter-sso").onchange = () => {
+      accountsSsoFilter = ($("acc-filter-sso").value || "");
+      try { localStorage.setItem("g2a_accounts_sso_filter", accountsSsoFilter); } catch (_) {}
+      accountsPage = 1;
+      loadAccountsPage({ reset: true });
+    };
+  }
   if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
   if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { setPageSelection(true); toast("已选择本页账号（服务端分页）"); };
   if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => { selectedAccountIds.clear(); renderAccountsPage(); };
@@ -638,6 +677,8 @@ function rebindPageControls() {
   if ($("btn-acc-renew-selected")) $("btn-acc-renew-selected").onclick = () => renewAccounts(Array.from(selectedAccountIds));
   if ($("btn-acc-probe-selected")) $("btn-acc-probe-selected").onclick = () => probeAccounts(Array.from(selectedAccountIds));
   if ($("btn-acc-export-selected")) $("btn-acc-export-selected").onclick = () => exportSelectedAccounts();
+  if ($("btn-acc-export-sso-selected")) $("btn-acc-export-sso-selected").onclick = () => exportSelectedAccountsSso();
+  if ($("btn-acc-export-sso-all")) $("btn-acc-export-sso-all").onclick = () => exportAllAccountsSso();
   on("acc-page-prev", "onclick", () => { if (accountsPage > 1 && !accountsLoading) { accountsPage--; loadAccountsPage(); } });
   on("acc-page-next", "onclick", () => { if (!accountsLoading && accountsPage < (accountsTotalPages || 1)) { accountsPage++; loadAccountsPage(); } });
   on("acc-page-size", "onchange", () => {
@@ -1126,7 +1167,7 @@ function renderStats() {
     <div class="stat"><div class="label">CLI 版本</div><div class="value mono">${esc(d.cli_version || s.cli_version || "")}</div>
       <div class="sub">上游 ${esc(d.upstream || s.upstream || "")}</div></div>
     <div class="stat"><div class="label">账号池</div><div class="value">${pool.total ?? acc.account_count ?? 0} 总数 · ${pool.enabled ?? acc.active_count ?? 0} 启用 / ${pool.live ?? acc.active_count ?? 0} 有效</div>
-      <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0}</div></div>
+      <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 过期 ${pool.expired ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0}</div></div>
     <div class="stat"><div class="label">API Keys</div><div class="value">${keys.enabled ?? 0} 启用 / ${keys.total ?? 0}</div>
       <div class="sub">请求累计 ${keys.total_requests ?? 0} · 鉴权 ${keys.auth_required ? "开启" : "关闭"}</div></div>
     <div class="stat"><div class="label">今日用量</div><div class="value mono">${fmtNum((d.usage || s.usage || {}).today_tokens || 0)} token</div>
@@ -1296,6 +1337,13 @@ function renderAccountsPage() {
       const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
       const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
       const quotaOff = p.disabled_for_quota;
+      const expired = !!(
+        p.pool_status === "expired"
+        || a.expired
+        || p.token_expired_at
+        || ["failed","expired","sso_failed","no_sso_removed","sso_attempt"].includes(String(p.last_renew_status || ""))
+      );
+      const renewFails = Number(p.renew_fail_count || 0) || 0;
       const streak = Number(p.consecutive_fails || 0) || 0;
       const cdCode = p.cooldown_code || "";
       const cdModel = p.cooldown_model || "";
@@ -1303,6 +1351,16 @@ function renderAccountsPage() {
         ? `${p.cooldown_tokens_actual}/${p.cooldown_tokens_limit}` : "";
       let poolLabel;
       if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
+      else if (expired) {
+        const tip = [
+          "已过期，已移出轮询",
+          renewFails ? `续期失败×${renewFails}` : "",
+          p.last_renew_error || p.token_expired_reason || p.last_error || "",
+          p.last_renew_status === "no_sso_removed" ? "无 SSO，已移出号池" : "",
+          p.last_renew_status === "sso_failed" ? "SSO 重登失败" : "",
+        ].filter(Boolean).join(" · ");
+        poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
+      }
       else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
       else if (cooling) {
         const n = cdCount > 0 ? cdCount : 1;
@@ -1323,7 +1381,7 @@ function renderAccountsPage() {
         ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
         : '<span class="g2a-tag warn">无 refresh</span>';
       const ssoPill = a.has_sso
-        ? '<span class="g2a-tag ok" title="账号库已保存 SSO cookie">SSO</span>'
+        ? '<span class="g2a-tag ok" title="账号库已保存 SSO cookie">有SSO</span>'
         : '<span class="g2a-tag" title="未保存 SSO cookie">无SSO</span>';
       const liveQ = quotaCache[a.id];
       const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
@@ -1398,13 +1456,17 @@ async function loadAccountsPage({ reset = false } = {}) {
   const q = (accountsSearchQuery || ($("acc-search") && $("acc-search").value) || "").trim();
   accountsSearchQuery = q;
   if ($("acc-sort") && $("acc-sort").value) accountsSort = $("acc-sort").value;
+  if ($("acc-filter-sso")) accountsSsoFilter = $("acc-filter-sso").value || "";
   const sort = accountsSort || "newest";
   const pageSize = accountsPageSize || 25;
   const page = accountsPage || 1;
+  const ssoQs = (accountsSsoFilter === "1" || accountsSsoFilter === "0")
+    ? `&has_sso=${encodeURIComponent(accountsSsoFilter === "1" ? "true" : "false")}`
+    : "";
   try {
     const data = await api(
       `/accounts?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}` +
-      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}`
+      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}`
     );
     if (seq !== accountsLoadSeq) return;
     const rawAccounts = Array.isArray(data && data.accounts) ? data.accounts : [];
@@ -1544,8 +1606,24 @@ function renderOneAccountRow(account) {
   const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
   const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
   const quotaOff = p.disabled_for_quota;
+  const expired = !!(
+    p.pool_status === "expired"
+    || a.expired
+    || p.token_expired_at
+    || ["failed","expired","sso_failed","no_sso_removed","sso_attempt"].includes(String(p.last_renew_status || ""))
+  );
+  const renewFails = Number(p.renew_fail_count || 0) || 0;
   let poolLabel;
   if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
+  else if (expired) {
+    const tip = [
+      "已过期，已移出轮询",
+      renewFails ? `续期失败×${renewFails}` : "",
+      p.last_renew_error || p.token_expired_reason || p.last_error || "",
+      p.last_renew_status === "no_sso_removed" ? "无 SSO，已移出号池" : "",
+    ].filter(Boolean).join(" · ");
+    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
+  }
   else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
   else if (cooling) {
     const n = cdCount > 0 ? cdCount : 1;
@@ -1790,6 +1868,98 @@ async function exportSelectedAccounts() {
   });
 }
 
+function _downloadTextFile(filename, content, mime) {
+  try {
+    const blob = new Blob([content || ""], { type: mime || "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename || "export.txt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    return true;
+  } catch (e) {
+    console.error(e);
+    return false;
+  }
+}
+
+async function exportSelectedAccountsSso() {
+  const ids = Array.from(selectedAccountIds);
+  if (!ids.length) {
+    toast("请先勾选要导出 SSO 的账号", false);
+    return;
+  }
+  const btn = $("btn-acc-export-sso-selected");
+  const includePassword = !!( $("export-include-password") && $("export-include-password").checked );
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = "导出中…";
+  }
+  try {
+    const data = await api("/accounts/export-sso?download=0", {
+      method: "POST",
+      body: JSON.stringify({
+        ids,
+        only_with_sso: true,
+        format: "txt",
+        include_password: includePassword,
+      }),
+    });
+    if (!data || !data.content) {
+      toast("选中账号没有可导出的 SSO", false);
+      return;
+    }
+    const filename = data.filename || "grok2api-accounts-sso-selected.txt";
+    if (!_downloadTextFile(filename, data.content, "text/plain;charset=utf-8")) {
+      toast("下载失败", false);
+      return;
+    }
+    toast(`已导出 ${data.with_sso || data.count || 0} 条 SSO`, true);
+  } catch (e) {
+    toast("导出 SSO 失败: " + (e.message || e), false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "导出选中 SSO";
+    }
+  }
+}
+
+async function exportAllAccountsSso() {
+  const btn = $("btn-acc-export-sso-all");
+  const includePassword = !!( $("export-include-password") && $("export-include-password").checked );
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = "导出中…";
+  }
+  try {
+    const qs = `download=0&format=txt&include_password=${includePassword ? 1 : 0}`;
+    const data = await api(`/accounts/export-sso?${qs}`);
+    if (!data || !data.content) {
+      toast("没有带 SSO 的账号可导出", false);
+      return;
+    }
+    const filename = data.filename || "grok2api-accounts-sso.txt";
+    if (!_downloadTextFile(filename, data.content, "text/plain;charset=utf-8")) {
+      toast("下载失败", false);
+      return;
+    }
+    toast(`已导出 ${data.with_sso || data.count || 0} 条 SSO`, true);
+  } catch (e) {
+    toast("导出全部 SSO 失败: " + (e.message || e), false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "导出全部 SSO";
+    }
+  }
+}
+
 // Fallback bindings when page scripts load outside bindSoftNav rebind path.
 on("acc-page-prev", "onclick", () => { if (accountsPage > 1 && !accountsLoading) { accountsPage--; loadAccountsPage(); } });
 on("acc-page-next", "onclick", () => { if (!accountsLoading && accountsPage < (accountsTotalPages || 1)) { accountsPage++; loadAccountsPage(); } });
@@ -1809,6 +1979,28 @@ if ($("acc-sort") && !$("acc-sort").onchange) {
     accountsPage = 1;
     loadAccountsPage({ reset: true });
   };
+}
+
+if ($("acc-filter-sso") && !$("acc-filter-sso").onchange) {
+  try {
+    const savedSso = localStorage.getItem("g2a_accounts_sso_filter");
+    if (savedSso === "1" || savedSso === "0" || savedSso === "") {
+      accountsSsoFilter = savedSso || "";
+      $("acc-filter-sso").value = accountsSsoFilter;
+    }
+  } catch (_) {}
+  $("acc-filter-sso").onchange = () => {
+    accountsSsoFilter = ($("acc-filter-sso").value || "");
+    try { localStorage.setItem("g2a_accounts_sso_filter", accountsSsoFilter); } catch (_) {}
+    accountsPage = 1;
+    loadAccountsPage({ reset: true });
+  };
+}
+if ($("btn-acc-export-sso-selected") && !$("btn-acc-export-sso-selected").onclick) {
+  $("btn-acc-export-sso-selected").onclick = () => exportSelectedAccountsSso();
+}
+if ($("btn-acc-export-sso-all") && !$("btn-acc-export-sso-all").onclick) {
+  $("btn-acc-export-sso-all").onclick = () => exportAllAccountsSso();
 }
 
 if ($("btn-acc-search")) $("btn-acc-search").onclick = () => applyAccountSearch(true);
@@ -5789,7 +5981,7 @@ function collectSystemSettingsPatch() {
 
 function countOutboundProxyLines(text) {
   return String(text || "")
-    .split(/\r?\n|;/)
+    .split(/\r?\n|;|,/)
     .map((s) => s.trim())
     .filter((s) => s && !s.startsWith("#"))
     .length;

@@ -24,6 +24,22 @@ from urllib.parse import quote, unquote, urlparse, urlunparse
 
 _lock = threading.Lock()
 _rr_index = 0
+_outbound_proxy_cache_key: tuple[Any, ...] | None = None
+_outbound_proxy_cache_value: dict[str, Any] | None = None
+
+
+def _copy_outbound_proxy_source(src: dict[str, Any]) -> dict[str, Any]:
+    out = dict(src)
+    out["pool"] = list(src.get("pool") or [])
+    return out
+
+
+def invalidate_outbound_proxy_cache() -> None:
+    """Drop cached outbound proxy source / parsed pool after config changes."""
+    global _outbound_proxy_cache_key, _outbound_proxy_cache_value
+    with _lock:
+        _outbound_proxy_cache_key = None
+        _outbound_proxy_cache_value = None
 
 
 def _env_proxy_text() -> str:
@@ -397,6 +413,7 @@ def get_outbound_proxy_source() -> dict[str, Any]:
       2) env GROK2API_XAI_PROXY_POOL / GROK2API_XAI_PROXY
       3) registration_config.proxy (shared pool fallback)
     """
+    global _outbound_proxy_cache_key, _outbound_proxy_cache_value
     text = ""
     user = ""
     password = ""
@@ -450,8 +467,16 @@ def get_outbound_proxy_source() -> dict[str, Any]:
         except Exception:
             pass
 
+    cache_key = (bool(enabled), source, text, user, password, strategy)
+    with _lock:
+        if (
+            _outbound_proxy_cache_key == cache_key
+            and _outbound_proxy_cache_value is not None
+        ):
+            return _copy_outbound_proxy_source(_outbound_proxy_cache_value)
+
     if not enabled:
-        return {
+        out = {
             "enabled": False,
             "proxy": "",
             "proxy_username": user,
@@ -460,22 +485,26 @@ def get_outbound_proxy_source() -> dict[str, Any]:
             "source": source,
             "pool": [],
         }
-
-    pool = parse_proxy_pool(
-        text,
-        username=user or None,
-        password=password or None,
-        fallback_env=False,
-    )
-    return {
-        "enabled": bool(pool),
-        "proxy": text,
-        "proxy_username": user,
-        "proxy_password": password,
-        "proxy_strategy": strategy,
-        "source": source if pool else "none",
-        "pool": pool,
-    }
+    else:
+        pool = parse_proxy_pool(
+            text,
+            username=user or None,
+            password=password or None,
+            fallback_env=False,
+        )
+        out = {
+            "enabled": bool(pool),
+            "proxy": text,
+            "proxy_username": user,
+            "proxy_password": password,
+            "proxy_strategy": strategy,
+            "source": source if pool else "none",
+            "pool": pool,
+        }
+    with _lock:
+        _outbound_proxy_cache_key = cache_key
+        _outbound_proxy_cache_value = _copy_outbound_proxy_source(out)
+    return _copy_outbound_proxy_source(out)
 
 
 def pick_proxy_for_account(

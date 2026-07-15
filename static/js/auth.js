@@ -11,19 +11,26 @@ window.G2A = window.G2A || {};
   }
   const $ = $id;
 
+  function adminBasePath() {
+    const path = String(location.pathname || "");
+    const i = path.indexOf("/admin");
+    return (i >= 0 ? path.slice(0, i) : "") + "/admin";
+  }
   function safeNext(raw) {
+    const base = adminBasePath();
     try {
-      if (!raw) return "/admin";
+      if (!raw) return base;
       const u = new URL(raw, location.origin);
-      if (u.origin !== location.origin) return "/admin";
-      if (!u.pathname.startsWith("/admin")) return "/admin";
+      if (u.origin !== location.origin) return base;
+      if (!u.pathname.startsWith(base)) return base;
       return u.pathname + u.search + u.hash;
-    } catch { return "/admin"; }
+    } catch { return base; }
   }
 
   function redirectLogin(next) {
+    const base = adminBasePath();
     const n = encodeURIComponent(next || (location.pathname + location.search));
-    location.replace("/admin/login?next=" + n);
+    location.replace(base + "/login?next=" + n);
   }
 
   let _authRedirecting = false;
@@ -65,7 +72,7 @@ window.G2A = window.G2A || {};
       st = (G2A.state && G2A.state.status) || null;
     }
     if (st && st.setup_needed) {
-      location.replace("/admin/login");
+      location.replace(adminBasePath() + "/login");
       return null;
     }
     if (!G2A.getToken()) {
@@ -255,7 +262,7 @@ window.G2A = window.G2A || {};
 async function logout() {
     try { await G2A.api("/logout", { method: "POST", body: "{}" }); } catch (_) {}
     G2A.clearToken();
-    location.replace("/admin/login");
+    location.replace(adminBasePath() + "/login");
   }
 
   G2A.auth = { requireSession, initLoginPage, logout, redirectLogin, safeNext };

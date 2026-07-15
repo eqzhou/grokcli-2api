@@ -212,10 +212,20 @@
     <button class="g2a-btn g2a-btn-default" id="btn-acc-renew-selected">批量续期</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-probe-selected">批量模型测试</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-export-selected">导出选中</button>
+    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-sso-selected" title="仅导出选中账号的 SSO cookie">导出选中 SSO</button>
+    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-sso-all" title="导出所有带 SSO 的账号">导出全部 SSO</button>
     <button class="g2a-btn g2a-btn-primary" id="btn-acc-push-sub2api-selected" title="将选中账号导入到已配置的 sub2api">导入 sub2api（选中）</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-push-sub2api-all" title="将全部账号导入到已配置的 sub2api">导入 sub2api（全部）</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-export-sub2api-format" title="下载 sub2api 官方数据备份（type=sub2api-data，可在 sub2api「导入数据」使用）">导出 sub2api 数据</button>
     <button class="g2a-btn g2a-btn-danger" id="btn-acc-delete-selected">删除选中</button>
+    <label class="g2a-sort-wrap" for="acc-filter-sso" title="按是否保存 SSO 筛选">
+      <span class="g2a-sort-label">SSO</span>
+      <select id="acc-filter-sso" class="g2a-sort-select" aria-label="SSO 筛选">
+        <option value="" selected>全部</option>
+        <option value="1">有 SSO</option>
+        <option value="0">无 SSO</option>
+      </select>
+    </label>
     <label class="g2a-sort-wrap" for="acc-sort" title="账号排序">
       <span class="g2a-sort-label">排序</span>
       <select id="acc-sort" class="g2a-sort-select" aria-label="账号排序">
@@ -415,7 +425,7 @@
       <button type="button" class="g2a-btn" id="btn-export-sso">导出 SSO</button>
     </div>
   </div>
-  <p class="g2a-muted" style="margin-top:6px">从<strong>注册会话</strong>导出 SSO cookie（注册机内存会话；进程重启后可能清空）。可直接用于上方导入。</p>
+  <p class="g2a-muted" style="margin-top:6px">从<strong>账号数据库</strong>导出已入库 SSO cookie；导出前会先同步已保存的注册会话 SSO，并按 SSO 去重。</p>
   <div id="sso-progress-wrap" class="g2a-sso-progress hidden" hidden>
     <div class="g2a-sso-progress-meta">
       <span id="sso-progress-label" class="g2a-muted">准备中…</span>
@@ -470,9 +480,9 @@
     </div>
   </div>
   <script src="/static/dist/utils.360f09cd20.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.0a1cd78145.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.531718545a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

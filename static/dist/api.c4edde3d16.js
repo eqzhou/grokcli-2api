@@ -4,6 +4,12 @@ window.G2A = window.G2A || {};
   "use strict";
   const TOKEN_KEY = "g2a_admin_token";
   const TOKEN_TS_KEY = "g2a_admin_token_ts";
+  function adminBasePath() {
+    const path = String(location.pathname || "");
+    const i = path.indexOf("/admin");
+    return (i >= 0 ? path.slice(0, i) : "") + "/admin";
+  }
+  const API_BASE = adminBasePath() + "/api";
   // Soft trust window: after successful auth, do not force-redirect on transient 401
   // for a short period (cookie / redis touch races, multi-worker lag).
   const AUTH_GRACE_MS = 5 * 60 * 1000;
@@ -50,6 +56,20 @@ window.G2A = window.G2A || {};
     return fallback || "请求失败";
   }
 
+  function _apiHtmlError(path, status, text) {
+    const sample = String(text || "").replace(/\s+/g, " ").trim().slice(0, 180);
+    const err = new Error(
+      "Admin API 返回了 HTML 页面，通常是反向代理或部署子路径没有把 " +
+      API_BASE + path + " 转发到后端。请检查 /admin/api 路由。" +
+      (sample ? " 响应片段：" + sample : "")
+    );
+    err.status = status;
+    err.path = path;
+    err.html = true;
+    err.detail = sample;
+    return err;
+  }
+
   function _networkError(path, cause) {
     const raw = (cause && (cause.message || String(cause))) || "Failed to fetch";
     // Browser TypeError "Failed to fetch" is opaque — expand for operators.
@@ -68,7 +88,7 @@ window.G2A = window.G2A || {};
   async function api(path, opts = {}) {
     let res;
     try {
-      res = await fetch("/admin/api" + path, {
+      res = await fetch(API_BASE + path, {
         ...opts,
         credentials: "same-origin",
         headers: {
@@ -85,9 +105,15 @@ window.G2A = window.G2A || {};
       if (ct.includes("application/json")) data = await res.json();
       else {
         const text = await res.text();
+        if (/^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text || "")) {
+          throw _apiHtmlError(path, res.status, text);
+        }
         data = text ? { detail: text.slice(0, 300) } : null;
       }
-    } catch { data = null; }
+    } catch (e) {
+      if (e && e.html) throw e;
+      data = null;
+    }
     if (!res.ok) {
       const fallback = res.status === 500
         ? "服务器内部错误 (500)"
@@ -121,7 +147,7 @@ window.G2A = window.G2A || {};
   }
 
   async function download(path, opts = {}) {
-    const res = await fetch("/admin/api" + path, {
+    const res = await fetch(API_BASE + path, {
       ...opts,
       credentials: "same-origin",
       headers: { ...headers(false), ...(opts.headers || {}) },
@@ -151,6 +177,7 @@ window.G2A = window.G2A || {};
   }
 
   G2A.TOKEN_KEY = TOKEN_KEY;
+  G2A.API_BASE = API_BASE;
   G2A.getToken = getToken;
   G2A.setToken = setToken;
   G2A.clearToken = clearToken;

@@ -9,6 +9,28 @@ from typing import Any, Callable
 
 from store.pg import _ts, _unix, connection, json_dump, pg_enabled
 
+try:
+    from accounts import get_sso_value, has_sso_value, merge_durable_account_fields
+except Exception:  # pragma: no cover - import cycle safety
+    def get_sso_value(entry: dict[str, Any] | None) -> str:
+        if not isinstance(entry, dict):
+            return ""
+        return str(entry.get("sso") or entry.get("sso_cookie") or entry.get("sso_token") or "").strip()
+
+    def has_sso_value(entry: dict[str, Any] | None) -> bool:
+        return bool(get_sso_value(entry))
+
+    def merge_durable_account_fields(
+        entry: dict[str, Any], old_entry: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if not isinstance(entry, dict) or not isinstance(old_entry, dict):
+            return entry
+        old_sso = get_sso_value(old_entry)
+        if old_sso and not get_sso_value(entry):
+            entry["sso"] = old_sso
+            entry.setdefault("sso_cookie", old_sso)
+        return entry
+
 # Short process-local cache so every API request doesn't re-scan the whole
 # accounts table before the first upstream byte (large pools otherwise add
 # hundreds of ms of TTFT just reading auth).
@@ -191,11 +213,14 @@ def list_account_summaries(
     page: int = 1,
     page_size: int = 25,
     sort: str | None = None,
+    has_sso: bool | None = None,
 ) -> dict[str, Any]:
     """Paged account list for admin UI without loading the full auth map.
 
     Returns admin-safe fields only (no full access/refresh tokens).
     `sort` defaults to newest (updated_at DESC) so fresh registrations appear first.
+    `has_sso=True` returns only accounts whose payload keeps a non-empty SSO cookie.
+    `has_sso=False` returns only accounts without SSO.
     """
     sort_key = normalize_account_sort(sort)
     order_sql = _ACCOUNT_SORT_SQL[sort_key]
@@ -216,6 +241,7 @@ def list_account_summaries(
             "total_pages": 1,
             "q": q,
             "sort": sort_key,
+            "has_sso": has_sso,
         }
 
     query = (q or "").strip().lower()
@@ -234,20 +260,60 @@ def list_account_summaries(
         size_i = max(1, min(200, size_i))
 
     like = f"%{query}%" if query else None
+    sso_clause = ""
+    if has_sso is True:
+        sso_clause = (
+            " AND ("
+            " nullif(btrim(COALESCE(payload->>'sso','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload->>'sso_cookie','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload->>'sso_token','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload#>>'{session_cookies,sso}','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload#>>'{session_cookies,sso-rw}','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload#>>'{cookies,sso}','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload#>>'{cookies,sso-rw}','')), '') IS NOT NULL"
+            " OR COALESCE(payload->>'cookie','') ILIKE '%%sso=%%'"
+            " OR COALESCE(payload->>'cookies','') ILIKE '%%sso=%%'"
+            " OR COALESCE(payload->>'set_cookie','') ILIKE '%%sso=%%'"
+            " OR COALESCE(payload->>'set-cookie','') ILIKE '%%sso=%%'"
+            " OR COALESCE(payload->>'set_cookies','') ILIKE '%%sso=%%'"
+            " )"
+        )
+    elif has_sso is False:
+        sso_clause = (
+            " AND NOT ("
+            " nullif(btrim(COALESCE(payload->>'sso','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload->>'sso_cookie','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload->>'sso_token','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload#>>'{session_cookies,sso}','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload#>>'{session_cookies,sso-rw}','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload#>>'{cookies,sso}','')), '') IS NOT NULL"
+            " OR nullif(btrim(COALESCE(payload#>>'{cookies,sso-rw}','')), '') IS NOT NULL"
+            " OR COALESCE(payload->>'cookie','') ILIKE '%%sso=%%'"
+            " OR COALESCE(payload->>'cookies','') ILIKE '%%sso=%%'"
+            " OR COALESCE(payload->>'set_cookie','') ILIKE '%%sso=%%'"
+            " OR COALESCE(payload->>'set-cookie','') ILIKE '%%sso=%%'"
+            " OR COALESCE(payload->>'set_cookies','') ILIKE '%%sso=%%'"
+            " )"
+        )
     with connection() as conn:
         with conn.cursor() as cur:
             if like:
                 cur.execute(
-                    """
+                    f"""
                     SELECT COUNT(*) FROM accounts
-                    WHERE lower(COALESCE(email,'')) LIKE %s
+                    WHERE (
+                       lower(COALESCE(email,'')) LIKE %s
                        OR lower(id) LIKE %s
                        OR lower(COALESCE(user_id,'')) LIKE %s
+                    ){sso_clause}
                     """,
                     (like, like, like),
                 )
             else:
-                cur.execute("SELECT COUNT(*) FROM accounts")
+                if sso_clause:
+                    cur.execute(f"SELECT COUNT(*) FROM accounts WHERE TRUE{sso_clause}")
+                else:
+                    cur.execute("SELECT COUNT(*) FROM accounts")
             total = int((cur.fetchone() or [0])[0] or 0)
 
             if size_i == 0:
@@ -276,13 +342,52 @@ def list_account_summaries(
                     FROM accounts a
                 """
             params: list[Any] = []
+            where_parts: list[str] = []
             if like:
-                sql += """
-                    WHERE lower(COALESCE(a.email,'')) LIKE %s
-                       OR lower(a.id) LIKE %s
-                       OR lower(COALESCE(a.user_id,'')) LIKE %s
-                """
+                where_parts.append(
+                    "("
+                    " lower(COALESCE(a.email,'')) LIKE %s"
+                    " OR lower(a.id) LIKE %s"
+                    " OR lower(COALESCE(a.user_id,'')) LIKE %s"
+                    ")"
+                )
                 params.extend([like, like, like])
+            if has_sso is True:
+                where_parts.append(
+                    "("
+                    " nullif(btrim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload#>>'{session_cookies,sso}','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload#>>'{session_cookies,sso-rw}','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload#>>'{cookies,sso}','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload#>>'{cookies,sso-rw}','')), '') IS NOT NULL"
+                    " OR COALESCE(a.payload->>'cookie','') ILIKE '%%sso=%%'"
+                    " OR COALESCE(a.payload->>'cookies','') ILIKE '%%sso=%%'"
+                    " OR COALESCE(a.payload->>'set_cookie','') ILIKE '%%sso=%%'"
+                    " OR COALESCE(a.payload->>'set-cookie','') ILIKE '%%sso=%%'"
+                    " OR COALESCE(a.payload->>'set_cookies','') ILIKE '%%sso=%%'"
+                    ")"
+                )
+            elif has_sso is False:
+                where_parts.append(
+                    "NOT ("
+                    " nullif(btrim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload#>>'{session_cookies,sso}','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload#>>'{session_cookies,sso-rw}','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload#>>'{cookies,sso}','')), '') IS NOT NULL"
+                    " OR nullif(btrim(COALESCE(a.payload#>>'{cookies,sso-rw}','')), '') IS NOT NULL"
+                    " OR COALESCE(a.payload->>'cookie','') ILIKE '%%sso=%%'"
+                    " OR COALESCE(a.payload->>'cookies','') ILIKE '%%sso=%%'"
+                    " OR COALESCE(a.payload->>'set_cookie','') ILIKE '%%sso=%%'"
+                    " OR COALESCE(a.payload->>'set-cookie','') ILIKE '%%sso=%%'"
+                    " OR COALESCE(a.payload->>'set_cookies','') ILIKE '%%sso=%%'"
+                    ")"
+                )
+            if where_parts:
+                sql += " WHERE " + " AND ".join(where_parts)
             sql += f" ORDER BY {order_sql}"
             if limit is not None:
                 sql += " LIMIT %s OFFSET %s"
@@ -334,13 +439,7 @@ def list_account_summaries(
                 "expires_at": exp,
                 "expired": expired,
                 "has_refresh_token": bool(payload.get("refresh_token")),
-                "has_sso": bool(
-                    (isinstance(payload.get("sso"), str) and payload.get("sso").strip())
-                    or (
-                        isinstance(payload.get("sso_cookie"), str)
-                        and payload.get("sso_cookie").strip()
-                    )
-                ),
+                "has_sso": has_sso_value(payload),
                 "token_hint": hint,
                 "first_name": payload.get("first_name"),
                 "last_name": payload.get("last_name"),
@@ -357,6 +456,7 @@ def list_account_summaries(
         "total_pages": max(1, (total + size_i - 1) // size_i) if size_i else 1,
         "q": (q or "").strip(),
         "sort": sort_key,
+        "has_sso": has_sso,
     }
 
 
@@ -439,6 +539,43 @@ def upsert_account_merged(
     with connection() as conn:
         with conn.cursor() as cur:
             if merge_same_user and (uid or token):
+                # Preserve durable metadata from the row(s) this import may replace.
+                if uid and token:
+                    cur.execute(
+                        """
+                        SELECT payload FROM accounts
+                        WHERE id = %s
+                           OR user_id = %s
+                           OR payload->>'user_id' = %s
+                           OR payload->>'principal_id' = %s
+                           OR payload->>'key' = %s
+                        """,
+                        (account_id, str(uid), str(uid), str(uid), str(token)),
+                    )
+                elif uid:
+                    cur.execute(
+                        """
+                        SELECT payload FROM accounts
+                        WHERE id = %s
+                           OR user_id = %s
+                           OR payload->>'user_id' = %s
+                           OR payload->>'principal_id' = %s
+                        """,
+                        (account_id, str(uid), str(uid), str(uid)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT payload FROM accounts
+                        WHERE id = %s OR payload->>'key' = %s
+                        """,
+                        (account_id, str(token)),
+                    )
+                for old_row in cur.fetchall() or []:
+                    old_payload = _decode_payload(old_row[0])
+                    if isinstance(old_payload, dict):
+                        merge_durable_account_fields(entry, old_payload)
+
                 # Drop other rows that collide on user_id / access token.
                 if uid and token:
                     cur.execute(
@@ -507,6 +644,25 @@ def _upsert_one(cur, account_id: str, entry: dict[str, Any]) -> None:
     user_id = entry.get("user_id") or entry.get("principal_id")
     team_id = entry.get("team_id")
     expires_at = _ts(entry.get("expires_at"))
+    # Preserve durable SSO / register password if a later write omits them
+    # (e.g. token refresh / re-import without cookie).
+    try:
+        cur.execute("SELECT payload FROM accounts WHERE id = %s", (account_id,))
+        row = cur.fetchone()
+        if row and isinstance(row[0], dict):
+            old_payload = row[0]
+        elif row and isinstance(row[0], str):
+            import json as _json
+
+            old_payload = _json.loads(row[0]) if row[0] else {}
+        else:
+            old_payload = {}
+        if isinstance(old_payload, dict):
+            merge_durable_account_fields(entry, old_payload)
+        else:
+            merge_durable_account_fields(entry, None)
+    except Exception:
+        pass
     cur.execute(
         """
         INSERT INTO accounts (id, email, user_id, team_id, payload, expires_at, updated_at)
