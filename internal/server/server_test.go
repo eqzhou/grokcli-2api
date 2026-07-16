@@ -385,7 +385,7 @@ func TestStreamAnthropicMessagesEmitsThinkingDelta(t *testing.T) {
 func TestStreamOpenAIResponsesWritesSSE(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	usage, err := streamOpenAIResponses(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n"), "resp_test", "grok", nil)
+	usage, err := streamOpenAIResponses(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n"), "resp_test", "grok", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +403,7 @@ func TestStreamOpenAIResponsesWritesSSE(t *testing.T) {
 func TestStreamOpenAIResponsesWritesFunctionCall(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	_, err := streamOpenAIResponses(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Edit\",\"arguments\":\"{\\\"file_path\\\":\\\"/x\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"), "resp_test", "grok", []string{"Edit"})
+	_, err := streamOpenAIResponses(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Edit\",\"arguments\":\"{\\\"file_path\\\":\\\"/x\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"), "resp_test", "grok", []string{"Edit"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +418,7 @@ func TestStreamOpenAIResponsesWritesFunctionCall(t *testing.T) {
 func TestStreamChatCompletionsWritesSSE(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	stats, err := streamChatCompletions(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
+	stats, err := streamChatCompletions(recorder, request, strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -27,17 +27,20 @@ type liveTool struct {
 // numbers. Complete deliberately remains open when no client payload exists so
 // callers can still emit response.failed for an empty upstream HTTP 200.
 type LiveStreamer struct {
-	responseID string
-	model      string
-	allowed    []string
-	sequence   Sequence
-	started    bool
-	closed     bool
-	textOpen   bool
-	messageID  string
-	text       string
-	output     int
-	tools      map[int]*liveTool
+	responseID    string
+	model         string
+	allowed       []string
+	sequence      Sequence
+	started       bool
+	closed        bool
+	textOpen      bool
+	reasoningOpen bool
+	messageID     string
+	reasoningID   string
+	text          string
+	reasoning     string
+	output        int
+	tools         map[int]*liveTool
 }
 
 func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
@@ -70,11 +73,57 @@ func (s *LiveStreamer) Start() []string {
 	}
 }
 
+func (s *LiveStreamer) Reasoning(delta string) []string {
+	if s.closed || delta == "" {
+		return nil
+	}
+	frames := s.Start()
+	if !s.reasoningOpen {
+		s.reasoningOpen = true
+		frames = append(frames,
+			s.sequence.Event("response.output_item.added", map[string]any{
+				"output_index": s.output,
+				"item": map[string]any{
+					"id": s.reasoningID, "type": "reasoning", "status": "in_progress",
+					"summary": []any{},
+				},
+			}),
+			s.sequence.Event("response.reasoning_summary_part.added", map[string]any{
+				"item_id": s.reasoningID, "output_index": s.output, "summary_index": 0,
+				"part": map[string]any{"type": "summary_text", "text": ""},
+			}),
+		)
+	}
+	s.reasoning += delta
+	frames = append(frames, s.sequence.Event("response.reasoning_summary_text.delta", map[string]any{
+		"item_id": s.reasoningID, "output_index": s.output, "summary_index": 0,
+		"delta": delta,
+	}))
+	return frames
+}
+
 func (s *LiveStreamer) Text(delta string) []string {
 	if s.closed || delta == "" {
 		return nil
 	}
 	frames := s.Start()
+	if s.reasoningOpen {
+		frames = append(frames,
+			s.sequence.Event("response.reasoning_summary_part.done", map[string]any{
+				"item_id": s.reasoningID, "output_index": s.output, "summary_index": 0,
+				"part": map[string]any{"type": "summary_text", "text": s.reasoning},
+			}),
+			s.sequence.Event("response.output_item.done", map[string]any{
+				"output_index": s.output,
+				"item": map[string]any{
+					"id": s.reasoningID, "type": "reasoning", "status": "completed",
+					"summary": []any{map[string]any{"type": "summary_text", "text": s.reasoning}},
+				},
+			}),
+		)
+		s.reasoningOpen = false
+		s.output++
+	}
 	if !s.textOpen {
 		s.textOpen = true
 		frames = append(frames,

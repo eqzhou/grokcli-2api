@@ -260,3 +260,31 @@ Leave the canary running only if:
 4. affinity stickiness holds for `metadata.session_id` / cache markers
 5. error rate and latency are not worse than the Python baseline for the same
    traffic slice
+
+
+## Chat / Responses canary
+
+After Messages is healthy, enable independently:
+
+```bash
+GROK2API_RUNTIME=go
+GROK2API_GO_PUBLIC_READ=1
+GROK2API_GO_CHAT=1
+GROK2API_GO_RESPONSES=1
+```
+
+Smoke:
+
+```bash
+# chat
+curl -fsS -X POST "$BASE/v1/chat/completions" \
+  -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"grok-4.5","messages":[{"role":"user","content":"ping"}]}' -D -
+
+# responses stream
+curl -N -X POST "$BASE/v1/responses" \
+  -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"grok-4.5","stream":true,"input":[{"role":"user","content":"ping"}]}'
+```
+
+Expect headers `X-Grok2API-Protocol: openai_chat` / `openai_responses`, short failover chain (`Accounts` ~4), and stream terminal frames (`data: [DONE]` / `response.completed`).

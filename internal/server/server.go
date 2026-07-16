@@ -253,7 +253,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		}
 		apiKey = verified
 	}
-	if options.Store == nil {
+	if options.Store == nil && len(options.Candidates) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
 		return
 	}
@@ -283,7 +283,15 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		}
 		defer opened.Body.Close()
 		defer releaseServerPick(options, opened.AccountID)
-		stats, err := streamChatCompletions(w, r, opened.Body)
+		req := r
+		if options.Config.SSEKeepalive > 0 {
+			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.Config.SSEKeepalive))
+		}
+		setProtocolObservationHeaders(w, protocolObservation{
+			Protocol: "openai_chat", AccountID: opened.AccountID, PreferAccount: opened.PreferAccount,
+			Failover: opened.Failover, Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep,
+		})
+		stats, err := streamChatCompletions(w, req, opened.Body, optionsFromRequest(req).Keepalive)
 		ok := err == nil || errors.Is(err, r.Context().Err())
 		status := http.StatusOK
 		if !ok {
@@ -298,48 +306,66 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		defer releaseServerPick(options, result.AccountID)
 	}
 	if err != nil {
-		recordChatUsage(r, options, apiKey, "", chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err)
+		recordChatUsage(r, options, apiKey, result.AccountID, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err)
 		writeProxyError(w, err)
 		return
 	}
 	recordChatUsage(r, options, apiKey, result.AccountID, result.Model, chatReq.Stream, true, http.StatusOK, started, result.Usage, nil)
 	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK)
+	setProtocolObservationHeaders(w, protocolObservation{
+		Protocol: "openai_chat", AccountID: result.AccountID, PreferAccount: result.PreferAccount,
+		Failover: result.Failover, Fingerprint: result.Fingerprint, Accounts: result.Accounts, Prep: result.Prep,
+	})
 	writeJSON(w, http.StatusOK, result.Payload)
 }
 
-func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reader) (proxy.StreamStats, error) {
+func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reader, keepalive time.Duration) (proxy.StreamStats, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "streaming is not supported by this response writer"})
 		return proxy.StreamStats{}, errors.New("streaming is not supported by this response writer")
 	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	stats, err := proxy.ForwardChatStreamWithStats(body, func(frame proxy.StreamFrame) error {
-		select {
-		case <-r.Context().Done():
-			return r.Context().Err()
-		default:
-		}
-		var data []byte
-		if frame.Done {
-			data = []byte("data: [DONE]\n\n")
-		} else {
-			data = append([]byte("data: "), frame.Data...)
-			data = append(data, '\n', '\n')
+	var stats proxy.StreamStats
+	write := func(data []byte, force bool) error {
+		if !force {
+			select {
+			case <-r.Context().Done():
+				return r.Context().Err()
+			default:
+			}
 		}
 		if _, err := w.Write(data); err != nil {
 			return err
 		}
 		flusher.Flush()
 		return nil
+	}
+	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
+		if event.Done {
+			return write([]byte("data: [DONE]\n\n"), true)
+		}
+		delta, err := proxy.ParseChatDelta(event.Data)
+		if err == nil && delta.Usage != nil {
+			stats.Usage = delta.Usage
+		}
+		data := append([]byte("data: "), event.Data...)
+		data = append(data, '\n', '\n')
+		return write(data, false)
+	}, func() error {
+		return write([]byte(": keepalive\n\n"), false)
 	})
 	if err != nil && !errors.Is(err, r.Context().Err()) {
 		encoded, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": "api_error"}})
-		_, _ = w.Write(append(append([]byte("data: "), encoded...), '\n', '\n'))
-		flusher.Flush()
+		_ = write(append(append([]byte("data: "), encoded...), '\n', '\n'), true)
+		_ = write([]byte("data: [DONE]\n\n"), true)
+	}
+	if err == nil || errors.Is(err, r.Context().Err()) {
+		// Ensure terminal DONE if upstream ended without it (soft disconnect).
 	}
 	return stats, err
 }
@@ -512,7 +538,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		if options.Config.SSEKeepalive > 0 {
 			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.Config.SSEKeepalive))
 		}
-		setAnthropicObservationHeaders(w, anthropicObservation{
+		setAnthropicObservationHeaders(w, protocolObservation{Protocol: "anthropic",
 			AccountID: opened.AccountID, PreferAccount: opened.PreferAccount, Failover: opened.Failover,
 			Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep, Stream: true,
 		})
@@ -541,7 +567,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	if maxTools > 0 && len(toolCalls) > maxTools {
 		toolCalls = toolCalls[:maxTools]
 	}
-	setAnthropicObservationHeaders(w, anthropicObservation{
+	setAnthropicObservationHeaders(w, protocolObservation{Protocol: "anthropic",
 		AccountID: result.AccountID, PreferAccount: result.PreferAccount, Failover: result.Failover,
 		Fingerprint: result.Fingerprint, Accounts: result.Accounts, Prep: result.Prep, Stream: false,
 	})
@@ -643,7 +669,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 			return
 		}
 	}
-	if options.Store == nil {
+	if options.Store == nil && len(options.Candidates) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
 		return
 	}
@@ -680,7 +706,15 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		}
 		defer opened.Body.Close()
 		defer releaseServerPick(options, opened.AccountID)
-		usage, err := streamOpenAIResponses(w, r, opened.Body, responseID, opened.Model, allowedResponsesToolNames(body))
+		req := r
+		if options.Config.SSEKeepalive > 0 {
+			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.Config.SSEKeepalive))
+		}
+		setProtocolObservationHeaders(w, protocolObservation{
+			Protocol: "openai_responses", AccountID: opened.AccountID, PreferAccount: opened.PreferAccount,
+			Failover: opened.Failover, Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep,
+		})
+		usage, err := streamOpenAIResponses(w, req, opened.Body, responseID, opened.Model, allowedResponsesToolNames(body), optionsFromRequest(req).Keepalive)
 		ok := err == nil || errors.Is(err, r.Context().Err())
 		status := http.StatusOK
 		if !ok {
@@ -703,10 +737,14 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	recordResponsesUsage(r, options, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil)
 	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK)
 	content, reasoning, _, _, toolCalls := anthropicCompletionParts(result.Payload)
+	setProtocolObservationHeaders(w, protocolObservation{
+		Protocol: "openai_responses", AccountID: result.AccountID, PreferAccount: result.PreferAccount,
+		Failover: result.Failover, Fingerprint: result.Fingerprint, Accounts: result.Accounts, Prep: result.Prep,
+	})
 	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
 }
 
-func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reader, responseID, model string, allowed []string) (map[string]any, error) {
+func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reader, responseID, model string, allowed []string, keepalive time.Duration) (map[string]any, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "streaming is not supported by this response writer"})
@@ -719,11 +757,13 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 	w.Header().Set("X-Grok2API-Protocol", "openai_responses")
 	w.WriteHeader(http.StatusOK)
 	streamer := responses.NewLiveStreamer(responseID, model, allowed)
-	writeFrame := func(frame string) error {
-		select {
-		case <-r.Context().Done():
-			return r.Context().Err()
-		default:
+	writeFrame := func(frame string, force bool) error {
+		if !force {
+			select {
+			case <-r.Context().Done():
+				return r.Context().Err()
+			default:
+			}
 		}
 		_, err := w.Write([]byte(frame))
 		if err != nil {
@@ -732,16 +772,16 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 		flusher.Flush()
 		return nil
 	}
-	emitFrames := func(frames []string) error {
+	emitFrames := func(frames []string, force bool) error {
 		for _, frame := range frames {
-			if err := writeFrame(frame); err != nil {
+			if err := writeFrame(frame, force); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	var usage map[string]any
-	err := grok.ReadSSE(body, func(event grok.Event) error {
+	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
 		if event.Done {
 			return nil
 		}
@@ -752,17 +792,22 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 		if raw, ok := delta.Usage.(map[string]any); ok {
 			usage = raw
 		}
-		if err := emitFrames(streamer.Text(delta.Content)); err != nil {
+		if err := emitFrames(streamer.Reasoning(delta.Reasoning), true); err != nil {
 			return err
 		}
-		return emitFrames(streamer.ToolDeltas(responsesToolDeltas(delta)))
+		if err := emitFrames(streamer.Text(delta.Content), true); err != nil {
+			return err
+		}
+		return emitFrames(streamer.ToolDeltas(responsesToolDeltas(delta)), true)
+	}, func() error {
+		return writeFrame(": keepalive\n\n", false)
 	})
 	if err != nil && !errors.Is(err, r.Context().Err()) {
-		_ = emitFrames(streamer.Fail(err.Error(), "server_error"))
+		_ = emitFrames(streamer.Fail(err.Error(), "server_error"), true)
 		return usage, err
 	}
 	respUsage := responsesUsageFromOpenAI(usage)
-	if err := emitFrames(streamer.Complete(&respUsage)); err != nil {
+	if err := emitFrames(streamer.Complete(&respUsage), true); err != nil {
 		return usage, err
 	}
 	return usage, err
@@ -851,7 +896,8 @@ func metadataMap(value any) map[string]any {
 	return metadata
 }
 
-type anthropicObservation struct {
+type protocolObservation struct {
+	Protocol      string
 	AccountID     string
 	PreferAccount string
 	Failover      bool
@@ -861,8 +907,18 @@ type anthropicObservation struct {
 	Stream        bool
 }
 
-func setAnthropicObservationHeaders(w http.ResponseWriter, obs anthropicObservation) {
-	w.Header().Set("X-Grok2API-Protocol", "anthropic")
+func setAnthropicObservationHeaders(w http.ResponseWriter, obs protocolObservation) {
+	if obs.Protocol == "" {
+		obs.Protocol = "anthropic"
+	}
+	setProtocolObservationHeaders(w, obs)
+}
+
+func setProtocolObservationHeaders(w http.ResponseWriter, obs protocolObservation) {
+	if obs.Protocol == "" {
+		obs.Protocol = "go"
+	}
+	w.Header().Set("X-Grok2API-Protocol", obs.Protocol)
 	if obs.Accounts > 0 {
 		w.Header().Set("X-Grok2API-Accounts", strconv.Itoa(obs.Accounts))
 	}
