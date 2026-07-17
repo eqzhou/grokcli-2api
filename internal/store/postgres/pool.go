@@ -5,12 +5,32 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/pool"
 )
 
+// Short in-process candidate window cache to avoid repeated full-row scans under burst.
+// TTL is intentionally tiny so cooldown/disable changes still show up quickly.
+var (
+	candidateCacheMu   sync.Mutex
+	candidateCacheAt   time.Time
+	candidateCacheData []pool.Candidate
+)
+
+const candidateCacheTTL = 400 * time.Millisecond
+
 func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, error) {
+	candidateCacheMu.Lock()
+	if time.Since(candidateCacheAt) < candidateCacheTTL && len(candidateCacheData) > 0 {
+		out := make([]pool.Candidate, len(candidateCacheData))
+		copy(out, candidateCacheData)
+		candidateCacheMu.Unlock()
+		return out, nil
+	}
+	candidateCacheMu.Unlock()
+
 	// Hot path: only load a small eligible window instead of the full pool.
 	// Token is required and must not be expired/cooldown/disabled. LIMIT keeps
 	// picker work and JSON payload decode cheap while preserving least_used order.
@@ -30,8 +50,8 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 		     OR COALESCE(a.payload->>'access_token', '') <> ''
 		     OR COALESCE(a.payload->>'token', '') <> ''
 		  )
-		ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.request_count, 0) ASC, a.id ASC
-		LIMIT 64`)
+		ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.fail_count, 0) ASC, COALESCE(ap.request_count, 0) ASC, a.id ASC
+		LIMIT 32`)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +77,22 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 			out = append(out, candidate)
 		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	candidateCacheMu.Lock()
+	candidateCacheData = append([]pool.Candidate(nil), out...)
+	candidateCacheAt = time.Now()
+	candidateCacheMu.Unlock()
+	return out, nil
+}
+
+// InvalidateCandidateCache drops the short-lived pick window (after kick/disable).
+func (c *Connector) InvalidateCandidateCache() {
+	candidateCacheMu.Lock()
+	candidateCacheData = nil
+	candidateCacheAt = time.Time{}
+	candidateCacheMu.Unlock()
 }
 
 type PoolFailure struct {
@@ -204,6 +239,9 @@ func (c *Connector) BlockPoolModel(ctx context.Context, accountID, model string,
 				ELSE 'model_blocked'
 			END,
 			updated_at = now()`, accountID, blocked)
+	if err == nil {
+		c.InvalidateCandidateCache()
+	}
 	return err
 }
 
@@ -238,6 +276,9 @@ func (c *Connector) UnblockPoolModel(ctx context.Context, accountID, model strin
 			END,
 		    updated_at = now()
 		WHERE account_id = $1`, accountID, model)
+	if err == nil {
+		c.InvalidateCandidateCache()
+	}
 	return err
 }
 
@@ -250,6 +291,7 @@ func stringValue(ptr *string, fallback string) string {
 
 // SetAccountEnabled toggles pool enabled flag. Re-enable clears cooldown/quota/model blocks.
 func (c *Connector) SetAccountEnabled(ctx context.Context, accountID string, enabled bool) (map[string]any, error) {
+	c.InvalidateCandidateCache()
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return nil, errors.New("account id required")
@@ -300,6 +342,7 @@ func (c *Connector) SetAccountEnabled(ctx context.Context, accountID string, ena
 
 // ClearAccountCooldown clears durable cooldown so the account re-enters rotation.
 func (c *Connector) ClearAccountCooldown(ctx context.Context, accountID string) (map[string]any, error) {
+	c.InvalidateCandidateCache()
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return nil, errors.New("account id required")
@@ -333,6 +376,7 @@ func (c *Connector) ClearAccountCooldown(ctx context.Context, accountID string) 
 // KickFromPool temporarily cools down or hard-disables an account.
 // cooldownSec > 0: temporary cooldown; otherwise enabled=false.
 func (c *Connector) KickFromPool(ctx context.Context, accountID, reason string, cooldownSec *float64) (map[string]any, error) {
+	c.InvalidateCandidateCache()
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return nil, errors.New("account id required")

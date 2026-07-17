@@ -30,11 +30,10 @@ func (c *Client) GetAffinity(ctx context.Context, fingerprint string, ttl time.D
 	if entry == nil || entry.AccountID == "" {
 		return nil, nil
 	}
-	entry.Hits++
-	entry.LastSeen = unixFloat(time.Now())
-	if err := c.setAffinity(ctx, fingerprint, *entry, ttl); err != nil {
-		return nil, err
-	}
+	// Hot-path read: do NOT rewrite affinity on every lookup.
+	// Hits/last_seen are refreshed on BindAffinity after a successful pick.
+	// This saves a Redis write RTT before upstream request (TTFT critical path).
+	_ = ttl
 	return entry, nil
 }
 

@@ -31,6 +31,11 @@ type PickObserver interface {
 	ReleasePick(context.Context, string)
 }
 
+// optional batching extension for hot-path candidate windows
+type batchPickObserver interface {
+	LoadPenalties(context.Context, []string) map[string]int64
+}
+
 type AffinityStore interface {
 	GetAffinity(context.Context, string) (string, error)
 	BindAffinity(context.Context, string, string) error
@@ -689,6 +694,24 @@ func preferAffinity(ctx context.Context, candidates []pool.Candidate, store Affi
 }
 
 func adjustCandidatesForObserver(ctx context.Context, candidates []pool.Candidate, observer PickObserver) {
+	if observer == nil || len(candidates) == 0 {
+		return
+	}
+	if batch, ok := observer.(batchPickObserver); ok {
+		ids := make([]string, 0, len(candidates))
+		for _, c := range candidates {
+			if id := strings.TrimSpace(c.ID); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		penalties := batch.LoadPenalties(ctx, ids)
+		for i := range candidates {
+			if p := penalties[candidates[i].ID]; p > 0 {
+				candidates[i].RequestCount += p
+			}
+		}
+		return
+	}
 	for i := range candidates {
 		penalty := observer.LoadPenalty(ctx, candidates[i].ID)
 		if penalty <= 0 {
@@ -768,7 +791,7 @@ func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 		resultCh <- peekResult{sawModel: sawModel, sawDone: sawDone, buffered: buffered.String()}
 	}()
 
-	// Short empty-stream peek so healthy TTFT is not delayed.
+	// Ultra-short empty-stream peek (80ms): only catch instant empty/[DONE], never wait for slow first tokens.
 	select {
 	case result := <-resultCh:
 		if result.err != nil {
@@ -784,7 +807,7 @@ func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 		// 有内容或者流还在继续 → 正常返回
 		replayed := io.MultiReader(strings.NewReader(result.buffered), body)
 		return &multiClose{Reader: replayed, closer: body}, false, nil
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(80 * time.Millisecond):
 		// Peek deadline elapsed: pass through without waiting for full first token.
 		// 注意：这里不关闭 body，让它继续流式输出
 		return body, false, nil

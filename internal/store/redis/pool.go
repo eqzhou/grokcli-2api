@@ -195,15 +195,44 @@ func (c *Client) GetStats(ctx context.Context, accountID string) (map[string]any
 
 func (c *Client) GetInflightMany(ctx context.Context, accountIDs []string) map[string]int64 {
 	out := map[string]int64{}
+	ids := make([]string, 0, len(accountIDs))
+	keys := make([]string, 0, len(accountIDs))
 	for _, id := range accountIDs {
 		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
-		n, err := c.GetInflight(ctx, id)
-		if err == nil {
-			out[id] = n
+		ids = append(ids, id)
+		keys = append(keys, c.key("inflight", id))
+	}
+	if len(keys) == 0 {
+		return out
+	}
+	// One MGET round-trip instead of N GETs (each GET currently dials Redis).
+	args := append([]string{"MGET"}, keys...)
+	values, err := c.commandArray(ctx, args...)
+	if err != nil || len(values) == 0 {
+		// Fallback best-effort individual reads if MGET unsupported/fails.
+		for _, id := range ids {
+			if n, e := c.GetInflight(ctx, id); e == nil && n > 0 {
+				out[id] = n
+			}
 		}
+		return out
+	}
+	for i, id := range ids {
+		if i >= len(values) {
+			break
+		}
+		raw := strings.TrimSpace(values[i])
+		if raw == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n <= 0 {
+			continue
+		}
+		out[id] = n
 	}
 	return out
 }

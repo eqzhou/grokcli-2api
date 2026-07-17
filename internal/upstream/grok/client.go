@@ -44,22 +44,24 @@ func (e *UpstreamError) Error() string {
 
 // defaultHTTPClient returns a properly configured HTTP client with connection pooling
 func defaultHTTPClient() *http.Client {
+	// No overall Client.Timeout: streaming responses can run for minutes.
+	// Bound connect + response headers only via Transport.
 	return &http.Client{
-		Timeout: 180 * time.Second, // 增加到 3 分钟，避免大请求超时
+		Timeout: 0,
 		Transport: &http.Transport{
-			MaxIdleConns:        200,  // 增加全局空闲连接数
-			MaxIdleConnsPerHost: 100,  // 增加每个 host 的空闲连接数，支持高并发
-			MaxConnsPerHost:     200,  // 增加每个 host 的最大连接数
+			MaxIdleConns:        200,               // 增加全局空闲连接数
+			MaxIdleConnsPerHost: 100,               // 增加每个 host 的空闲连接数，支持高并发
+			MaxConnsPerHost:     200,               // 增加每个 host 的最大连接数
 			IdleConnTimeout:     120 * time.Second, // 延长空闲连接保持时间
 			TLSHandshakeTimeout: 10 * time.Second,
 			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second, // 缩短连接建立超时，快速失败
+				Timeout:   5 * time.Second,  // fail-fast dial for failover TTFT
 				KeepAlive: 60 * time.Second, // 延长 TCP keepalive
 			}).DialContext,
 			ForceAttemptHTTP2:     true,
 			DisableCompression:    false,
 			ExpectContinueTimeout: 1 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second, // 添加响应头超时，避免无响应挂起
+			ResponseHeaderTimeout: 20 * time.Second, // fail-fast first-byte; long streams keep body open after headers
 			DisableKeepAlives:     false,
 			WriteBufferSize:       32 * 1024, // 增加写缓冲，提高大请求性能
 			ReadBufferSize:        32 * 1024, // 增加读缓冲，提高大响应性能

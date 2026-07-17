@@ -24,6 +24,21 @@ func (o PickObserver) LoadPenalty(ctx context.Context, accountID string) int64 {
 	return inflight * 1000
 }
 
+// LoadPenalties batches inflight lookups for a candidate window (hot path).
+func (o PickObserver) LoadPenalties(ctx context.Context, accountIDs []string) map[string]int64 {
+	out := map[string]int64{}
+	if o.Client == nil || len(accountIDs) == 0 {
+		return out
+	}
+	inflight := o.Client.GetInflightMany(ctx, accountIDs)
+	for id, n := range inflight {
+		if n > 0 {
+			out[id] = n * 1000
+		}
+	}
+	return out
+}
+
 func (o PickObserver) MarkPick(ctx context.Context, accountID string) {
 	if o.Client == nil {
 		return
