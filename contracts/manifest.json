@@ -2,7 +2,7 @@
   "schema_version": 1,
   "oracle": {
     "implementation": "go",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "note": "Public API is Go; Python remains registration/SSO/captcha sidecars only."
   },
   "routes": [
@@ -106,7 +106,7 @@
   "readiness": {
     "startup": "Go app verifies PostgreSQL connectivity and applied migration checksums before /ready succeeds.",
     "fail_closed": "If shared stores, store backend, or migrations are not safe, /live stays up, /ready is 503, and mutating routes must be disabled.",
-    "no_auto_migrate": "Application startup verifies only; schema changes are applied exclusively by grok2api-migrate."
+    "no_auto_migrate": "Application process verifies only; schema changes are applied by grok2api-migrate (Docker entrypoint runs it before exec, unless GROK2API_AUTO_MIGRATE=0)."
   },
   "data_safety": {
     "durable_source": "PostgreSQL",

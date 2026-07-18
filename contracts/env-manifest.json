@@ -109,6 +109,20 @@
       "go_behavior": "verify migration checksums before readiness; never auto-apply from app startup"
     },
     {
+      "name": "GROK2API_AUTO_MIGRATE",
+      "type": "boolean",
+      "default": true,
+      "scope": "entrypoint",
+      "go_behavior": "Docker/entrypoint only: run grok2api-migrate up before starting the app so fresh Postgres has schema_migrations; set 0/false to skip (app still fail-closed when REQUIRE_MIGRATIONS=1)"
+    },
+    {
+      "name": "GROK2API_MIGRATE_WAIT_SEC",
+      "type": "integer",
+      "default": 60,
+      "scope": "entrypoint",
+      "go_behavior": "seconds to retry migrate up while Postgres becomes reachable"
+    },
+    {
       "name": "GROK2API_RUNTIME",
       "type": "enum",
       "values": [

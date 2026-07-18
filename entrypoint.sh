@@ -152,11 +152,64 @@ stop_pid() {
   fi
 }
 
+# Apply SQL schema before the Go app starts. The app only verifies
+# schema_migrations (no auto-migrate inside the binary); Docker/fresh Postgres
+# therefore needs this step or /ready fails with:
+#   verify migrations: ERROR: relation "schema_migrations" does not exist
+run_migrations() {
+  local auto_migrate migrate_bin migrate_dir wait_sec i
+  auto_migrate="$(echo "${GROK2API_AUTO_MIGRATE:-1}" | tr '[:upper:]' '[:lower:]')"
+  case "${auto_migrate}" in
+    0|false|no|off)
+      echo "[entrypoint] GROK2API_AUTO_MIGRATE=${auto_migrate}; skip schema migrate"
+      return 0
+      ;;
+  esac
+
+  migrate_bin="${GROK2API_MIGRATE_BIN:-}"
+  if [[ -z "${migrate_bin}" ]]; then
+    if [[ -x /app/bin/grok2api-migrate ]]; then
+      migrate_bin="/app/bin/grok2api-migrate"
+    elif [[ -x ./bin/grok2api-migrate ]]; then
+      migrate_bin="./bin/grok2api-migrate"
+    fi
+  fi
+  migrate_dir="${GROK2API_MIGRATIONS_DIR:-migrations}"
+  if [[ ! -x "${migrate_bin:-}" ]]; then
+    echo "[entrypoint] ERROR: migrate binary not found/executable (set GROK2API_MIGRATE_BIN or ship bin/grok2api-migrate)" >&2
+    return 2
+  fi
+  if [[ ! -d "${migrate_dir}" ]]; then
+    echo "[entrypoint] ERROR: migrations directory missing: ${migrate_dir}" >&2
+    return 2
+  fi
+
+  wait_sec="${GROK2API_MIGRATE_WAIT_SEC:-60}"
+  echo "[entrypoint] waiting for PostgreSQL then applying migrations (dir=${migrate_dir}, timeout=${wait_sec}s)"
+  # Retry while Postgres is still coming up (compose depends_on healthy is best-effort).
+  # Permanent failures (checksum mismatch, bad SQL) also retry until timeout, then exit 1.
+  for i in $(seq 1 "${wait_sec}"); do
+    if "${migrate_bin}" -dir "${migrate_dir}" up; then
+      echo "[entrypoint] schema migrations applied/verified"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[entrypoint] ERROR: failed to apply schema migrations after ${wait_sec}s" >&2
+  echo "[entrypoint] hint: ensure postgres is healthy and GROK2API_DATABASE_URL/DATABASE_URL is correct" >&2
+  return 1
+}
+
 cleanup() {
   stop_pid "registration sidecar" "${reg_pid}"
   stop_pid "turnstile-solver" "${solver_pid}"
 }
 trap cleanup EXIT INT TERM
+
+# Schema first: sidecars and the Go app both expect applied migrations.
+if ! run_migrations; then
+  exit 1
+fi
 
 # Force local solver URL to loopback when using inline mode. This only keeps the
 # existing registration/solver sidecar path available; the Go runtime does not

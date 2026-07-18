@@ -157,3 +157,28 @@ python migrate_json_to_pg.py --data-dir ./data --dry-run
 curl -s http://127.0.0.1:3000/health | jq .
 curl -s http://127.0.0.1:3000/metrics | head
 ```
+
+
+---
+
+## 场景 C：Go 2.x 空库 / `schema_migrations does not exist`
+
+Go 主进程**不会**在启动时改 schema，只校验 `schema_migrations`。Docker ≥2.0.1 入口会自动跑 `grok2api-migrate up`。
+
+手工恢复（兼容旧库，`IF NOT EXISTS` 不删数据）：
+
+```bash
+# 备份
+docker exec grokcli-2api-postgres pg_dump -U grok2api -d grok2api \
+  > /root/grok2api-before-migration-$(date +%F-%H%M%S).sql
+
+# 迁移 + 校验
+docker exec grokcli-2api /app/bin/grok2api-migrate -dir /app/migrations up
+docker exec grokcli-2api /app/bin/grok2api-migrate -dir /app/migrations verify
+
+# 重启
+docker restart grokcli-2api
+curl -fsS http://127.0.0.1:3000/health || curl -fsS http://127.0.0.1:40081/health
+```
+
+新部署用 `docker compose up -d` 即可；入口默认 `GROK2API_AUTO_MIGRATE=1`。
