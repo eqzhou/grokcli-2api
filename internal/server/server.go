@@ -463,6 +463,12 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("POST /admin/api/settings/sub2api/test", func(w http.ResponseWriter, r *http.Request) {
 		serveSub2APITest(w, r, options)
 	})
+	mux.HandleFunc("GET /admin/api/settings/sub2api/groups", func(w http.ResponseWriter, r *http.Request) {
+		serveSub2APIGroupsList(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/settings/sub2api/groups", func(w http.ResponseWriter, r *http.Request) {
+		serveSub2APIGroupsCreate(w, r, options)
+	})
 	return mux
 }
 
@@ -884,7 +890,7 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 				slog.Warn("record usage failed", "error", err, "account_id", accountID, "model", model, "ok", ok)
 			}
 		}
-		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
+		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, cacheRead, ok)
 	}()
 }
 
@@ -2215,7 +2221,7 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 				slog.Warn("record usage failed", "error", err, "account_id", accountID, "model", model, "ok", ok)
 			}
 		}
-		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
+		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, cacheRead, ok)
 	}()
 }
 
@@ -2768,7 +2774,7 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 				slog.Warn("record usage failed", "error", err, "account_id", accountID, "model", model, "ok", ok)
 			}
 		}
-		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
+		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, cacheRead, ok)
 	}()
 }
 
@@ -3100,6 +3106,18 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
 			return
 		}
+	} else {
+		// Unprotected /admin/api/status is polled every ~8s by the admin UI.
+		// Serve a short-lived snapshot so reverse proxies never hit 502 on
+		// 7k-account PoolSummary scans.
+		statusPayloadMu.Lock()
+		if statusPayloadCache != nil && time.Since(statusPayloadAt) < 3*time.Second {
+			out := cloneStringAnyMap(statusPayloadCache)
+			statusPayloadMu.Unlock()
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		statusPayloadMu.Unlock()
 	}
 	store := options.Store
 	accountCount, modelCount := int64(0), int64(0)
@@ -3185,6 +3203,11 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 		payload["models"] = modelCatalog(options).PublicModels(r.Context())
 		payload["account_modes"] = []string{"round_robin", "random", "least_used"}
 		payload["full"] = false
+	} else {
+		statusPayloadMu.Lock()
+		statusPayloadCache = cloneStringAnyMap(payload)
+		statusPayloadAt = time.Now()
+		statusPayloadMu.Unlock()
 	}
 	writeJSON(w, http.StatusOK, payload)
 }
@@ -3375,16 +3398,26 @@ func requireAdminReadWrite(w http.ResponseWriter, r *http.Request, options Optio
 	return true
 }
 
-func recordRedisUsage(options Options, apiKeyID, accountID, model string, prompt, completion, total int64, ok bool) {
+func recordRedisUsage(options Options, apiKeyID, accountID, model string, prompt, completion, total, cacheRead int64, ok bool) {
 	if options.Redis == nil || !options.Redis.Enabled() {
 		return
+	}
+	// Store billed tokens so /admin/api/status light snapshot does not over-count
+	// prompt cache hits (and does not need a full PG UsageSummary scan).
+	billed := total - cacheRead
+	if billed < 0 {
+		billed = 0
+	}
+	promptBilled := prompt - cacheRead
+	if promptBilled < 0 {
+		promptBilled = 0
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = options.Redis.RecordUsage(ctx, redis.UsageDeltas{
-		PromptTokens:     prompt,
+		PromptTokens:     promptBilled,
 		CompletionTokens: completion,
-		TotalTokens:      total,
+		TotalTokens:      billed,
 		OK:               ok,
 		APIKeyID:         apiKeyID,
 		AccountID:        accountID,
@@ -3403,11 +3436,116 @@ func touchRedisPool(options Options, accountID string, success bool, errText str
 	_, _ = options.Redis.TouchStats(ctx, accountID, touch)
 }
 
+// usageLight cache: /admin/api/status is polled every ~few seconds by the admin UI.
+// Never run full UsageSummary / full-table scans here — reverse proxies
+// (Cloudflare/nginx) return HTML 502 when this path stalls.
+var (
+	statusPayloadMu    sync.Mutex
+	statusPayloadCache map[string]any
+	statusPayloadAt    time.Time
+
+	usageLightMu         sync.Mutex
+	usageLightCache      map[string]any
+	usageLightAt         time.Time
+	usageLightPGAt       time.Time
+	usageLightPGInFlight bool
+)
+
 func usageLightSnapshot(ctx context.Context, options Options) map[string]any {
+	// 1) In-process cache — status auto-refresh must be free after first hit.
+	usageLightMu.Lock()
+	if usageLightCache != nil && time.Since(usageLightAt) < 20*time.Second {
+		out := cloneStringAnyMap(usageLightCache)
+		usageLightMu.Unlock()
+		return out
+	}
+	usageLightMu.Unlock()
+
+	// 2) Redis hot buckets (O(1)). Billed tokens are written at record time.
 	if options.Redis != nil && options.Redis.Enabled() {
-		return options.Redis.LightSnapshot(ctx)
+		snap := options.Redis.LightSnapshot(ctx)
+		if snap != nil {
+			// Normalize keys for overview card.
+			if _, ok := snap["today_tokens"]; !ok {
+				snap["today_tokens"] = snap["today_tokens"]
+			}
+			snap["source"] = "redis"
+			usageLightMu.Lock()
+			usageLightCache = cloneStringAnyMap(snap)
+			usageLightAt = time.Now()
+			// Rare PG reconcile (at most every 60s) — never on request path.
+			needPG := time.Since(usageLightPGAt) > 60*time.Second && !usageLightPGInFlight
+			if needPG {
+				usageLightPGInFlight = true
+			}
+			usageLightMu.Unlock()
+			if needPG {
+				go refreshUsageLightFromPG(options)
+			}
+			return snap
+		}
+	}
+
+	// 3) Stale cache better than a blocking PG scan under a reverse proxy.
+	usageLightMu.Lock()
+	if usageLightCache != nil {
+		out := cloneStringAnyMap(usageLightCache)
+		usageLightMu.Unlock()
+		return out
+	}
+	usageLightMu.Unlock()
+
+	// 4) Last resort: tiny PG light with hard 150ms budget (indexes on created_at).
+	if options.Store != nil {
+		cctx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+		light, err := options.Store.UsageLightBilled(cctx)
+		cancel()
+		if err == nil && light != nil {
+			light["source"] = "postgres"
+			usageLightMu.Lock()
+			usageLightCache = cloneStringAnyMap(light)
+			usageLightAt = time.Now()
+			usageLightPGAt = time.Now()
+			usageLightMu.Unlock()
+			return light
+		}
 	}
 	return map[string]any{"today_requests": 0, "today_tokens": 0, "total_tokens": 0, "source": "none"}
+}
+
+func refreshUsageLightFromPG(options Options) {
+	defer func() {
+		usageLightMu.Lock()
+		usageLightPGInFlight = false
+		usageLightMu.Unlock()
+	}()
+	if options.Store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	light, err := options.Store.UsageLightBilled(ctx)
+	if err != nil || light == nil {
+		return
+	}
+	light["source"] = "postgres"
+	usageLightMu.Lock()
+	// Only replace redis snapshot if PG succeeded; keep 20s cache TTL from now.
+	usageLightCache = cloneStringAnyMap(light)
+	usageLightAt = time.Now()
+	usageLightPGAt = time.Now()
+	usageLightMu.Unlock()
+}
+
+func cloneStringAnyMap(in map[string]any) map[string]any {
+	if in == nil {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func leaderStatus(ctx context.Context, options Options) map[string]any {
@@ -4886,8 +5024,18 @@ func serveAccountsRefresh(w http.ResponseWriter, r *http.Request, options Option
 	if v, ok := body["force"].(bool); ok {
 		force = v
 	}
-	// selected ids currently use same batch path (best-effort full cycle)
-	result := options.Maintainer.RunOnce(r.Context(), force)
+	ids := stringSlice(body["ids"])
+	if len(ids) == 0 {
+		ids = stringSlice(body["account_ids"])
+	}
+	var result map[string]any
+	if len(ids) > 0 {
+		// Selected-account renew: refresh only those ids and return per-row results
+		// so the admin UI can paint immediately (busy rows / toast / pool patch).
+		result = options.Maintainer.RunForIDs(r.Context(), ids, force)
+	} else {
+		result = options.Maintainer.RunOnce(r.Context(), force)
+	}
 	result["maintainer"] = options.Maintainer.Status()
 	result["token_maintainer"] = result["maintainer"]
 	writeJSON(w, http.StatusOK, result)
@@ -5384,24 +5532,50 @@ func serveAdminAccountQuota(w http.ResponseWriter, r *http.Request, options Opti
 	if item == nil {
 		item = map[string]any{"ok": false, "account_id": aid, "error": "empty quota result"}
 	}
-	// Attach pool AFTER SaveQuotaSnapshot so UI reflects DB-coherent status
-	// (quota_disabled / re-enabled normal) without a full page reload.
+	// Prefer the synthetic pool from FetchOne (live billing result) so the admin
+	// UI paints immediately. DB SaveQuotaSnapshot is already async; if a durable
+	// pool view is available and not lagging, merge cooldown flags from it.
 	if poolView, perr := options.Store.GetAccountPoolView(r.Context(), aid); perr == nil && poolView != nil {
-		item["pool"] = poolView
-		if v, ok := poolView["pool_status"]; ok {
+		// Keep synthetic last_quota / quota_disabled from FetchOne; only enrich
+		// non-quota fields (cooldown / blocked models) from DB.
+		synth, _ := item["pool"].(map[string]any)
+		if synth == nil {
+			synth = map[string]any{}
+			item["pool"] = synth
+		}
+		for _, k := range []string{"in_cooldown", "cooldown_until", "cooldown_code", "cooldown_model", "cooldown_reason", "blocked_models", "blocked_model_ids", "last_probe", "last_probe_status"} {
+			if v, ok := poolView[k]; ok && v != nil {
+				synth[k] = v
+				item[k] = v
+			}
+		}
+		// If DB already has the quota write, prefer its pool_status.
+		if v, ok := poolView["pool_status"].(string); ok && v == "quota_disabled" {
+			synth["pool_status"] = v
+			synth["disabled_for_quota"] = true
+			synth["enabled"] = false
+			item["pool_status"] = v
+			item["disabled_for_quota"] = true
+			item["auto_disabled"] = true
+			item["pool_disabled"] = true
+		}
+	}
+	// Surface top-level fields used by frontend even when only synth pool exists.
+	if pool, _ := item["pool"].(map[string]any); pool != nil {
+		if v, ok := pool["pool_status"]; ok {
 			item["pool_status"] = v
 		}
-		if v, ok := poolView["disabled_for_quota"]; ok {
+		if v, ok := pool["disabled_for_quota"]; ok {
 			item["disabled_for_quota"] = v
 			if b, ok := v.(bool); ok && b {
 				item["auto_disabled"] = true
 				item["pool_disabled"] = true
 			}
 		}
-		if v, ok := poolView["enabled"]; ok {
+		if v, ok := pool["enabled"]; ok {
 			item["enabled"] = v
 		}
-		if v, ok := poolView["in_cooldown"]; ok {
+		if v, ok := pool["in_cooldown"]; ok {
 			item["in_cooldown"] = v
 		}
 	}
@@ -5443,13 +5617,22 @@ func serveIntegrationSettingsPut(w http.ResponseWriter, r *http.Request, options
 		return
 	}
 	out := map[string]any{"ok": true, "config": cfg}
-	if doTest && key == "cliproxyapi_config" {
-		// use raw secret
+	if doTest {
 		raw, _ := options.Store.GetSetting(r.Context(), key)
 		rm, _ := raw.(map[string]any)
-		test := integrations.TestCLIProxy(r.Context(), rm)
-		out["test"] = test
-		out["ok"] = test["ok"] == true
+		switch key {
+		case "cliproxyapi_config":
+			test := integrations.TestCLIProxy(r.Context(), rm)
+			out["test"] = test
+			out["ok"] = test["ok"] == true
+		case "sub2api_config":
+			test := integrations.TestSub2API(r.Context(), rm)
+			out["test"] = test
+			out["ok"] = test["ok"] == true
+			if v, ok := test["groups"]; ok {
+				out["groups"] = v
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -5821,7 +6004,59 @@ func serveSub2APITest(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	rm, _ := raw.(map[string]any)
 	test := integrations.TestSub2API(r.Context(), rm)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": test["ok"] == true, "test": test})
+	// Flatten groups / group_count for the settings page (testSub2apiConnection /
+	// renderSub2apiGroups expect top-level fields, not only nested under "test").
+	out := map[string]any{"ok": test["ok"] == true, "test": test}
+	if v, ok := test["groups"]; ok {
+		out["groups"] = v
+	}
+	if v, ok := test["group_count"]; ok {
+		out["group_count"] = v
+	}
+	if v, ok := test["error"]; ok {
+		out["error"] = v
+	}
+	if v, ok := test["message"]; ok {
+		out["message"] = v
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func serveSub2APIGroupsList(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	out := integrations.ListSub2APIGroups(r.Context(), options.Store)
+	// Keep HTTP 200 with ok:false for remote/config errors so the admin toast
+	// can show the message; only auth/store failures use non-200 above.
+	writeJSON(w, http.StatusOK, out)
+}
+
+func serveSub2APIGroupsCreate(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	name := stringValue(body["name"])
+	platform := stringValue(body["platform"])
+	if platform == "" {
+		platform = "grok"
+	}
+	setDefault := true
+	if v, ok := body["set_default"].(bool); ok {
+		setDefault = v
+	}
+	out := integrations.CreateSub2APIGroup(r.Context(), options.Store, name, platform, setDefault)
+	writeJSON(w, http.StatusOK, out)
 }
 
 func buildSSOExport(authMap map[string]any) map[string]any {
@@ -5945,12 +6180,45 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 		}
 		aid := firstNonEmptyStr(stringValue(row["account_id"]), stringValue(result["account_id"]), accountID)
 		email := firstNonEmptyStr(stringValue(row["email"]), stringValue(result["email"]))
-		// ProbeIDs already SaveLastProbe inside probeAccount; re-save is idempotent insurance.
-		if result["budget_cut"] != true {
-			_ = options.Store.SaveLastProbe(r.Context(), aid, result)
-		}
-		poolView, _ := options.Store.GetAccountPoolView(r.Context(), aid)
+		// ProbeIDs already deferred last_probe batch save; do not block the admin
+		// response on another synchronous PG write. Kick/Clear already applied.
 		ok := row["ok"] == true || result["available"] == true
+		// Prefer live probe flags for immediate UI; enrich with DB pool if present.
+		poolView := map[string]any{
+			"id": aid, "account_id": aid, "last_probe": result,
+			"last_probe_status": map[bool]string{true: "ok", false: "fail"}[ok],
+		}
+		if ok {
+			poolView["pool_status"] = "normal"
+			poolView["in_cooldown"] = false
+			if result["recovered"] == true {
+				poolView["recovered"] = true
+			}
+		} else {
+			if result["kicked_cooldown"] == true {
+				poolView["in_cooldown"] = true
+				poolView["pool_status"] = "cooldown"
+				poolView["cooldown_code"] = result["cooldown_code"]
+			}
+			if result["model_blocked"] == true {
+				poolView["pool_status"] = "model_blocked"
+			}
+			if result["auto_disabled"] == true {
+				poolView["enabled"] = false
+				poolView["pool_status"] = "disabled"
+			}
+		}
+		if dbPool, perr := options.Store.GetAccountPoolView(r.Context(), aid); perr == nil && dbPool != nil {
+			// Merge durable fields without overwriting live last_probe snapshot.
+			for k, v := range dbPool {
+				if k == "last_probe" {
+					continue
+				}
+				if _, has := poolView[k]; !has || poolView[k] == nil {
+					poolView[k] = v
+				}
+			}
+		}
 		statusCode := 0
 		switch v := result["status_code"].(type) {
 		case int:
@@ -6535,9 +6803,20 @@ func readyReason(options Options) string {
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
+	// Marshal first so encode failures never produce HTTP 200 + empty body
+	// (which the admin UI then treats as null and crashes on field access).
+	payload, err := json.Marshal(value)
+	if err != nil {
+		slog.Error("writeJSON marshal failed", "error", err)
+		payload, _ = json.Marshal(map[string]any{"ok": false, "detail": "encode response failed"})
+		status = http.StatusInternalServerError
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	_, _ = w.Write(payload)
+	if len(payload) == 0 || payload[len(payload)-1] != '\n' {
+		_, _ = w.Write([]byte("\n"))
+	}
 }
 
 func itoa(value int) string {

@@ -85,12 +85,22 @@ func (s *Service) FetchOne(ctx context.Context, accountID string) (map[string]an
 		return map[string]any{"ok": false, "account_id": accountID, "error": "account not found or has no token"}, nil
 	}
 	item := s.fetchOne(ctx, *auth)
-	// SaveQuotaSnapshot writes last_quota AND syncs pool status (quota_disabled / re-enable).
-	_ = s.Store.SaveQuotaSnapshot(ctx, auth.ID, item)
+	if item == nil {
+		item = map[string]any{"ok": false, "account_id": auth.ID, "error": "empty quota result"}
+	}
+	// Persist AFTER the live fetch so the HTTP response is not blocked on PG write
+	// for every single-account button click. Snapshot is fire-and-forget with a
+	// detached context so request cancel does not drop the durable write.
+	s.persistQuotaSnapshotAsync(auth.ID, item)
 	if item["exhausted"] == true {
 		item["auto_disabled"] = true
 		item["pool_disabled"] = true
 	}
+	// Synthesize a lightweight pool view for immediate frontend feedback before
+	// the async SaveQuotaSnapshot lands. Authoritative pool is re-read by UI later.
+	// Must not embed `item` inside pool (see syntheticPoolFromQuota) — that creates
+	// a JSON cycle and writeJSON encodes an empty body.
+	item["pool"] = syntheticPoolFromQuota(auth.ID, item)
 	return item, nil
 }
 
@@ -114,6 +124,10 @@ func (s *Service) FetchAll(ctx context.Context) (map[string]any, error) {
 	ch := make(chan result, len(auths))
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
+	// Collect snapshots for a single async bulk persist after the response is built.
+	// Live billing is the slow part; PG writes must not serialize the admin button.
+	snaps := make([]quotaSnap, 0, len(auths))
+	var snapsMu sync.Mutex
 	for _, auth := range auths {
 		wg.Add(1)
 		go func(a postgres.AccountAuth) {
@@ -121,17 +135,24 @@ func (s *Service) FetchAll(ctx context.Context) (map[string]any, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			item := s.fetchOne(ctx, a)
-			// Real-time DB sync: last_quota + disabled_for_quota / pool_status / re-enable.
-			_ = s.Store.SaveQuotaSnapshot(ctx, a.ID, item)
+			if item == nil {
+				item = map[string]any{"ok": false, "account_id": a.ID, "error": "empty quota result"}
+			}
 			if item["exhausted"] == true {
 				item["auto_disabled"] = true
 				item["pool_disabled"] = true
 			}
+			item["pool"] = syntheticPoolFromQuota(a.ID, item)
+			snapsMu.Lock()
+			snaps = append(snaps, quotaSnap{id: a.ID, item: item})
+			snapsMu.Unlock()
 			ch <- result{item: item}
 		}(auth)
 	}
 	wg.Wait()
 	close(ch)
+	// Fire bulk persist AFTER live results are ready so the HTTP handler can return.
+	go s.persistQuotaSnapshots(snaps)
 	results := make([]map[string]any, 0, len(auths))
 	for r := range ch {
 		results = append(results, r.item)
@@ -172,8 +193,112 @@ func (s *Service) FetchAll(ctx context.Context) (map[string]any, error) {
 		"total_monthly_limit": totalLimit,
 		"total_remaining":     totalRemaining,
 		"workers":             workers,
-		"accounts":            results,
+		// Both keys: frontend accepts results || accounts; keep both for clients.
+		"accounts": results,
+		"results":  results,
 	}, nil
+}
+
+// persistQuotaSnapshotAsync writes last_quota + pool status without blocking the
+// request that already has live billing data for the UI.
+func (s *Service) persistQuotaSnapshotAsync(accountID string, item map[string]any) {
+	if s == nil || s.Store == nil || strings.TrimSpace(accountID) == "" || item == nil {
+		return
+	}
+	// Shallow copy so concurrent mutation of the response map cannot race the write.
+	copyItem := make(map[string]any, len(item))
+	for k, v := range item {
+		copyItem[k] = v
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = s.Store.SaveQuotaSnapshot(ctx, accountID, copyItem)
+	}()
+}
+
+type quotaSnap struct {
+	id   string
+	item map[string]any
+}
+
+func (s *Service) persistQuotaSnapshots(snaps []quotaSnap) {
+	if s == nil || s.Store == nil || len(snaps) == 0 {
+		return
+	}
+	// Cap concurrent PG writers so a 7k-account pool does not stampede the DB.
+	workers := s.Workers
+	if workers <= 0 {
+		workers = 8
+	}
+	if workers > 16 {
+		workers = 16
+	}
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for _, sn := range snaps {
+		sn := sn
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			_ = s.Store.SaveQuotaSnapshot(ctx, sn.id, sn.item)
+		}()
+	}
+	wg.Wait()
+}
+
+// syntheticPoolFromQuota builds a client-side pool view so the admin UI can paint
+// quota_disabled / re-enabled status immediately, before async SaveQuotaSnapshot.
+//
+// IMPORTANT: do NOT set pool["last_quota"] = item when the caller also attaches
+// item["pool"] = pool. That creates a cycle and encoding/json fails with
+// "unsupported value: encountered a cycle", producing an empty HTTP body.
+// Frontend already treats the quota response itself as last_quota.
+func syntheticPoolFromQuota(accountID string, item map[string]any) map[string]any {
+	if item == nil {
+		return map[string]any{
+			"id":         accountID,
+			"account_id": accountID,
+		}
+	}
+	exhausted := item["exhausted"] == true || item["auto_disabled"] == true || item["disabled_for_quota"] == true
+	ok := item["ok"] == true && !exhausted
+	pool := map[string]any{
+		"id":         accountID,
+		"account_id": accountID,
+	}
+	if exhausted {
+		pool["disabled_for_quota"] = true
+		pool["enabled"] = false
+		pool["pool_status"] = "quota_disabled"
+		pool["pool_disabled"] = true
+		if r, ok := item["exhaust_reason"].(string); ok && strings.TrimSpace(r) != "" {
+			pool["disabled_reason"] = r
+		} else if d, ok := item["display"].(map[string]any); ok {
+			if s, ok := d["summary"].(string); ok {
+				pool["disabled_reason"] = s
+			}
+		}
+		pool["quota_source"] = firstNonEmpty(stringFromAny(item["source"]), "billing")
+	} else if ok {
+		pool["disabled_for_quota"] = false
+		pool["enabled"] = true
+		pool["pool_status"] = "normal"
+		pool["disabled_reason"] = nil
+		pool["quota_source"] = nil
+	}
+	return pool
+}
+
+func stringFromAny(v any) string {
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
 }
 
 func (s *Service) fetchOne(ctx context.Context, auth postgres.AccountAuth) map[string]any {
