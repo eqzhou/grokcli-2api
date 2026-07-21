@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.289114c3f5.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.d2ecc21f1e.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -288,20 +288,27 @@
 </section>
 
 <section class="g2a-card">
-  <div class="g2a-card-head">
-    <div>
-      <h3>协议注册</h3>
-      <p>临时邮箱（MoeMail / YYDS / GPTMail / CF）+ 过盾服务自动建号并导入账号池。每种邮箱服务使用<strong>独立</strong>的 Key / 域名 / URL，分库存储，互不覆盖。本地过盾以内联方式运行（无需填写 URL）；也可切换到 YesCaptcha 云端。</p>
+  <div class="g2a-card-head g2a-reg-card-head">
+    <div class="g2a-reg-card-title">
+      <div class="g2a-reg-title-row">
+        <h3>协议注册</h3>
+        <span class="g2a-tag blue g2a-reg-chip" id="reg-mode-chip" title="当前配置摘要">单次 · 本地过盾</span>
+      </div>
+      <p>临时邮箱 + 过盾自动建号并导入账号池。各邮箱服务的 Key / 域名 / URL <strong>分库独立</strong>；本地过盾容器内联运行，也可切换 YesCaptcha。</p>
     </div>
-    <div class="g2a-actions">
-      <button class="g2a-btn g2a-btn-default" id="btn-save-reg">保存配置</button>
-      <button class="g2a-btn g2a-btn-default" id="btn-test-reg-proxy">测试代理</button>
-      <button class="g2a-btn g2a-btn-primary" id="btn-start-reg">开始注册</button>
-      <button class="g2a-btn g2a-btn-danger" id="btn-stop-reg" title="停止当前/全部进行中的注册会话">停止注册</button>
-      <button class="g2a-btn g2a-btn-default" id="btn-refresh-reg">刷新进度</button>
+    <div class="g2a-actions g2a-reg-actions">
+      <button class="g2a-btn g2a-btn-default" id="btn-save-reg" type="button">保存配置</button>
+      <button class="g2a-btn g2a-btn-default" id="btn-test-reg-proxy" type="button">测试代理</button>
+      <button class="g2a-btn g2a-btn-default" id="btn-refresh-reg" type="button">刷新进度</button>
+      <span class="g2a-reg-actions-sep" aria-hidden="true"></span>
+      <button class="g2a-btn g2a-btn-danger" id="btn-stop-reg" type="button" title="停止当前/全部进行中的注册会话" disabled>停止注册</button>
+      <button class="g2a-btn g2a-btn-primary" id="btn-start-reg" type="button">开始注册</button>
     </div>
   </div>
-  <div class="g2a-form-grid">
+  <div class="g2a-form-grid g2a-reg-form">
+    <div class="g2a-reg-section" style="grid-column:1/-1">
+      <div class="g2a-reg-section-label">邮箱服务</div>
+    </div>
     <div class="g2a-field">
       <label for="reg-mail-provider">邮箱服务</label>
       <select id="reg-mail-provider">
@@ -378,6 +385,9 @@
       <textarea id="reg-tempmail-domain" class="g2a-input" rows="2" placeholder="免费层级请留空（系统随机域名）；自定义域名需 Plus/Ultra" autocomplete="off" name="reg-tempmail-domain" spellcheck="false"></textarea>
       <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：api.tempmail.lol · 文档 <a href="https://tempmail.lol/zh/api" target="_blank" rel="noopener">tempmail.lol/zh/api</a>。免费：POST /v2/inbox/create（无需 Key），收信 GET /v2/inbox?token=…</div>
     </div>
+    <div class="g2a-reg-section" style="grid-column:1/-1">
+      <div class="g2a-reg-section-label">过盾与批量</div>
+    </div>
     <div class="g2a-field">
       <label for="reg-captcha-provider">过盾方式</label>
       <select id="reg-captcha-provider">
@@ -405,6 +415,9 @@
         <option value="0">永久</option>
       </select>
     </div>
+    <div class="g2a-reg-section" style="grid-column:1/-1">
+      <div class="g2a-reg-section-label">代理（可选）</div>
+    </div>
     <div class="g2a-field g2a-field-span2">
       <label for="reg-proxy" title="支持代理池：每行一个；也可用逗号/分号分隔。格式：http://host:port 或 host:port:user:pass 或 socks5://...">代理池</label>
       <textarea id="reg-proxy" rows="3" placeholder="可选，每行一个代理&#10;http://host:port&#10;host:port:user:pass&#10;socks5://user:pass@host:port" spellcheck="false"></textarea>
@@ -421,16 +434,40 @@
       </select>
     </div>
   </div>
-  <div id="reg-session-box" class="g2a-subcard hidden" style="margin-top:12px" hidden>
-    <div class="g2a-kv"><span>状态</span><span id="reg-status" class="g2a-tag">idle</span></div>
-    <div class="g2a-kv"><span>会话</span><code id="reg-email" class="g2a-code-inline">—</code></div>
-    <div class="g2a-actions" style="margin:8px 0 4px">
-      <button class="g2a-btn g2a-btn-danger g2a-btn-sm" id="btn-stop-reg-inline" type="button">停止当前注册</button>
-      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-refresh-reg-inline" type="button">刷新</button>
-      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-close-reg-inline" type="button" title="关闭进度卡片（不停止后台注册）">关闭</button>
+  <div id="reg-session-box" class="g2a-subcard g2a-reg-progress hidden" style="margin-top:14px" hidden>
+    <div class="g2a-reg-progress-head">
+      <div class="g2a-reg-progress-title">
+        <span class="g2a-reg-live-dot" id="reg-live-dot" aria-hidden="true"></span>
+        <div>
+          <div class="g2a-reg-progress-label">注册进度</div>
+          <code id="reg-email" class="g2a-code-inline g2a-reg-session-id">—</code>
+        </div>
+      </div>
+      <div class="g2a-actions g2a-reg-progress-actions">
+        <span id="reg-status" class="g2a-tag g2a-reg-status-tag" data-reg-state="idle">idle</span>
+        <button class="g2a-btn g2a-btn-danger g2a-btn-sm" id="btn-stop-reg-inline" type="button">停止</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-refresh-reg-inline" type="button">刷新</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-close-reg-inline" type="button" title="关闭进度卡片（不停止后台注册）">关闭</button>
+      </div>
     </div>
-    <p class="g2a-muted" style="margin:8px 0 4px">进度日志（成功/失败统计 · 入池后自动测活；切页仍可查看进行中任务）</p>
-    <pre id="reg-log" class="g2a-log is-empty hidden" hidden>—</pre>
+    <div class="g2a-reg-stats" id="reg-stats" aria-live="polite">
+      <div class="g2a-reg-stat"><span class="k">总数</span><span class="v" id="reg-stat-total">0</span></div>
+      <div class="g2a-reg-stat is-ok"><span class="k">成功</span><span class="v" id="reg-stat-ok">0</span></div>
+      <div class="g2a-reg-stat is-bad"><span class="k">失败</span><span class="v" id="reg-stat-fail">0</span></div>
+      <div class="g2a-reg-stat is-run"><span class="k">进行中</span><span class="v" id="reg-stat-run">0</span></div>
+      <div class="g2a-reg-stat is-stop"><span class="k">已停</span><span class="v" id="reg-stat-stop">0</span></div>
+    </div>
+    <div class="g2a-reg-bar-wrap" id="reg-progress-wrap">
+      <div class="g2a-reg-bar-meta">
+        <span id="reg-progress-label" class="g2a-muted">等待开始…</span>
+        <span id="reg-progress-pct" class="g2a-muted">0%</span>
+      </div>
+      <div class="g2a-reg-bar-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="reg-progress-bar">
+        <div id="reg-progress-fill" class="g2a-reg-bar-fill" style="width:0%"></div>
+      </div>
+    </div>
+    <p class="g2a-muted g2a-reg-log-hint">实时步骤 · 入池后自动测活 · 切页后仍可恢复进行中任务</p>
+    <pre id="reg-log" class="g2a-log g2a-reg-log is-empty hidden" hidden>—</pre>
   </div>
 </section>
 
@@ -547,6 +584,6 @@
   <script src="/static/dist/api.1bf56e45fe.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4578b49216.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.bf059cf043.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.71d9320b21.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>
