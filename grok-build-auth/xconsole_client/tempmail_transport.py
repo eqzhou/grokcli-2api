@@ -98,6 +98,16 @@ class TempmailInbox:
         data = resp.json()
         return data.get("emails", [])
 
+    def close(self) -> None:
+        """Release the underlying requests.Session (safe to call multiple times)."""
+        sess = self._http
+        self._http = None
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
     def wait_for_code(self, timeout: Optional[float] = None) -> str:
         """Poll until a 6-char x.ai code appears. Returns the code string.
 

@@ -192,3 +192,134 @@ class ProbeEnqueueTests(unittest.TestCase):
             self.assertEqual(job["account_ids"], ["a1"])
             self.assertEqual(job["delay_sec"], 30.0)
 
+
+
+class AdmissionAndStopTests(unittest.TestCase):
+    def test_single_job_start_uses_admission(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+        import inspect
+        src = inspect.getsource(gba._start_one_registration)
+        self.assertIn("_wait_reg_admission", src)
+        self.assertIn("admission_flag", src)
+        self.assertIn("_release_reg_admission_once", src)
+
+    def test_run_registration_finally_releases_admission(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+        import inspect
+        src = inspect.getsource(gba._run_registration)
+        self.assertIn("_release_reg_admission_once(admission_flag)", src)
+        self.assertIn("_dispose_reg_handles", src)
+        # Promote stopping -> cancelled on worker exit
+        self.assertIn('st_now == "stopping"', src)
+
+    def test_dispose_reg_handles_closes_receiver(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+        closed = {"n": 0}
+
+        class R:
+            def close(self):
+                closed["n"] += 1
+
+        ev = __import__("threading").Event()
+        sess = {"_receiver": R(), "_cancel_event": ev, "status": "running"}
+        gba._dispose_reg_handles(sess)
+        self.assertTrue(ev.is_set())
+        self.assertEqual(closed["n"], 1)
+        self.assertNotIn("_receiver", sess)
+
+    def test_stop_sets_cancel_event_and_disposes(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+        import threading
+        sid = "gba_test_stop_1"
+        closed = {"n": 0}
+
+        class R:
+            def close(self):
+                closed["n"] += 1
+
+        ev = threading.Event()
+        with gba._lock:
+            gba._sessions[sid] = {
+                "id": sid,
+                "status": "registering",
+                "updated_at": gba._now(),
+                "created_at": gba._now(),
+                "cancel_requested": False,
+                "_receiver": R(),
+                "_cancel_event": ev,
+            }
+        try:
+            out = gba.stop_registration_session(sid)
+            self.assertTrue(out.get("ok"))
+            self.assertTrue(ev.is_set())
+            self.assertEqual(closed["n"], 1)
+            with gba._lock:
+                cur = gba._sessions.get(sid) or {}
+            self.assertTrue(cur.get("cancel_requested"))
+            self.assertEqual(str(cur.get("status")), "stopping")
+            self.assertNotIn("_receiver", cur)
+        finally:
+            with gba._lock:
+                gba._sessions.pop(sid, None)
+
+    def test_mail_receiver_has_close(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+        import inspect
+        src = inspect.getsource(gba._make_email_receiver)
+        self.assertIn("def close(self)", src)
+        self.assertIn("_cancel_event", src)
+
+    def test_session_cancel_honours_event(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+        import threading
+        ev = threading.Event()
+        self.assertFalse(gba._session_cancel_requested({"status": "running", "_cancel_event": ev}))
+        ev.set()
+        self.assertTrue(gba._session_cancel_requested({"status": "running", "_cancel_event": ev}))
+
+
+
+    def test_stop_does_not_demote_terminal(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+        sid = "gba_test_stop_terminal"
+        with gba._lock:
+            gba._sessions[sid] = {
+                "id": sid,
+                "status": "imported",
+                "updated_at": gba._now(),
+                "created_at": gba._now(),
+                "message": "already done",
+            }
+        try:
+            out = gba.stop_registration_session(sid)
+            self.assertTrue(out.get("ok"))
+            self.assertTrue(out.get("already_terminal"))
+            self.assertEqual(out.get("status"), "imported")
+            with gba._lock:
+                cur = gba._sessions.get(sid) or {}
+            self.assertEqual(cur.get("status"), "imported")
+        finally:
+            with gba._lock:
+                gba._sessions.pop(sid, None)
+
+    def test_run_registration_bails_admission_on_missing_session(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+        import inspect
+        src = inspect.getsource(gba._run_registration)
+        self.assertIn("_bail_admission", src)
+        self.assertIn("except _RegCancelled:", src)
+
+
+class TempmailCloseTests(unittest.TestCase):
+    def test_tempmail_close_releases_session(self) -> None:
+        from xconsole_client.tempmail_transport import TempmailInbox
+        inbox = TempmailInbox(api_key="k")
+        # force-create session without network
+        class Fake:
+            def close(self):
+                self.closed = True
+        fake = Fake()
+        inbox._http = fake
+        inbox.close()
+        self.assertIsNone(inbox._http)
+        self.assertTrue(fake.closed)

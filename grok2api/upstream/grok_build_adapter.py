@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.97-reg-scale-perf"
+ADAPTER_BUILD = "v1.9.99-reg-stop-cleanup"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -204,6 +204,32 @@ def _release_reg_admission_once(flag: dict[str, bool]) -> None:
         return
     flag["released"] = True
     _release_reg_admission()
+
+
+def _dispose_reg_handles(sess: dict[str, Any] | None) -> None:
+    """Best-effort close process-local registration handles (mailbox/client)."""
+    if not isinstance(sess, dict):
+        return
+    # Wake cooperative cancel waiters first.
+    ev = sess.get("_cancel_event")
+    if ev is not None:
+        try:
+            if hasattr(ev, "set"):
+                ev.set()
+        except Exception:
+            pass
+    for k in ("_receiver", "_client", "_oauth_client"):
+        obj = sess.pop(k, None)
+        if obj is None:
+            continue
+        for meth in ("close", "stop", "shutdown", "cancel"):
+            fn = getattr(obj, meth, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+                break
 
 
 # Post-import probe queue: free registration workers immediately after durable
@@ -710,6 +736,13 @@ def _session_cancel_requested(sess: dict[str, Any] | None) -> bool:
         return False
     if sess.get("cancel_requested"):
         return True
+    ev = sess.get("_cancel_event")
+    if ev is not None:
+        try:
+            if hasattr(ev, "is_set") and ev.is_set():
+                return True
+        except Exception:
+            pass
     return _is_cancel_status(sess.get("status"))
 
 
@@ -1628,6 +1661,19 @@ def _make_email_receiver(
             self.base_url = base_url or default_base
             self.provider = provider
             self.token = token
+            self._closed = False
+            self._cancel_event = None  # optional threading.Event from registration session
+
+        def close(self) -> None:
+            """Mark closed and wake cooperative waiters; no long-lived sockets to drop."""
+            self._closed = True
+            ev = self._cancel_event
+            if ev is not None:
+                try:
+                    if hasattr(ev, "set"):
+                        ev.set()
+                except Exception:
+                    pass
 
         def wait_for_code(
             self,
@@ -1645,22 +1691,41 @@ def _make_email_receiver(
             poll = max(0.4, min(poll, 2.0))
             started = time.time()
             last_tick = 0.0
-            while time.time() < deadline:
+
+            def _cancelled() -> bool:
+                if self._closed:
+                    return True
+                ev = self._cancel_event
+                if ev is not None:
+                    try:
+                        if hasattr(ev, "is_set") and ev.is_set():
+                            return True
+                    except Exception:
+                        pass
                 if callable(should_cancel) and should_cancel():
+                    return True
+                return False
+
+            while time.time() < deadline:
+                if _cancelled():
                     raise _RegCancelled("cancelled while waiting for email code")
                 try:
                     messages = []
                     # YYDS: prefer GET /v1/messages/next (long-poll + verificationCode).
+                    # Cap wait to 2s when cancel is wired so stop lands quickly.
                     if self.provider == "yyds":
                         try:
                             from grok2api.upstream.moemail import yyds_wait_next_message
 
+                            yyds_wait = min(15, max(1, int(deadline - time.time())))
+                            if self._cancel_event is not None or callable(should_cancel):
+                                yyds_wait = min(yyds_wait, 2)
                             nxt = yyds_wait_next_message(
                                 address=self.email,
                                 api_key=self.api_key,
                                 base_url=self.base_url,
                                 token=self.token or None,
-                                wait=min(15, max(1, int(deadline - time.time()))),
+                                wait=yyds_wait,
                                 email_id=self.email_id,
                             )
                             if nxt:
@@ -1711,6 +1776,8 @@ def _make_email_receiver(
                             clean = str(code).replace("-", "").strip().upper()
                             if len(clean) == 6 and _re.fullmatch(r"[A-Z0-9]{6}", clean):
                                 return clean
+                except _RegCancelled:
+                    raise
                 except Exception:
                     pass
                 # Heartbeat for admin UI so waiting_email is not a silent freeze.
@@ -1727,7 +1794,7 @@ def _make_email_receiver(
                 # Sleep in small slices so stop can interrupt mid-wait.
                 slept = 0.0
                 while slept < poll:
-                    if callable(should_cancel) and should_cancel():
+                    if _cancelled():
                         raise _RegCancelled("cancelled while waiting for email code")
                     step = min(0.25, poll - slept)
                     time.sleep(step)
@@ -1872,6 +1939,7 @@ def _prepare_registration_session(
     # xAI password rules: mix upper/lower/digit/symbol.
     password = f"Aa{os.urandom(5).hex()}9!xZ"
     sid = f"gba_{uuid.uuid4().hex[:16]}"
+    cancel_event = threading.Event()
 
     sess = {
         "id": sid,
@@ -1891,9 +1959,16 @@ def _prepare_registration_session(
         "batch_id": batch_id,
         "batch_index": batch_index,
         "batch_total": batch_total,
-        # Keep receiver process-local only (not mirrored to Redis).
+        # Keep receiver / cancel event process-local only (not mirrored to Redis).
         "_receiver": receiver,
+        "_cancel_event": cancel_event,
     }
+    # Wire mailbox waiter to the same cancel event so stop wakes wait_for_code promptly.
+    try:
+        if hasattr(receiver, "_cancel_event"):
+            receiver._cancel_event = cancel_event
+    except Exception:
+        pass
     mirror_batch = None
     with _lock:
         _sessions[sid] = sess
@@ -1928,7 +2003,11 @@ def _start_one_registration(
     batch_total: int | None = None,
     start_delay: float = 0.0,
 ) -> dict[str, Any]:
-    """Create one session and spawn its worker thread (single-job path)."""
+    """Create one session and spawn its worker thread (single-job path).
+
+    Honours the same global inflight admission as batch jobs so concurrent
+    single-shot starts cannot stampede local captcha / device-flow.
+    """
     prepared = _prepare_registration_session(
         yescaptcha_key=yescaptcha_key,
         proxy=proxy,
@@ -1974,9 +2053,57 @@ def _start_one_registration(
                 finished=False,
                 detail={**payload["detail"], "phase": "started"},
             )
+
+    def _worker() -> None:
+        admission_flag = {"released": False}
+        admitted = False
+        try:
+            def _job_cancel() -> None:
+                with _lock:
+                    cur = _sessions.get(sid) or {}
+                if _session_cancel_requested(cur):
+                    raise _RegCancelled("cancelled while waiting for admission")
+
+            _wait_reg_admission(check_cancel=_job_cancel)
+            admitted = True
+            # Re-check cancel after admission (stop may land while queued).
+            with _lock:
+                cur = _sessions.get(sid) or {}
+            if _session_cancel_requested(cur):
+                raise _RegCancelled(cur.get("message") or "cancelled before worker start")
+            _run_registration(
+                sid,
+                yescaptcha_key,
+                proxy or "",
+                receiver,
+                admission_flag=admission_flag,
+            )
+        except _RegCancelled as e:
+            mirror_copy = None
+            with _lock:
+                if sid in _sessions:
+                    cur = _sessions[sid]
+                    cur["status"] = "cancelled"
+                    cur["error"] = "cancelled"
+                    cur["message"] = str(e) or "cancelled"
+                    cur["cancel_requested"] = True
+                    cur["updated_at"] = _now()
+                    _dispose_reg_handles(cur)
+                    mirror_copy = dict(cur)
+            if mirror_copy is not None:
+                try:
+                    _mirror_reg_sess(sid, mirror_copy, force=True)
+                except Exception:
+                    pass
+        finally:
+            if admitted:
+                _release_reg_admission_once(admission_flag)
+            with _lock:
+                if sid in _sessions:
+                    _dispose_reg_handles(_sessions[sid])
+
     threading.Thread(
-        target=_run_registration,
-        args=(sid, yescaptcha_key, proxy or "", receiver),
+        target=_worker,
         daemon=True,
         name=f"gba-reg-{sid[-8:]}",
     ).start()
@@ -2638,7 +2765,7 @@ def _spawn_batch_runner(
                         _sessions[sid]["error"] = "cancelled"
                         _sessions[sid]["cancel_requested"] = True
                         _sessions[sid]["updated_at"] = _now()
-                        _sessions[sid].pop("_receiver", None)
+                        _dispose_reg_handles(_sessions[sid])
                         _mirror_reg_sess(sid, _sessions[sid])
                     return {
                         "ok": False,
@@ -2700,7 +2827,7 @@ def _spawn_batch_runner(
                     _release_reg_admission_once(admission_flag)
                 with _lock:
                     if sid in _sessions:
-                        _sessions[sid].pop("_receiver", None)
+                        _dispose_reg_handles(_sessions[sid])
             with _lock:
                 final = _sessions.get(sid) or {}
             st = str(final.get("status") or "")
@@ -2994,12 +3121,17 @@ def _run_registration(
     receiver: Any,
     admission_flag: dict[str, bool] | None = None,
 ) -> None:
+    def _bail_admission() -> None:
+        if admission_flag is not None:
+            _release_reg_admission_once(admission_flag)
+
     with _lock:
         sess = _sessions.get(sid)
     if not sess:
         # Another worker may hold the durable copy; still try to load.
         sess = _load_reg_sess(sid)
     if not sess:
+        _bail_admission()
         return
     # Re-bind process-local map so later progress stays readable on this worker.
     with _lock:
@@ -3187,7 +3319,10 @@ def _run_registration(
     email = str(sess.get("email") or "").strip().lower()
     password = sess.get("password") or ""
     if not password:
-        update("error", "missing password for registration session", error="missing password")
+        try:
+            update("error", "missing password for registration session", error="missing password")
+        finally:
+            _bail_admission()
         return
     sess["email"] = email
     client = None
@@ -3216,6 +3351,9 @@ def _run_registration(
             proxy=proxy or "",
             signup_url="https://accounts.x.ai/sign-up?redirect=grok-com",
         )
+        with _lock:
+            if sid in _sessions:
+                _sessions[sid]["_client"] = client
         client.visit_home()
         _check_cancel()
         client.load_signup_page()
@@ -3339,7 +3477,8 @@ def _run_registration(
             last_beat = 0.0
             while True:
                 _check_cancel()
-                acquired = _local_captcha_sem.acquire(timeout=5.0)
+                # Prefer short acquire timeout so stop lands while queued for captcha.
+                acquired = _local_captcha_sem.acquire(timeout=1.0)
                 if not acquired:
                     waited = time.time() - wait_started
                     if waited - last_beat >= 12.0:
@@ -4176,6 +4315,7 @@ def _run_registration(
             cur["error"] = "cancelled"
             cur["cancel_requested"] = True
             cur["updated_at"] = _now()
+            _dispose_reg_handles(cur)
             _sessions[sid] = cur
             mirror_copy = dict(cur)
         if mirror_copy is not None:
@@ -4185,9 +4325,12 @@ def _run_registration(
                 pass
         return
     except Exception as exc:  # noqa: BLE001
-        try:
-            update("error", f"failed: {exc}", error=str(exc))
-        except _RegCancelled:
+        # Prefer cancelled when stop raced an upstream exception (HTTP/captcha).
+        prefer_cancel = False
+        with _lock:
+            cur0 = _sessions.get(sid) or sess or {}
+            prefer_cancel = _session_cancel_requested(cur0)
+        if prefer_cancel:
             mirror_copy = None
             with _lock:
                 cur = _sessions.get(sid) or sess
@@ -4196,6 +4339,7 @@ def _run_registration(
                 cur["error"] = "cancelled"
                 cur["cancel_requested"] = True
                 cur["updated_at"] = _now()
+                _dispose_reg_handles(cur)
                 _sessions[sid] = cur
                 mirror_copy = dict(cur)
             if mirror_copy is not None:
@@ -4203,7 +4347,30 @@ def _run_registration(
                     _mirror_reg_sess(sid, mirror_copy, force=True)
                 except Exception:
                     pass
+        else:
+            try:
+                update("error", f"failed: {exc}", error=str(exc))
+            except _RegCancelled:
+                mirror_copy = None
+                with _lock:
+                    cur = _sessions.get(sid) or sess
+                    cur["status"] = "cancelled"
+                    cur["message"] = "cancelled by user"
+                    cur["error"] = "cancelled"
+                    cur["cancel_requested"] = True
+                    cur["updated_at"] = _now()
+                    _dispose_reg_handles(cur)
+                    _sessions[sid] = cur
+                    mirror_copy = dict(cur)
+                if mirror_copy is not None:
+                    try:
+                        _mirror_reg_sess(sid, mirror_copy, force=True)
+                    except Exception:
+                        pass
     finally:
+        # Always free global admission (idempotent). Import path may already have.
+        if admission_flag is not None:
+            _release_reg_admission_once(admission_flag)
         if client is not None:
             try:
                 client.close()
@@ -4215,23 +4382,33 @@ def _run_registration(
         with _lock:
             final_sess = dict(_sessions.get(sid) or sess or {})
             if sid in _sessions:
-                for k in ("_receiver", "_client", "_oauth_client"):
-                    obj = _sessions[sid].pop(k, None)
-                    if obj is None:
-                        continue
-                    for meth in ("close", "stop", "shutdown", "cancel"):
-                        fn = getattr(obj, meth, None)
-                        if callable(fn):
-                            try:
-                                fn()
-                            except Exception:
-                                pass
-                            break
+                # If stop left us in "stopping" and the worker is exiting, promote
+                # to terminal cancelled so admin/UI does not hang on stopping.
+                # Never demote a successful import/error that already finished.
+                cur = _sessions[sid]
+                st_now = str(cur.get("status") or "").lower()
+                success_or_done = st_now in (
+                    "imported",
+                    "success",
+                    "completed",
+                    "done",
+                )
+                if (
+                    not success_or_done
+                    and st_now not in _TERMINAL_STATUSES
+                    and (cur.get("cancel_requested") or st_now == "stopping")
+                ):
+                    cur["status"] = "cancelled"
+                    cur["error"] = cur.get("error") or "cancelled"
+                    cur["message"] = cur.get("message") or "cancelled by user"
+                    cur["cancel_requested"] = True
+                    cur["updated_at"] = _now()
+                _dispose_reg_handles(cur)
                 try:
-                    _mirror_reg_sess(sid, _sessions[sid], force=True)
+                    _mirror_reg_sess(sid, cur, force=True)
                 except Exception:
                     pass
-                final_sess = dict(_sessions[sid])
+                final_sess = dict(cur)
         # Single sessions write their own terminal task log. Batch sessions are
         # summarized once by the batch finalizer (avoids N noise rows).
         if final_sess and not final_sess.get("batch_id"):
@@ -4923,24 +5100,36 @@ def stop_registration_session(session_id: str) -> dict[str, Any]:
         }
     with _lock:
         cur = _sessions.get(sid) or dict(sess)
+        # Re-check under lock: worker may have finished (imported/error) while we loaded.
+        st_now = str(cur.get("status") or "").lower()
+        if st_now in _TERMINAL_STATUSES:
+            _sessions[sid] = cur
+            out = _compact_session(cur)
+            return {
+                **out,
+                "ok": True,
+                "id": sid,
+                "status": st_now,
+                "already_terminal": True,
+                "message": cur.get("message") or st_now,
+            }
         cur["cancel_requested"] = True
+        # Do not demote a success that raced in; only mark stopping for live work.
         cur["status"] = "stopping"
         cur["message"] = "stop requested; waiting for worker to exit"
         cur["updated_at"] = _now()
+        # Signal cooperative waiters immediately (mail poll / admission wait).
+        # Keep _cancel_event for later waiters; dispose only closes I/O handles.
+        ev = cur.get("_cancel_event")
+        if ev is not None:
+            try:
+                if hasattr(ev, "set"):
+                    ev.set()
+            except Exception:
+                pass
         # Best-effort immediate release of process-local handles so Camoufox /
         # mailbox sockets do not linger until the worker next hits update().
-        for k in ("_receiver", "_client", "_oauth_client"):
-            obj = cur.pop(k, None)
-            if obj is None:
-                continue
-            for meth in ("close", "stop", "shutdown", "cancel"):
-                fn = getattr(obj, meth, None)
-                if callable(fn):
-                    try:
-                        fn()
-                    except Exception:
-                        pass
-                    break
+        _dispose_reg_handles(cur)
         try:
             _append_session_log(cur, "stopping", "stop requested")
         except Exception:
