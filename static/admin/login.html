@@ -112,61 +112,83 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.cc8af45fd7.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.3f38a8fa48.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 </head>
 <body class="g2a-body g2a-login-body">
   <div id="toast" class="g2a-message"></div>
-  <div style="position:fixed;top:16px;right:16px;z-index:30"><button type="button" class="g2a-theme-toggle" data-theme-toggle aria-label="切换主题"><span class="ico">☀️</span><span class="label">白天</span></button></div>
-
-  <div id="boot-view" class="g2a-login-screen">
-    <div class="g2a-login-panel g2a-card">
-      <div class="g2a-login-brand">
-        <div class="g2a-logo g2a-logo-lg">G</div>
-        <div>
-          <div class="g2a-brand-title">grokcli-2api</div>
-          <div class="g2a-brand-sub">OpenAI · Anthropic 兼容网关</div>
-        </div>
-      </div>
-      <div class="g2a-login-status">
-        <span class="g2a-spinner" aria-hidden="true"></span>
-        <div>
-          <h1 id="boot-desc" class="g2a-login-title">正在连接服务…</h1>
-          <p id="boot-hint" class="g2a-muted">检测鉴权与数据库连接状态</p>
-        </div>
-      </div>
-      <div id="boot-conn" class="g2a-conn-list" style="margin-top:16px"></div>
-    </div>
+  <div class="g2a-login-theme-wrap">
+    <button type="button" class="g2a-theme-toggle" data-theme-toggle aria-label="切换主题"><span class="ico">☀️</span><span class="label">白天</span></button>
   </div>
 
-  <div id="auth-view" class="g2a-login-screen hidden">
-    <div class="g2a-login-panel g2a-card">
-      <div class="g2a-login-brand">
-        <div class="g2a-logo g2a-logo-lg">G</div>
-        <div>
-          <div class="g2a-brand-title">grokcli-2api</div>
-          <div class="g2a-brand-sub">管理台鉴权入口</div>
+  <div class="g2a-login-shell">
+    <aside class="g2a-login-hero" aria-hidden="true">
+      <div class="g2a-login-hero-glow"></div>
+      <div class="g2a-login-hero-grid"></div>
+      <div class="g2a-login-hero-inner">
+        <div class="g2a-page-kicker">SIGNAL · CONSOLE</div>
+        <h2 class="g2a-login-hero-title">账号池与兼容网关的<br/>运维入口</h2>
+        <p class="g2a-login-hero-copy">OpenAI / Anthropic 兼容 · 多账号轮询 · 协议注册 · Token 续期</p>
+        <ul class="g2a-login-hero-points">
+          <li><span class="dot"></span>会话 Token 鉴权，循环安全退出</li>
+          <li><span class="dot"></span>池健康、额度、任务进度实时可见</li>
+          <li><span class="dot"></span>本地过盾与云端验证码可切换</li>
+        </ul>
+      </div>
+    </aside>
+
+    <div class="g2a-login-main">
+      <div id="boot-view" class="g2a-login-screen g2a-login-screen-embed">
+        <div class="g2a-login-panel g2a-card">
+          <div class="g2a-login-brand">
+            <div class="g2a-logo g2a-logo-lg">G</div>
+            <div>
+              <div class="g2a-brand-title">grokcli-2api</div>
+              <div class="g2a-brand-sub">OpenAI · Anthropic 兼容网关</div>
+            </div>
+          </div>
+          <div class="g2a-login-status">
+            <span class="g2a-spinner" aria-hidden="true"></span>
+            <div>
+              <h1 id="boot-desc" class="g2a-login-title">正在连接服务…</h1>
+              <p id="boot-hint" class="g2a-muted">检测鉴权与数据库连接状态</p>
+            </div>
+          </div>
+          <div id="boot-conn" class="g2a-conn-list" style="margin-top:16px"></div>
         </div>
       </div>
 
-      <h1 id="auth-title" class="g2a-login-title">登录管理台</h1>
-      <p id="auth-desc" class="g2a-muted g2a-login-desc">使用管理员密码进入（会话 Token 鉴权）</p>
+      <div id="auth-view" class="g2a-login-screen g2a-login-screen-embed hidden">
+        <div class="g2a-login-panel g2a-card">
+          <div class="g2a-login-brand">
+            <div class="g2a-logo g2a-logo-lg">G</div>
+            <div>
+              <div class="g2a-brand-title">grokcli-2api</div>
+              <div class="g2a-brand-sub">管理台鉴权入口</div>
+            </div>
+          </div>
 
-      <div id="auth-conn" class="g2a-conn-list" style="margin-bottom:16px"></div>
+          <div class="g2a-page-kicker" style="margin-top:4px">ACCESS</div>
+          <h1 id="auth-title" class="g2a-login-title">登录管理台</h1>
+          <p id="auth-desc" class="g2a-muted g2a-login-desc">使用管理员密码进入（会话 Token 鉴权）</p>
 
-      <form id="auth-form" class="g2a-login-form" autocomplete="on">
-        <label class="g2a-label" for="auth-password">管理员密码</label>
-        <input id="auth-password" name="password" type="password" class="g2a-input g2a-input-lg"
-               placeholder="请输入管理员密码" autocomplete="current-password" required minlength="4" />
-        <div id="auth-error" class="g2a-form-error hidden"></div>
-        <button class="g2a-btn g2a-btn-primary g2a-btn-lg g2a-btn-block" id="auth-submit" type="submit">
-          登录并连接数据
-        </button>
-      </form>
+          <div id="auth-conn" class="g2a-conn-list" style="margin-bottom:16px"></div>
 
-      <div class="g2a-login-foot">
-        <button type="button" class="g2a-link-btn" id="auth-refresh">重新检测连接</button>
-        <a class="g2a-link-btn" href="/health" target="_blank" rel="noopener">/health</a>
+          <form id="auth-form" class="g2a-login-form" autocomplete="on">
+            <label class="g2a-label" for="auth-password">管理员密码</label>
+            <input id="auth-password" name="password" type="password" class="g2a-input g2a-input-lg"
+                   placeholder="请输入管理员密码" autocomplete="current-password" required minlength="4" />
+            <div id="auth-error" class="g2a-form-error hidden"></div>
+            <button class="g2a-btn g2a-btn-primary g2a-btn-lg g2a-btn-block" id="auth-submit" type="submit">
+              登录并连接数据
+            </button>
+          </form>
+
+          <div class="g2a-login-foot">
+            <button type="button" class="g2a-link-btn" id="auth-refresh">重新检测连接</button>
+            <a class="g2a-link-btn" href="/health" target="_blank" rel="noopener">/health</a>
+          </div>
+        </div>
       </div>
     </div>
   </div>
