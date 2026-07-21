@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.f29e01a1a2.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.4c2fc8dc2b.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -147,29 +147,38 @@
 <section class="g2a-card">
   <div class="g2a-card-head">
     <div>
+      <div class="g2a-section-kicker">INTEGRATION · ENDPOINT</div>
       <h3>接入信息</h3>
       <p>Base URL 与默认模型（优先使用当前浏览器 origin）。</p>
     </div>
   </div>
-  <div class="g2a-kv"><span>OpenAI Base</span><code id="guide-base" class="g2a-code-inline">—</code></div>
-  <div class="g2a-kv"><span>默认模型</span><code id="guide-model" class="g2a-code-inline">—</code></div>
+  <div class="g2a-info-tiles">
+    <div class="g2a-info-tile">
+      <span class="k">OpenAI Base</span>
+      <code id="guide-base" class="g2a-code-inline">—</code>
+    </div>
+    <div class="g2a-info-tile">
+      <span class="k">默认模型</span>
+      <code id="guide-model" class="g2a-code-inline">—</code>
+    </div>
+  </div>
 </section>
 
-<section class="g2a-card">
-  <div class="g2a-card-head"><div><h3>cURL</h3><p>快速测通。</p></div></div>
-  <pre id="guide-curl" class="g2a-code">—</pre>
+<section class="g2a-card g2a-guide-snippet">
+  <div class="g2a-card-head"><div><div class="g2a-section-kicker">SNIPPET</div><h3>cURL</h3><p>快速测通。</p></div></div>
+  <pre id="guide-curl" class="g2a-code g2a-code-tall">—</pre>
 </section>
-<section class="g2a-card">
-  <div class="g2a-card-head"><div><h3>OpenAI Python</h3></div></div>
-  <pre id="guide-py" class="g2a-code">—</pre>
+<section class="g2a-card g2a-guide-snippet">
+  <div class="g2a-card-head"><div><div class="g2a-section-kicker">SNIPPET</div><h3>OpenAI Python</h3></div></div>
+  <pre id="guide-py" class="g2a-code g2a-code-tall">—</pre>
 </section>
-<section class="g2a-card">
-  <div class="g2a-card-head"><div><h3>Anthropic Python</h3></div></div>
-  <pre id="guide-anthropic" class="g2a-code">—</pre>
+<section class="g2a-card g2a-guide-snippet">
+  <div class="g2a-card-head"><div><div class="g2a-section-kicker">SNIPPET</div><h3>Anthropic Python</h3></div></div>
+  <pre id="guide-anthropic" class="g2a-code g2a-code-tall">—</pre>
 </section>
-<section class="g2a-card">
-  <div class="g2a-card-head"><div><h3>Linux 部署提示</h3></div></div>
-  <pre id="guide-linux" class="g2a-code">—</pre>
+<section class="g2a-card g2a-guide-snippet">
+  <div class="g2a-card-head"><div><div class="g2a-section-kicker">DEPLOY</div><h3>Linux 部署提示</h3></div></div>
+  <pre id="guide-linux" class="g2a-code g2a-code-tall">—</pre>
 </section>
 
       </div>

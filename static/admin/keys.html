@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.f29e01a1a2.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.4c2fc8dc2b.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -145,43 +145,47 @@
       <div class="g2a-content">
 
 <section class="g2a-card">
-  <div class="g2a-card-head">
+  <div class="g2a-card-head g2a-card-head-inline">
     <div>
+      <div class="g2a-section-kicker">ACCESS · ISSUE</div>
       <h3>创建 API Key</h3>
       <p>生成客户端密钥（sk-g2a-…），哈希存储，仅创建时完整显示一次。</p>
     </div>
   </div>
-  <div class="g2a-form-row">
+  <div class="g2a-form-row g2a-filter-bar">
     <div class="g2a-field">
       <label for="key-name">名称</label>
-      <input id="key-name" placeholder="例如 Cherry Studio" />
+      <input id="key-name" class="g2a-input" placeholder="例如 Cherry Studio" />
     </div>
     <div class="g2a-field">
       <label for="key-note">备注</label>
-      <input id="key-note" placeholder="可选" />
+      <input id="key-note" class="g2a-input" placeholder="可选" />
     </div>
     <div class="g2a-field g2a-field-action">
-      <label>&nbsp;</label>
-      <button class="g2a-btn g2a-btn-primary" id="btn-create-key">新建 Key</button>
+      <label class="g2a-sr-only" for="btn-create-key">操作</label>
+      <button class="g2a-btn g2a-btn-primary" id="btn-create-key" type="button">新建 Key</button>
     </div>
   </div>
-  <div id="new-key-box" class="g2a-alert g2a-alert-success hidden" style="margin-top:12px">
-    <div class="g2a-muted" style="margin-bottom:6px">请立即复制保存，关闭后无法再查看完整密钥：</div>
-    <code id="new-key-value" class="g2a-code-inline"></code>
-    <div class="g2a-actions" style="margin-top:10px">
-      <button class="g2a-btn g2a-btn-primary" id="copy-key">复制</button>
-      <button class="g2a-btn g2a-btn-default" id="dismiss-key">关闭</button>
+  <div id="new-key-box" class="g2a-alert g2a-alert-success g2a-key-issued hidden" style="margin-top:14px">
+    <div class="g2a-muted" style="margin-bottom:8px">请立即复制保存，关闭后无法再查看完整密钥：</div>
+    <code id="new-key-value" class="g2a-code-inline g2a-key-value"></code>
+    <div class="g2a-actions" style="margin-top:12px">
+      <button class="g2a-btn g2a-btn-primary" id="copy-key" type="button">复制</button>
+      <button class="g2a-btn g2a-btn-default" id="dismiss-key" type="button">关闭</button>
     </div>
   </div>
 </section>
 
 <section class="g2a-card">
-  <div class="g2a-card-head">
+  <div class="g2a-card-head g2a-card-head-inline">
     <div>
+      <div class="g2a-section-kicker">INVENTORY</div>
       <h3>密钥列表</h3>
       <p>启用 / 停用 / 删除。停用后客户端将立即 401。</p>
     </div>
-    <button class="g2a-btn g2a-btn-default" id="btn-refresh-all">刷新</button>
+    <div class="g2a-actions g2a-card-actions">
+      <button class="g2a-btn g2a-btn-default" id="btn-refresh-all" type="button">刷新</button>
+    </div>
   </div>
   <div class="g2a-table-wrap">
     <table class="g2a-table">

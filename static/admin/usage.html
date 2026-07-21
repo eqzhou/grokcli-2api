@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.f29e01a1a2.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.4c2fc8dc2b.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -145,13 +145,14 @@
       <div class="g2a-content">
 
 <section class="g2a-card">
-  <div class="g2a-card-head">
+  <div class="g2a-card-head g2a-card-head-inline">
     <div>
+      <div class="g2a-section-kicker">TELEMETRY · SUMMARY</div>
       <h3>用量概览</h3>
       <p>代理侧统计：成功请求的<strong>计费 token = total − cache_read</strong>（已扣缓存命中）；失败只计请求数。累计数字带 k/M/B 单位。缓存命中率 = cache_read / prompt。</p>
     </div>
-    <div class="g2a-actions">
-      <div class="g2a-field" style="min-width:120px;margin:0">
+    <div class="g2a-actions g2a-card-actions">
+      <div class="g2a-field g2a-field-sm" style="margin:0">
         <label for="usage-days">窗口</label>
         <select id="usage-days" class="g2a-input">
           <option value="1">今日</option>
@@ -160,27 +161,29 @@
           <option value="30">近 30 天</option>
         </select>
       </div>
-      <button class="g2a-btn g2a-btn-primary" id="btn-usage-reload" style="align-self:end">刷新</button>
+      <button class="g2a-btn g2a-btn-primary" id="btn-usage-reload" type="button">刷新</button>
     </div>
   </div>
   <div id="usage-stats-grid" class="g2a-stat-grid"></div>
-  <div id="usage-source" class="g2a-muted" style="margin-top:8px">—</div>
+  <div id="usage-source" class="g2a-muted g2a-meta-line">—</div>
 </section>
 
 <section class="g2a-card">
   <div class="g2a-card-head">
     <div>
+      <div class="g2a-section-kicker">SERIES</div>
       <h3>按日趋势</h3>
       <p>每日<strong>计费</strong> tokens（柱高，已扣缓存）与请求数。</p>
     </div>
   </div>
-  <div id="usage-series" class="g2a-usage-bars" style="min-height:120px">—</div>
+  <div id="usage-series" class="g2a-usage-bars" style="min-height:168px">—</div>
 </section>
 
 <div class="g2a-grid-2">
   <section class="g2a-card">
     <div class="g2a-card-head">
       <div>
+        <div class="g2a-section-kicker">BY KEY</div>
         <h3>按 API Key</h3>
         <p>窗口内 Token 消耗 Top。</p>
       </div>
@@ -202,6 +205,7 @@
   <section class="g2a-card">
     <div class="g2a-card-head">
       <div>
+        <div class="g2a-section-kicker">BY MODEL</div>
         <h3>按模型</h3>
         <p>窗口内模型消耗 Top。</p>
       </div>
@@ -223,13 +227,14 @@
 </div>
 
 <section class="g2a-card">
-  <div class="g2a-card-head">
+  <div class="g2a-card-head g2a-card-head-inline">
     <div>
+      <div class="g2a-section-kicker">EVENTS</div>
       <h3>使用明细</h3>
       <p>每条 API 请求的 Token 明细、流式/非流式、首字/完成耗时、调用的 API Key、客户端 IP 与缓存命中（prompt cache）。</p>
     </div>
-    <div class="g2a-actions">
-      <button class="g2a-btn g2a-btn-default" id="btn-usage-events-reload">刷新明细</button>
+    <div class="g2a-actions g2a-card-actions">
+      <button class="g2a-btn g2a-btn-default" id="btn-usage-events-reload" type="button">刷新明细</button>
     </div>
   </div>
   <div class="g2a-form-row" style="gap:10px;flex-wrap:wrap;margin-bottom:12px">

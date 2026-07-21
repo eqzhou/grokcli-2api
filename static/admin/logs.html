@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.f29e01a1a2.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.4c2fc8dc2b.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -145,27 +145,28 @@
       <div class="g2a-content">
 
 <section class="g2a-card">
-  <div class="g2a-card-head">
+  <div class="g2a-card-head g2a-card-head-inline">
     <div>
+      <div class="g2a-section-kicker">OPS · TASKS</div>
       <h3>任务日志</h3>
       <p>后台 / 长任务结果（协议注册、SSO 导入、测活、Token 续期等），保存在 PostgreSQL，可按类型 / 状态 / 关键词查询。</p>
     </div>
-    <div class="g2a-actions">
-      <button class="g2a-btn g2a-btn-default" id="btn-logs-reload">刷新</button>
+    <div class="g2a-actions g2a-card-actions">
+      <button class="g2a-btn g2a-btn-default" id="btn-logs-reload" type="button">刷新</button>
     </div>
   </div>
-  <div class="g2a-form-row" style="gap:10px;flex-wrap:wrap;margin-bottom:12px">
-    <div class="g2a-field" style="min-width:220px;flex:1">
+  <div class="g2a-form-row g2a-filter-bar">
+    <div class="g2a-field g2a-field-grow">
       <label for="logs-q">关键词</label>
       <input id="logs-q" class="g2a-input" placeholder="类型 / 状态 / 摘要 / 任务 ID" />
     </div>
-    <div class="g2a-field" style="min-width:160px">
+    <div class="g2a-field g2a-field-sm">
       <label for="logs-action">类型</label>
       <select id="logs-action" class="g2a-input">
         <option value="all">全部</option>
       </select>
     </div>
-    <div class="g2a-field" style="min-width:140px">
+    <div class="g2a-field g2a-field-sm">
       <label for="logs-status">状态</label>
       <select id="logs-status" class="g2a-input">
         <option value="all">全部</option>
@@ -176,7 +177,7 @@
         <option value="running">running</option>
       </select>
     </div>
-    <div class="g2a-field" style="min-width:120px">
+    <div class="g2a-field g2a-field-sm">
       <label for="logs-page-size">每页</label>
       <select id="logs-page-size" class="g2a-input">
         <option value="20">20</option>
@@ -184,11 +185,12 @@
         <option value="100">100</option>
       </select>
     </div>
-    <div class="g2a-field" style="align-self:end">
-      <button class="g2a-btn g2a-btn-primary" id="btn-logs-search">查询</button>
+    <div class="g2a-field g2a-field-action">
+      <label class="g2a-sr-only" for="btn-logs-search">查询</label>
+      <button class="g2a-btn g2a-btn-primary" id="btn-logs-search" type="button">查询</button>
     </div>
   </div>
-  <div id="logs-info" class="g2a-muted" style="margin-bottom:8px">—</div>
+  <div id="logs-info" class="g2a-muted g2a-meta-line">—</div>
   <div class="g2a-table-wrap">
     <table class="g2a-table">
       <thead>
@@ -204,14 +206,14 @@
       <tbody id="logs-tbody"></tbody>
     </table>
   </div>
-  <div class="g2a-actions" style="justify-content:space-between;margin-top:12px">
+  <div class="g2a-pager g2a-pager-footer">
     <div id="logs-page-info" class="g2a-muted">—</div>
     <div class="g2a-actions">
-      <button class="g2a-btn g2a-btn-default" id="logs-page-prev">上一页</button>
-      <button class="g2a-btn g2a-btn-default" id="logs-page-next">下一页</button>
+      <button class="g2a-btn g2a-btn-default" id="logs-page-prev" type="button">上一页</button>
+      <button class="g2a-btn g2a-btn-default" id="logs-page-next" type="button">下一页</button>
     </div>
   </div>
-  <pre id="logs-detail" class="g2a-log is-empty hidden" style="margin-top:12px" hidden>—</pre>
+  <pre id="logs-detail" class="g2a-log g2a-detail-panel is-empty hidden" hidden>—</pre>
 </section>
 
       </div>

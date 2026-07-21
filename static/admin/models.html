@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.f29e01a1a2.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.4c2fc8dc2b.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -145,55 +145,57 @@
       <div class="g2a-content">
 
 <section class="g2a-card" id="upstream-monitor-card">
-  <div class="g2a-card-head">
+  <div class="g2a-card-head g2a-card-head-inline">
     <div>
+      <div class="g2a-section-kicker">SIGNAL · UPSTREAM</div>
       <h3>上游实时监控</h3>
       <p id="upstream-monitor-sub">探测 cli-chat-proxy 可达性、延迟与 /models 响应（在本页自动刷新）。</p>
     </div>
-    <div class="g2a-actions" style="flex-wrap:wrap;gap:8px;align-items:center">
+    <div class="g2a-actions g2a-card-actions">
       <span id="upstream-status-pill" class="g2a-tag">—</span>
-      <label class="g2a-check" title="离开本页会自动停止">
+      <label class="g2a-check g2a-check-chip" title="离开本页会自动停止">
         <input type="checkbox" id="chk-upstream-live" checked /> 实时监控
       </label>
       <button type="button" class="g2a-btn g2a-btn-default" id="btn-upstream-probe" title="立即探测（绕过缓存）">立即探测</button>
     </div>
   </div>
-  <div id="upstream-stat-grid" class="g2a-stat-grid" style="margin-bottom:8px">
-    <div class="stat"><div class="label">状态</div><div class="value" id="upstream-stat-state">—</div>
+  <div id="upstream-stat-grid" class="g2a-stat-grid" style="margin-bottom:10px">
+    <div class="stat g2a-stat-card"><div class="g2a-stat-top"><span class="label">状态</span><span class="g2a-stat-chip">state</span></div><div class="value" id="upstream-stat-state">—</div>
       <div class="sub" id="upstream-stat-error">等待探测…</div></div>
-    <div class="stat"><div class="label">延迟</div><div class="value mono" id="upstream-stat-latency">—</div>
+    <div class="stat g2a-stat-card"><div class="g2a-stat-top"><span class="label">延迟</span><span class="g2a-stat-chip">latency</span></div><div class="value mono g2a-stat-hero" id="upstream-stat-latency">—</div>
       <div class="sub" id="upstream-stat-dial">拨号 —</div></div>
-    <div class="stat"><div class="label">HTTP</div><div class="value mono" id="upstream-stat-http">—</div>
+    <div class="stat g2a-stat-card"><div class="g2a-stat-top"><span class="label">HTTP</span><span class="g2a-stat-chip">http</span></div><div class="value mono" id="upstream-stat-http">—</div>
       <div class="sub" id="upstream-stat-models">模型数 —</div></div>
-    <div class="stat"><div class="label">上游地址</div><div class="value mono" id="upstream-stat-base" style="font-size:0.85rem;word-break:break-all">—</div>
+    <div class="stat g2a-stat-card"><div class="g2a-stat-top"><span class="label">上游地址</span><span class="g2a-stat-chip">base</span></div><div class="value mono g2a-stat-value-sm" id="upstream-stat-base">—</div>
       <div class="sub" id="upstream-stat-via">鉴权 —</div></div>
   </div>
-  <div class="g2a-muted" style="line-height:1.6;font-size:0.85rem">
+  <div class="g2a-meta-line g2a-muted">
     <span id="upstream-stat-checked">上次探测：—</span>
-    <span id="upstream-stat-cache" style="margin-left:12px"></span>
-    <span id="upstream-live-hint" style="margin-left:12px">轮询间隔 8s</span>
+    <span id="upstream-stat-cache"></span>
+    <span id="upstream-live-hint">轮询间隔 8s</span>
   </div>
 </section>
 
 <section class="g2a-card">
-  <div class="g2a-card-head">
+  <div class="g2a-card-head g2a-card-head-inline">
     <div>
+      <div class="g2a-section-kicker">CATALOG</div>
       <h3>模型列表</h3>
       <p id="models-card-sub">从数据库读取模型目录；点「同步上游」拉取并写入库。自动健康探测请在「系统设置」中配置。</p>
     </div>
-    <div class="g2a-actions" style="flex-wrap:wrap;gap:8px">
+    <div class="g2a-actions g2a-card-actions">
       <button type="button" class="g2a-btn g2a-btn-default" id="btn-models-reload">刷新</button>
       <button type="button" class="g2a-btn g2a-btn-default" id="btn-probe-all-models">全部账号探测</button>
       <button type="button" class="g2a-btn g2a-btn-primary" id="btn-sync-models" title="从上游获取并写入数据库">同步上游</button>
     </div>
   </div>
 
-  <div class="g2a-form-row" style="gap:10px;flex-wrap:wrap;margin-bottom:12px;align-items:end">
-    <div class="g2a-field" style="min-width:220px;flex:1">
+  <div class="g2a-form-row g2a-filter-bar">
+    <div class="g2a-field g2a-field-grow">
       <label for="models-q">搜索</label>
       <input id="models-q" class="g2a-input" placeholder="模型 ID / 名称" autocomplete="off" />
     </div>
-    <div class="g2a-field" style="min-width:140px">
+    <div class="g2a-field g2a-field-sm">
       <label for="models-filter-reason">Reasoning</label>
       <select id="models-filter-reason" class="g2a-input">
         <option value="all">全部</option>
@@ -201,12 +203,12 @@
         <option value="no">不支持 / 未知</option>
       </select>
     </div>
-    <div class="g2a-field" style="align-self:end">
-      <span id="models-count" class="g2a-muted">—</span>
+    <div class="g2a-field g2a-field-action" style="align-self:end">
+      <span id="models-count" class="g2a-muted g2a-count-pill">—</span>
     </div>
   </div>
 
-  <div id="model-health-info" class="g2a-muted" style="margin-bottom:12px;line-height:1.6">—</div>
+  <div id="model-health-info" class="g2a-muted g2a-meta-line">—</div>
 
   <div class="g2a-table-wrap">
     <table class="g2a-table">
@@ -222,7 +224,7 @@
       <tbody id="models-tbody"></tbody>
     </table>
   </div>
-  <pre id="probe-result" class="g2a-log is-empty hidden" style="margin-top:12px" hidden>—</pre>
+  <pre id="probe-result" class="g2a-log g2a-detail-panel is-empty hidden" hidden>—</pre>
 </section>
 
       </div>
