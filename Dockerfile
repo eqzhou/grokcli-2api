@@ -1,5 +1,5 @@
 # grokcli-2api — single container with optional inline Turnstile Solver
-FROM golang:1.24-bookworm AS go-builder
+FROM golang:1.26.5-bookworm AS go-builder
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -55,9 +55,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # App tools + browser runtime libs for inline Turnstile Solver (Camoufox/Firefox)
-# Static docker CLI for in-container hot-update (needs docker.sock mount at runtime).
-ARG DOCKER_CLI_VERSION=27.5.1
-ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -91,18 +88,6 @@ RUN apt-get update \
         xvfb \
     && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo Asia/Shanghai > /etc/timezone \
-    && arch="${TARGETARCH:-$(dpkg --print-architecture)}" \
-    && case "$arch" in \
-         amd64|x86_64) darch=x86_64 ;; \
-         arm64|aarch64) darch=aarch64 ;; \
-         *) darch=x86_64 ;; \
-       esac \
-    && curl -fsSL "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz" \
-         | tar -xz -C /tmp \
-    && mv /tmp/docker/docker /usr/local/bin/docker \
-    && chmod +x /usr/local/bin/docker \
-    && rm -rf /tmp/docker \
-    && docker --version \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt

@@ -192,7 +192,7 @@ window.G2A = window.G2A || {};
     const setup = !!st.setup_needed;
     if ($("auth-title")) $("auth-title").textContent = setup ? "初始化管理密码" : "登录管理台";
     if ($("auth-desc")) $("auth-desc").textContent = setup
-      ? "首次使用，请设置管理员密码（至少 4 位）。登录后将连接 PostgreSQL / Redis 账号数据。"
+      ? "首次使用，请设置管理员密码（至少 12 位）。登录后将连接 PostgreSQL / Redis 账号数据。"
       : "使用管理员密码进入。登录成功后通过 Token 鉴权读取数据库中的账号池。";
     if ($("auth-submit")) $("auth-submit").textContent = setup ? "创建并进入" : "登录并连接数据";
     const next = safeNext(new URLSearchParams(location.search).get("next"));
@@ -224,19 +224,21 @@ window.G2A = window.G2A || {};
       ev?.preventDefault?.();
       if (errBox) { errBox.classList.add("hidden"); errBox.textContent = ""; }
       const password = (pass && pass.value) || "";
-      if (!password || password.length < 4) {
-        G2A.toast("密码至少 4 位", false);
-        if (errBox) { errBox.textContent = "密码至少 4 位"; errBox.classList.remove("hidden"); }
+      const passwordChars = Array.from(password).length;
+      const passwordBytes = new TextEncoder().encode(password).length;
+      if (!password || passwordChars < 12 || passwordBytes > 256) {
+		G2A.toast("密码至少 12 位", false);
+		if (errBox) { errBox.textContent = passwordBytes > 256 ? "密码不能超过 256 字节" : "密码至少 12 位"; errBox.classList.remove("hidden"); }
         return;
       }
       G2A.setBusy(submit, true, "连接中…");
       try {
         if (setup) {
           const r = await G2A.api("/setup", { method: "POST", body: JSON.stringify({ password }) });
-          if (r.token) G2A.setToken(r.token);
+          if (typeof G2A.markAuthOk === "function") G2A.markAuthOk();
         } else {
           const r = await G2A.api("/login", { method: "POST", body: JSON.stringify({ password }) });
-          if (r.token) G2A.setToken(r.token);
+          if (typeof G2A.markAuthOk === "function") G2A.markAuthOk();
         }
         if (typeof G2A.markAuthOk === "function") G2A.markAuthOk();
         // Optional warm-up; failure should not force re-login within grace.

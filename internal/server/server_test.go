@@ -183,6 +183,15 @@ func TestAdminReadRoutesRequireFlagReadinessAndSession(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("public admin status = %d body=%q", recorder.Code, recorder.Body.String())
 	}
+	var publicStatus map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &publicStatus); err != nil {
+		t.Fatal(err)
+	}
+	for _, sensitive := range []string{"accounts", "pool", "keys", "store", "upstream", "redis", "leader"} {
+		if _, exists := publicStatus[sensitive]; exists {
+			t.Fatalf("public status leaks %q: %#v", sensitive, publicStatus)
+		}
+	}
 
 	recorder = httptest.NewRecorder()
 	NewMux(Options{Ready: func() bool { return true }, AdminReadEnabled: true, AdminSessions: fakeAdminSessions{ok: false}}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/api/dashboard", nil))
@@ -1882,7 +1891,6 @@ func TestStreamOpenAIResponsesTextSoftShortWriteNotTruncated(t *testing.T) {
 		t.Fatal("missing response.completed")
 	}
 }
-
 
 func TestEnsureOpenAIChatPromptCacheKeyStable(t *testing.T) {
 	// Turn 1: no explicit pck → mint from first user seed.

@@ -248,7 +248,7 @@ func main() {
 		Addr:              cfg.Address(),
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       0,                 // 不设置 ReadTimeout，避免影响流式响应
+		ReadTimeout:       60 * time.Second,  // cap slow request bodies; does not limit streamed responses
 		WriteTimeout:      0,                 // 不设置 WriteTimeout，流式响应需要持续写入
 		IdleTimeout:       120 * time.Second, // 增加空闲超时，支持长连接
 		MaxHeaderBytes:    1 << 20,           // 1MB header limit

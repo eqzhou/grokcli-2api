@@ -41,6 +41,8 @@ window.G2A = window.G2A || {};
   let regPollIntervalMs = 180;
   let regPollLiveCursor = 0;
   let regPollLastDurationMs = 0;
+  let regPollUnchangedTicks = 0;
+  let regPollLastFingerprint = "";
   // Hard abort per admin→Go request. Keep under Go→sidecar budget so ticks stay snappy.
   // Shared Go client timeout is ~750ms; browser abort slightly above that.
   const REG_POLL_TIMEOUT_MS = 900;
@@ -5329,11 +5331,11 @@ function renderGuide() {
   $("guide-base").textContent = base;
   $("guide-model").textContent = model;
   $("guide-curl").textContent = `curl ${base}/chat/completions \\
-  -H "Authorization: Bearer sk-g2a-YOUR_KEY" \\
+  -H "Authorization: Bearer YOUR_G2A_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{"model":"${model}","messages":[{"role":"user","content":"你好"}],"stream":false}'`;
   $("guide-py").textContent = `from openai import OpenAI
-client = OpenAI(base_url="${base}", api_key="sk-g2a-YOUR_KEY")
+client = OpenAI(base_url="${base}", api_key=os.environ["G2A_API_KEY"])
 r = client.chat.completions.create(
     model="${model}",
     messages=[{"role": "user", "content": "Hello"}],
@@ -5364,14 +5366,14 @@ print(r.choices[0].message.tool_calls or r.choices[0].message.content)`;
     $("guide-anthropic").textContent = `# Anthropic Messages API
 # Base URL 填网关根地址（或带 /v1）；鉴权用 x-api-key
 curl ${origin}/v1/messages \\
-  -H "x-api-key: sk-g2a-YOUR_KEY" \\
+  -H "x-api-key: YOUR_G2A_API_KEY" \\
   -H "anthropic-version: 2023-06-01" \\
   -H "Content-Type: application/json" \\
   -d '{"model":"${model}","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
 
 # Python anthropic SDK
 from anthropic import Anthropic
-client = Anthropic(base_url="${origin}", api_key="sk-g2a-YOUR_KEY")
+client = Anthropic(base_url="${origin}", api_key=os.environ["G2A_API_KEY"])
 msg = client.messages.create(
     model="${model}",
     max_tokens=1024,
@@ -5539,14 +5541,16 @@ function markTrackedRegistrationMissing(reason) {
 }
 
 function _desiredRegPollInterval() {
-  // Adaptive: snappy when polls are fast; back off only under real load so we
-  // don't pile up concurrent ticks (regPollInFlight lock freezes the log).
+  // Adaptive: floor 500ms when healthy; back off further when status unchanged
+  // or under load so we don't thrash Redis with ~7 polls/sec.
   if (regStopping) return 400;
   const last = Number(regPollLastDurationMs) || 0;
-  if (last >= 800) return 550;
-  if (last >= 500) return 320;
-  if (last >= 250) return 200;
-  return 140; // healthy batch-only path: ~7 paints/sec
+  const stale = Number(regPollUnchangedTicks) || 0;
+  if (stale >= 4) return 2000;
+  if (stale >= 2) return 1000;
+  if (last >= 800) return 1500;
+  if (last >= 500) return 1000;
+  return 500; // healthy batch-only path
 }
 
 function _scheduleRegPollTick(ms) {
@@ -5569,6 +5573,8 @@ function _scheduleRegPollTick(ms) {
 
 function startRegPolling({ immediate = true, intervalMs = 180 } = {}) {
   regFinishedNotified = false;
+  regPollUnchangedTicks = 0;
+  regPollLastFingerprint = "";
   regPollIntervalMs = Math.max(regStopping ? 400 : 120, Number(intervalMs) || 180);
   if (immediate) {
     // First paint ASAP; subsequent ticks use adaptive schedule.
@@ -7444,6 +7450,32 @@ async function pollRegSession() {
 
     if (sessions.length <= 1 && !regBatchId) showRegSession(sessions[0] || batch, { batch });
     else showRegSessionGroup(sessions, { batch });
+    // Fingerprint for unchanged-status backoff (status + counters + last log line).
+    try {
+      const fpParts = [
+        regBatchId || "",
+        String((batch && (batch.batch_status || batch.status)) || ""),
+        String((batch && batch.imported) || 0),
+        String((batch && batch.error) || 0),
+        String((batch && batch.running) || 0),
+        String((batch && batch.done) || 0),
+        String((batch && batch.updated_at) || ""),
+      ];
+      for (const s of (sessions || []).slice(0, 8)) {
+        fpParts.push(regSessionKey(s) || "");
+        fpParts.push(regStatusOf(s) || "");
+        const logs = Array.isArray(s && s.log_lines) ? s.log_lines : [];
+        fpParts.push(logs.length ? String(logs[logs.length - 1] || "") : String((s && s.message) || ""));
+      }
+      const fp = fpParts.join("|");
+      if (fp && fp === regPollLastFingerprint) regPollUnchangedTicks = (Number(regPollUnchangedTicks) || 0) + 1;
+      else {
+        regPollUnchangedTicks = 0;
+        regPollLastFingerprint = fp;
+      }
+    } catch (_) {
+      regPollUnchangedTicks = 0;
+    }
     // Keep browser track in sync as late-spawned sessions appear.
     saveRegTrack();
 
@@ -7500,10 +7532,21 @@ async function pollRegSession() {
     // Skip while stopping — no need to thrash the card with new probe lines mid-stop.
     const importedIds = collectImportedAccountIds(sessions);
     const needProbe = importedIds.filter((id) => !regProbedIds.has(id));
+    // Backend may schedule probe async (probe.pending) after import; that still
+    // counts as backend-owned so we must not fire a duplicate client-side probe.
+    const backendProbePending = sessions.some(
+      (s) => s && s.probe && s.probe.pending
+    );
     const backendProbed = sessions.some(
       (s) => s && s.probe && (s.probe.count > 0 || (Array.isArray(s.probe.results) && s.probe.results.length))
     );
-    if (!regStopping && needProbe.length && !backendProbed && !regProbeRunning) {
+    if (
+      !regStopping &&
+      needProbe.length &&
+      !backendProbed &&
+      !backendProbePending &&
+      !regProbeRunning
+    ) {
       // Fire and continue polling; probe results append to log.
       // New registrations: wait probe_delay_sec before first health probe.
       probeImportedAccounts(needProbe, {
@@ -7689,8 +7732,9 @@ on("auth-submit", "onclick", async () => {  const password = $("password").value
     const data = setup
       ? await api("/setup", { method: "POST", body: JSON.stringify({ password }) })
       : await api("/login", { method: "POST", body: JSON.stringify({ password }) });
-    token = data.token;
-    localStorage.setItem(TOKEN_KEY, token);
+    token = "";
+    localStorage.removeItem(TOKEN_KEY);
+    if (window.G2A && G2A.markAuthOk) G2A.markAuthOk();
     if ($("password")) $("password").value = "";
     statusCache = await api("/status");
     await loadDashboard();
@@ -10036,7 +10080,8 @@ async function changeAdminPassword() {
   const nw = ($("set-new-password") && $("set-new-password").value) || "";
   const cf = ($("set-confirm-password") && $("set-confirm-password").value) || "";
   if (!cur) throw new Error("请输入当前密码（不会自动填入，需手动输入）");
-  if (!nw || nw.length < 4) throw new Error("新密码至少 4 位");
+  if (!nw || Array.from(nw).length < 12) throw new Error("新密码至少 12 位");
+  if (new TextEncoder().encode(nw).length > 256) throw new Error("新密码不能超过 256 字节");
   if (nw !== cf) throw new Error("两次输入的新密码不一致");
   if (cur === nw) throw new Error("新密码不能与当前密码相同");
   const btn = $("btn-change-password");

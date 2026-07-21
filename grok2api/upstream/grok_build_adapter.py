@@ -20,6 +20,7 @@ import json
 import os
 import secrets
 import sys
+import queue
 import threading
 import time
 import uuid
@@ -31,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.96-reg-mt-captcha-success"
+ADAPTER_BUILD = "v1.9.97-reg-scale-perf"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -203,6 +204,238 @@ def _release_reg_admission_once(flag: dict[str, bool]) -> None:
         return
     flag["released"] = True
     _release_reg_admission()
+
+
+# Post-import probe queue: free registration workers immediately after durable
+# import; settle delay + pool probe run on a small shared daemon pool.
+try:
+    _POST_IMPORT_PROBE_WORKERS = max(
+        1,
+        min(4, int(os.environ.get("GROK2API_REG_PROBE_WORKERS", "2") or 2)),
+    )
+except (TypeError, ValueError):
+    _POST_IMPORT_PROBE_WORKERS = 2
+_post_import_probe_q: queue.Queue | None = None
+_post_import_probe_started = False
+_post_import_probe_lock = threading.Lock()
+
+
+def _ensure_post_import_probe_workers() -> None:
+    global _post_import_probe_q, _post_import_probe_started
+    with _post_import_probe_lock:
+        if _post_import_probe_started:
+            return
+        _post_import_probe_q = queue.Queue(maxsize=5000)
+        for i in range(_POST_IMPORT_PROBE_WORKERS):
+            t = threading.Thread(
+                target=_post_import_probe_worker,
+                name=f"gba-probe-{i}",
+                daemon=True,
+            )
+            t.start()
+        _post_import_probe_started = True
+
+
+def _enqueue_post_import_probe(
+    *,
+    sid: str,
+    account_ids: list[str],
+    delay_sec: float,
+    email: str | None = None,
+) -> None:
+    """Schedule settle+probe without holding a registration worker slot."""
+    ids = [str(a).strip() for a in (account_ids or []) if str(a or "").strip()]
+    if not sid or not ids:
+        return
+    _ensure_post_import_probe_workers()
+    assert _post_import_probe_q is not None
+    job = {
+        "sid": sid,
+        "account_ids": ids,
+        "delay_sec": max(0.0, float(delay_sec or 0.0)),
+        "email": email or "",
+    }
+    try:
+        _post_import_probe_q.put_nowait(job)
+        return
+    except Exception:
+        pass
+    # Preserve probe functionality under load: brief blocking put, then one-shot.
+    try:
+        _post_import_probe_q.put(job, timeout=5.0)
+        return
+    except Exception as e:  # noqa: BLE001
+        print(f"[grok-build-auth] WARN: probe enqueue failed ({e}); running one-shot")
+    try:
+        threading.Thread(
+            target=_run_post_import_probe_job,
+            args=(job,),
+            name=f"gba-probe-oneshot-{(sid or '')[-6:]}",
+            daemon=True,
+        ).start()
+    except Exception as e2:  # noqa: BLE001
+        print(f"[grok-build-auth] WARN: probe oneshot failed: {e2}")
+
+
+def _post_import_probe_worker() -> None:
+    while True:
+        try:
+            job = _post_import_probe_q.get() if _post_import_probe_q is not None else None
+        except Exception:
+            time.sleep(0.5)
+            continue
+        if not isinstance(job, dict):
+            continue
+        try:
+            _run_post_import_probe_job(job)
+        finally:
+            try:
+                if _post_import_probe_q is not None:
+                    _post_import_probe_q.task_done()
+            except Exception:
+                pass
+
+
+def _run_post_import_probe_job(job: dict[str, Any]) -> None:
+    """Execute one settle+probe job (queue worker or oneshot fallback)."""
+    sid = str(job.get("sid") or "")
+    ids = list(job.get("account_ids") or [])
+    delay = max(0.0, float(job.get("delay_sec") or 0.0))
+    try:
+        if delay > 0:
+            # Coarse sleep; registration slot is already free.
+            deadline = time.time() + delay
+            while time.time() < deadline:
+                time.sleep(min(5.0, max(0.1, deadline - time.time())))
+        probe_summaries: list[dict[str, Any]] = []
+        try:
+            import grok2api.pool.model_health as model_health
+
+            for aid in ids:
+                try:
+                    pr = model_health.probe_single_account(
+                        aid, None, auto_disable=False, source="register"
+                    )
+                    detail = pr.get("result") if isinstance(pr, dict) else None
+                    if not isinstance(detail, dict):
+                        detail = pr if isinstance(pr, dict) else {}
+                    err_text = (
+                        detail.get("error")
+                        or detail.get("message")
+                        or (pr.get("error") if isinstance(pr, dict) else None)
+                        or ""
+                    )
+                    latency = (
+                        detail.get("latency_ms")
+                        or detail.get("elapsed_ms")
+                        or detail.get("duration_ms")
+                    )
+                    probe_summaries.append(
+                        {
+                            "account_id": aid,
+                            "ok": bool(pr.get("ok") if isinstance(pr, dict) else False),
+                            "model": detail.get("model")
+                            or (pr.get("model") if isinstance(pr, dict) else None),
+                            "error": (str(err_text)[:180] if err_text else None),
+                            "latency_ms": latency,
+                        }
+                    )
+                except Exception as pe:  # noqa: BLE001
+                    probe_summaries.append(
+                        {
+                            "account_id": aid,
+                            "ok": False,
+                            "error": str(pe)[:180],
+                        }
+                    )
+        except Exception as pe:  # noqa: BLE001
+            probe_summaries.append(
+                {
+                    "account_id": None,
+                    "ok": False,
+                    "error": f"probe module error: {pe}"[:180],
+                }
+            )
+        # Re-enable / clear cool so new accounts stay in rotation.
+        try:
+            import grok2api.pool.account_pool as account_pool
+            from grok2api.admin.settings_store import (
+                get_account_pool_meta,
+                patch_account_pool_meta,
+            )
+
+            for aid in ids:
+                try:
+                    account_pool.clear_account_cooldown(aid)
+                except Exception:
+                    pass
+                try:
+                    meta = get_account_pool_meta(aid) or {}
+                    if (
+                        isinstance(meta, dict)
+                        and meta.get("enabled") is False
+                        and not meta.get("disabled_for_quota")
+                    ):
+                        patch_account_pool_meta(
+                            aid,
+                            {
+                                "enabled": True,
+                                "pool_status": "normal",
+                                "disabled_reason": None,
+                                "disabled_source": None,
+                                "cooldown_until": None,
+                                "cooldown_count": 0,
+                            },
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        probe = {
+            "count": len(probe_summaries),
+            "ok": sum(1 for p in probe_summaries if p.get("ok")),
+            "fail": sum(1 for p in probe_summaries if not p.get("ok")),
+            "results": probe_summaries,
+            "pending": False,
+        }
+        # Best-effort session patch (session may already be terminal/imported).
+        # Redis load happens outside the global lock; mutate under lock.
+        remote = None
+        with _lock:
+            cur = _sessions.get(sid)
+        if cur is None:
+            try:
+                remote = _load_reg_sess(sid)
+            except Exception:
+                remote = None
+            cur = remote
+        mirror_copy = None
+        with _lock:
+            local = _sessions.get(sid)
+            if isinstance(local, dict):
+                cur = local
+            if isinstance(cur, dict):
+                cur = dict(cur)
+                cur["probe"] = probe
+                cur["updated_at"] = _now()
+                # Keep terminal status; only attach probe results.
+                if str(cur.get("status") or "").lower() not in _TERMINAL_STATUSES:
+                    cur["status"] = "imported"
+                msg = str(cur.get("message") or "")
+                if "probe ok=" not in msg:
+                    cur["message"] = (
+                        f"{msg}; probe ok={probe['ok']} fail={probe['fail']} "
+                        f"[{ADAPTER_BUILD}]"
+                    ).strip("; ")
+                _sessions[sid] = cur
+                mirror_copy = dict(cur)
+        if mirror_copy is not None:
+            try:
+                _mirror_reg_sess(sid, mirror_copy, force=True)
+            except Exception:
+                pass
+    except Exception as e:  # noqa: BLE001
+        print(f"[grok-build-auth] WARN: async probe failed sid={sid}: {e}")
 
 
 REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "90") or 90)
@@ -1661,13 +1894,22 @@ def _prepare_registration_session(
         # Keep receiver process-local only (not mirrored to Redis).
         "_receiver": receiver,
     }
+    mirror_batch = None
     with _lock:
         _sessions[sid] = sess
         if batch_id and batch_id in _batches:
             _batches[batch_id]["session_ids"].append(sid)
             _batches[batch_id]["updated_at"] = _now()
-            _mirror_reg_batch(batch_id, dict(_batches[batch_id]))
-    _mirror_reg_sess(sid, sess)
+            mirror_batch = dict(_batches[batch_id])
+    if mirror_batch is not None:
+        try:
+            _mirror_reg_batch(batch_id, mirror_batch)
+        except Exception:
+            pass
+    try:
+        _mirror_reg_sess(sid, sess)
+    except Exception:
+        pass
     return {"ok": True, **_compact_session(sess)}
 
 
@@ -1819,14 +2061,17 @@ def start_registration(
         os.environ["GROK2API_YESCAPTCHA_ENDPOINT"] = solver_url
         os.environ["YESCAPTCHA_ENDPOINT"] = solver_url
         key = "local"
-        # Gate: never spawn registration workers before the inline solver answers.
-        # Lazy browser mode is fine (pool_ready may be false); HTTP /health is enough.
-        solver_wait = wait_for_local_solver(solver_url)
+        # Fast-fail gate only: never block the Go 750ms hop with a 120s wait.
+        # Workers still re-check readiness before solving captcha.
+        solver_wait = probe_local_solver(solver_url, timeout=0.45)
         if not solver_wait.get("ready"):
             return {
                 "ok": False,
-                "error": solver_wait.get("error")
-                or f"本地过盾未就绪: {solver_url}",
+                "error": (
+                    solver_wait.get("error")
+                    or f"本地过盾未就绪: {solver_url}"
+                )
+                + "（启动接口快速探测失败，请确认 inline Turnstile 已启动后重试）",
                 "local_solver": solver_wait,
             }
     else:
@@ -2069,6 +2314,7 @@ def _spawn_batch_runner(
         return {"ok": False, "error": "registration batch not found"}
 
     if remaining <= 0:
+        mirror_b = None
         with _lock:
             b = _batches.get(bid) or dict(batch)
             b["runner_alive"] = False
@@ -2076,7 +2322,12 @@ def _spawn_batch_runner(
             b["updated_at"] = _now()
             b["message"] = "nothing to spawn"
             _batches[bid] = b
-            _mirror_reg_batch(bid, dict(b))
+            mirror_b = dict(b)
+        if mirror_b is not None:
+            try:
+                _mirror_reg_batch(bid, mirror_b, force=True)
+            except Exception:
+                pass
         return {
             "ok": True,
             "batch_id": bid,
@@ -2112,13 +2363,16 @@ def _spawn_batch_runner(
         os.environ["LOCAL_SOLVER_URL"] = solver_url
         os.environ["GROK2API_YESCAPTCHA_ENDPOINT"] = solver_url
         os.environ["YESCAPTCHA_ENDPOINT"] = solver_url
-        solver_wait = wait_for_local_solver(solver_url)
+        solver_wait = probe_local_solver(solver_url, timeout=0.45)
         if not solver_wait.get("ready"):
             _release_batch_runner(bid, lock_token)
             return {
                 "ok": False,
-                "error": solver_wait.get("error")
-                or f"本地过盾未就绪: {solver_url}",
+                "error": (
+                    solver_wait.get("error")
+                    or f"本地过盾未就绪: {solver_url}"
+                )
+                + "（启动接口快速探测失败，请确认 inline Turnstile 已启动后重试）",
                 "batch_id": bid,
                 "local_solver": solver_wait,
             }
@@ -2294,6 +2548,7 @@ def _spawn_batch_runner(
                     break
                 if _batch_cancel_requested():
                     # Keep heartbeat while draining, but mark status as stopping.
+                    mirror_bb = None
                     with _lock:
                         bb = _batches.get(bid)
                         if bb is not None:
@@ -2308,15 +2563,26 @@ def _spawn_batch_runner(
                                 bb["status"] = "stopping"
                             bb["updated_at"] = _now()
                             bb["runner_alive"] = True
-                            _mirror_reg_batch(bid, dict(bb))
+                            mirror_bb = dict(bb)
+                    if mirror_bb is not None:
+                        try:
+                            _mirror_reg_batch(bid, mirror_bb)
+                        except Exception:
+                            pass
                 _renew_batch_runner(bid, lock_token)
+                mirror_bb = None
                 with _lock:
                     bb = _batches.get(bid)
                     if bb is not None:
                         bb["updated_at"] = _now()
                         bb["runner_alive"] = True
                         bb["owner_pid"] = os.getpid()
-                        _mirror_reg_batch(bid, dict(bb))
+                        mirror_bb = dict(bb)
+                if mirror_bb is not None:
+                    try:
+                        _mirror_reg_batch(bid, mirror_bb)
+                    except Exception:
+                        pass
 
         renew_t = threading.Thread(
             target=_renew_loop,
@@ -2468,6 +2734,8 @@ def _spawn_batch_runner(
                 errors.append(
                     f"#{idx}: {r.get('error') or r.get('status') or 'failed'}"
                 )
+            mirror_batch = None
+            task_summary = None
             with _lock:
                 b = _batches.get(bid)
                 if b is not None:
@@ -2478,6 +2746,10 @@ def _spawn_batch_runner(
                     b["finished"] = finished
                     b["ok_count"] = ok_n
                     b["fail_count"] = fail_n
+                    b["imported"] = ok_n
+                    b["error"] = fail_n
+                    b["done"] = finished
+                    b["running"] = len(in_flight)
                     b["spawned"] = len(b.get("session_ids") or [])
                     b["spawn_errors"] = errors[-20:]
                     b["runner_alive"] = True
@@ -2487,30 +2759,36 @@ def _spawn_batch_runner(
                         f"(ok={ok_n} fail={fail_n}, threads={workers}, "
                         f"inflight={len(in_flight)})"
                     )
-                    _mirror_reg_batch(bid, dict(b))
-                    # Real-time batch progress into 任务日志 (throttled).
-                    try:
-                        _throttle_task_log(
-                            task_id=str(bid),
-                            status="running",
-                            summary=str(b.get("message") or f"协议注册批次 {bid}"),
-                            progress_done=int(finished or 0),
-                            progress_total=int(target_total or 0),
-                            finished=False,
-                            ok=None,
-                            detail={
-                                "batch_id": bid,
-                                "ok_count": ok_n,
-                                "fail_count": fail_n,
-                                "threads": workers,
-                                "inflight": len(in_flight),
-                                "phase": "progress",
-                                "adapter_build": ADAPTER_BUILD,
-                            },
-                            min_interval_sec=1.5,
-                        )
-                    except Exception:
-                        pass
+                    mirror_batch = dict(b)
+                    task_summary = str(b.get("message") or f"协议注册批次 {bid}")
+            if mirror_batch is not None:
+                try:
+                    _mirror_reg_batch(bid, mirror_batch)
+                except Exception:
+                    pass
+                # Real-time batch progress into 任务日志 (throttled).
+                try:
+                    _throttle_task_log(
+                        task_id=str(bid),
+                        status="running",
+                        summary=str(task_summary or f"协议注册批次 {bid}"),
+                        progress_done=int(finished or 0),
+                        progress_total=int(target_total or 0),
+                        finished=False,
+                        ok=None,
+                        detail={
+                            "batch_id": bid,
+                            "ok_count": ok_n,
+                            "fail_count": fail_n,
+                            "threads": workers,
+                            "inflight": len(in_flight),
+                            "phase": "progress",
+                            "adapter_build": ADAPTER_BUILD,
+                        },
+                        min_interval_sec=1.5,
+                    )
+                except Exception:
+                    pass
 
         try:
             target_total = int((_load_reg_batch(bid) or {}).get("count") or remaining)
@@ -2527,10 +2805,16 @@ def _spawn_batch_runner(
                         fut = pool.submit(_job, next_i)
                         in_flight[fut] = next_i
                         next_i += 1
+                        mirror_bb = None
+                        task_summary = None
                         with _lock:
                             bb = _batches.get(bid)
                             if bb is not None:
                                 bb["inflight"] = len(in_flight)
+                                bb["running"] = len(in_flight)
+                                bb["imported"] = ok_n
+                                bb["error"] = fail_n
+                                bb["done"] = finished
                                 bb["updated_at"] = _now()
                                 if not bb.get("cancel_requested"):
                                     bb["status"] = "running"
@@ -2539,29 +2823,35 @@ def _spawn_batch_runner(
                                     f"(ok={ok_n} fail={fail_n}, threads={workers}, "
                                     f"inflight={len(in_flight)})"
                                 )
-                                _mirror_reg_batch(bid, dict(bb))
-                                try:
-                                    _throttle_task_log(
-                                        task_id=str(bid),
-                                        status="running",
-                                        summary=str(bb.get("message") or f"协议注册批次 {bid}"),
-                                        progress_done=int(finished or 0),
-                                        progress_total=int(target_total or 0),
-                                        finished=False,
-                                        ok=None,
-                                        detail={
-                                            "batch_id": bid,
-                                            "ok_count": ok_n,
-                                            "fail_count": fail_n,
-                                            "threads": workers,
-                                            "inflight": len(in_flight),
-                                            "phase": "progress",
-                                            "adapter_build": ADAPTER_BUILD,
-                                        },
-                                        min_interval_sec=1.5,
-                                    )
-                                except Exception:
-                                    pass
+                                mirror_bb = dict(bb)
+                                task_summary = str(bb.get("message") or f"协议注册批次 {bid}")
+                        if mirror_bb is not None:
+                            try:
+                                _mirror_reg_batch(bid, mirror_bb)
+                            except Exception:
+                                pass
+                            try:
+                                _throttle_task_log(
+                                    task_id=str(bid),
+                                    status="running",
+                                    summary=str(task_summary or f"协议注册批次 {bid}"),
+                                    progress_done=int(finished or 0),
+                                    progress_total=int(target_total or 0),
+                                    finished=False,
+                                    ok=None,
+                                    detail={
+                                        "batch_id": bid,
+                                        "ok_count": ok_n,
+                                        "fail_count": fail_n,
+                                        "threads": workers,
+                                        "inflight": len(in_flight),
+                                        "phase": "progress",
+                                        "adapter_build": ADAPTER_BUILD,
+                                    },
+                                    min_interval_sec=1.5,
+                                )
+                            except Exception:
+                                pass
 
                     if not in_flight:
                         break
@@ -2599,6 +2889,8 @@ def _spawn_batch_runner(
                     fut.cancel()
                 except Exception:
                     pass
+            mirror_batch = None
+            task_args = None
             with _lock:
                 b = _batches.get(bid)
                 if b is not None:
@@ -2606,6 +2898,10 @@ def _spawn_batch_runner(
                     b["finished"] = finished
                     b["ok_count"] = ok_n
                     b["fail_count"] = fail_n
+                    b["imported"] = ok_n
+                    b["error"] = fail_n
+                    b["done"] = finished
+                    b["running"] = 0
                     b["spawned"] = len(b.get("session_ids") or [])
                     b["spawn_errors"] = errors[-20:]
                     b["runner_alive"] = False
@@ -2643,17 +2939,17 @@ def _spawn_batch_runner(
                             f"finished {finished}/{target_total} "
                             f"(ok={ok_n} fail={fail_n}, threads={workers})"
                         )
-                    _mirror_reg_batch(bid, dict(b))
+                    mirror_batch = dict(b)
                     st = str(b.get("status") or "done")
-                    _record_register_task(
-                        task_id=str(bid),
-                        summary=str(b.get("message") or f"协议注册批次 {bid}"),
-                        status=st,
-                        ok=st in {"done", "partial"} and ok_n > 0,
-                        progress_done=int(finished or 0),
-                        progress_total=int(target_total or finished or 0),
-                        finished=True,
-                        detail={
+                    task_args = {
+                        "task_id": str(bid),
+                        "summary": str(b.get("message") or f"协议注册批次 {bid}"),
+                        "status": st,
+                        "ok": st in {"done", "partial"} and ok_n > 0,
+                        "progress_done": int(finished or 0),
+                        "progress_total": int(target_total or finished or 0),
+                        "finished": True,
+                        "detail": {
                             "batch_id": bid,
                             "ok_count": ok_n,
                             "fail_count": fail_n,
@@ -2663,7 +2959,17 @@ def _spawn_batch_runner(
                             "phase": "finished",
                             "adapter_build": ADAPTER_BUILD,
                         },
-                    )
+                    }
+            if mirror_batch is not None:
+                try:
+                    _mirror_reg_batch(bid, mirror_batch, force=True)
+                except Exception:
+                    pass
+            if task_args is not None:
+                try:
+                    _record_register_task(**task_args)
+                except Exception:
+                    pass
             _release_batch_runner(bid, lock_token)
 
     threading.Thread(
@@ -2772,6 +3078,8 @@ def _run_registration(
         _refresh_cancel_from_redis()
         write_task_now = False
         task_payload: dict[str, Any] | None = None
+        mirror_payload: dict[str, Any] | None = None
+        mirror_force = False
         with _lock:
             cur = _sessions.get(sid) or sess
             # Batch-level cancel also aborts this worker.
@@ -2800,15 +3108,12 @@ def _run_registration(
             except Exception:
                 pass
             _sessions[sid] = cur
-            # Force Redis write on terminal / cancel so multi-worker UI sees exit ASAP.
-            _mirror_reg_sess(
-                sid,
-                cur,
-                force=bool(
-                    str(status or "").lower() in _TERMINAL_STATUSES
-                    or str(status or "").lower() in ("stopping", "cancelled", "stopped")
-                ),
+            # Snapshot for Redis/PG I/O outside the global lock.
+            mirror_force = bool(
+                str(status or "").lower() in _TERMINAL_STATUSES
+                or str(status or "").lower() in ("stopping", "cancelled", "stopped")
             )
+            mirror_payload = dict(cur)
             # Single-session jobs: stream progress into task_logs (throttled).
             # Batch sessions are summarized on the batch row to avoid N*step spam.
             if not bid:
@@ -2842,6 +3147,11 @@ def _run_registration(
                     },
                     "force": terminal,
                 }
+        if mirror_payload is not None:
+            try:
+                _mirror_reg_sess(sid, mirror_payload, force=mirror_force)
+            except Exception:
+                pass
         if write_task_now and task_payload:
             try:
                 _throttle_task_log(
@@ -2983,7 +3293,7 @@ def _run_registration(
             solver_key,
             endpoint=endpoint,
             # Keep captcha wait bounded; cancel still interrupts via on_progress.
-            timeout=float(os.environ.get("GROK2API_YESCAPTCHA_TIMEOUT", "120") or 120),
+            timeout=float(os.environ.get("GROK2API_YESCAPTCHA_TIMEOUT", "180") or 180),
             poll_interval=float(os.environ.get("GROK2API_YESCAPTCHA_POLL", "2") or 2),
             debug=True,
             on_progress=_turnstile_progress,
@@ -3834,150 +4144,31 @@ def _run_registration(
                     "total": len(imported_ids),
                 }
                 print(f"[grok-build-auth] WARN: CLIProxyAPI auto-push failed: {e}")
-        # Auto probe newly imported accounts so they are validated in the pool.
-        # Release global admission BEFORE the settle sleep so bulk jobs don't
-        # hold scarce inflight slots for REGISTER_PROBE_DELAY_SEC after success.
+        # Mark imported immediately; settle delay + probe run on a shared queue
+        # so batch worker slots are not held for REGISTER_PROBE_DELAY_SEC.
         if admission_flag is not None:
             _release_reg_admission_once(admission_flag)
-        probe_summaries: list[dict[str, Any]] = []
-        if imported_ids:
-            delay = max(0.0, float(REGISTER_PROBE_DELAY_SEC or 0.0))
-            if delay > 0:
-                update(
-                    "probing",
-                    f"imported {len(imported_ids)} account(s); wait {int(delay)}s "
-                    f"before probe [{ADAPTER_BUILD}]",
-                    imported_account_ids=imported_ids,
-                    imported_accounts=imported_accounts,
-                    probe_delay_sec=delay,
-                )
-                # Heartbeat during settle wait so multi-worker reclaim does not
-                # treat a healthy post-import session as an orphan.
-                deadline = time.time() + delay
-                while True:
-                    remaining_wait = deadline - time.time()
-                    if remaining_wait <= 0:
-                        break
-                    time.sleep(min(10.0, remaining_wait))
-                    left = max(0.0, deadline - time.time())
-                    if left <= 0:
-                        break
-                    update(
-                        "probing",
-                        f"imported {len(imported_ids)} account(s); wait "
-                        f"{int(left)}s before probe [{ADAPTER_BUILD}]",
-                        imported_account_ids=imported_ids,
-                        imported_accounts=imported_accounts,
-                        probe_delay_sec=delay,
-                    )
-            update(
-                "probing",
-                f"imported {len(imported_ids)} account(s); probing pool health "
-                f"(delay={int(delay)}s) [{ADAPTER_BUILD}]",
-                imported_account_ids=imported_ids,
-                imported_accounts=imported_accounts,
-                probe_delay_sec=delay,
-            )
-            try:
-                import grok2api.pool.model_health as model_health
-
-                for aid in imported_ids:
-                    try:
-                        # New registrations must enter the live rotation pool.
-                        # Never auto-disable / free-usage-cool on the post-import
-                        # probe — free accounts often report free-usage-exhausted
-                        # on the first ping and were wrongly kicked out of 轮询.
-                        pr = model_health.probe_single_account(
-                            aid, None, auto_disable=False, source="register"
-                        )
-                        detail = pr.get("result") if isinstance(pr, dict) else None
-                        if not isinstance(detail, dict):
-                            detail = pr if isinstance(pr, dict) else {}
-                        err_text = (
-                            detail.get("error")
-                            or detail.get("message")
-                            or (pr.get("error") if isinstance(pr, dict) else None)
-                            or ""
-                        )
-                        latency = (
-                            detail.get("latency_ms")
-                            or detail.get("elapsed_ms")
-                            or detail.get("duration_ms")
-                        )
-                        probe_summaries.append(
-                            {
-                                "account_id": aid,
-                                "ok": bool(pr.get("ok") if isinstance(pr, dict) else False),
-                                "model": detail.get("model")
-                                or (pr.get("model") if isinstance(pr, dict) else None),
-                                "error": (str(err_text)[:180] if err_text else None),
-                                "latency_ms": latency,
-                            }
-                        )
-                    except Exception as pe:  # noqa: BLE001
-                        probe_summaries.append(
-                            {
-                                "account_id": aid,
-                                "ok": False,
-                                "error": str(pe)[:180],
-                            }
-                        )
-            except Exception as pe:  # noqa: BLE001
-                probe_summaries.append(
-                    {
-                        "account_id": None,
-                        "ok": False,
-                        "error": f"probe module error: {pe}"[:180],
-                    }
-                )
-        # Ensure newly registered accounts stay enabled + not cooling even if a
-        # concurrent background health wave cooled them during import.
-        try:
-            import grok2api.pool.account_pool as account_pool
-            from grok2api.admin.settings_store import get_account_pool_meta, patch_account_pool_meta
-            for aid in imported_ids:
-                try:
-                    account_pool.clear_account_cooldown(aid)
-                except Exception:
-                    pass
-                try:
-                    meta = get_account_pool_meta(aid) or {}
-                    if isinstance(meta, dict) and meta.get("enabled") is False and not meta.get("disabled_for_quota"):
-                        patch_account_pool_meta(
-                            aid,
-                            {
-                                "enabled": True,
-                                "pool_status": "normal",
-                                "disabled_reason": None,
-                                "disabled_source": None,
-                                "cooldown_until": None,
-                                "cooldown_count": 0,
-                            },
-                        )
-                except Exception:
-                    pass
-        except Exception as rexc:
-            print(f"[grok-build-auth] WARN: post-register re-enable failed: {rexc}")
-        sess["probe"] = {
-            "count": len(probe_summaries),
-            "ok": sum(1 for p in probe_summaries if p.get("ok")),
-            "fail": sum(1 for p in probe_summaries if not p.get("ok")),
-            "results": probe_summaries,
-        }
-        ok_n = int(sess["probe"]["ok"])
-        fail_n = int(sess["probe"]["fail"])
+        delay = max(0.0, float(REGISTER_PROBE_DELAY_SEC or 0.0))
         update(
             "imported",
             f"imported via sso_to_auth_json "
             f"({len(imported_ids) or len(imported_rows)} account(s)); "
-            f"probe ok={ok_n} fail={fail_n} "
-            f"[{ADAPTER_BUILD}]",
+            f"probe scheduled delay={int(delay)}s [{ADAPTER_BUILD}]",
             imported_account_ids=imported_ids,
             imported_accounts=imported_accounts,
-            probe=sess.get("probe"),
+            probe_delay_sec=delay,
+            probe={"count": 0, "ok": 0, "fail": 0, "results": [], "pending": True},
         )
+        if imported_ids:
+            _enqueue_post_import_probe(
+                sid=sid,
+                account_ids=imported_ids,
+                delay_sec=delay,
+                email=str(email or ""),
+            )
         return
     except _RegCancelled as exc:
+        mirror_copy = None
         with _lock:
             cur = _sessions.get(sid) or sess
             cur["status"] = "cancelled"
@@ -3986,12 +4177,18 @@ def _run_registration(
             cur["cancel_requested"] = True
             cur["updated_at"] = _now()
             _sessions[sid] = cur
-            _mirror_reg_sess(sid, cur)
+            mirror_copy = dict(cur)
+        if mirror_copy is not None:
+            try:
+                _mirror_reg_sess(sid, mirror_copy, force=True)
+            except Exception:
+                pass
         return
     except Exception as exc:  # noqa: BLE001
         try:
             update("error", f"failed: {exc}", error=str(exc))
         except _RegCancelled:
+            mirror_copy = None
             with _lock:
                 cur = _sessions.get(sid) or sess
                 cur["status"] = "cancelled"
@@ -4000,7 +4197,12 @@ def _run_registration(
                 cur["cancel_requested"] = True
                 cur["updated_at"] = _now()
                 _sessions[sid] = cur
-                _mirror_reg_sess(sid, cur)
+                mirror_copy = dict(cur)
+            if mirror_copy is not None:
+                try:
+                    _mirror_reg_sess(sid, mirror_copy, force=True)
+                except Exception:
+                    pass
     finally:
         if client is not None:
             try:
@@ -4958,123 +5160,101 @@ def get_registration_session(
     return out
 
 
-def _batch_stats(
-    session_ids: list[str],
-    *,
-    batch: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Compute batch counters from live sessions.
+def _batch_counters_from_batch(batch: dict[str, Any] | None) -> dict[str, int] | None:
+    """Return persisted counters when present and coherent; else None.
 
-    Missing sessions (TTL expired / not mirrored) are *not* treated as running —
-    that previously made finished historical batches look active after Redis
-    session keys aged out. When no live sessions remain, fall back to the
-    persisted batch status/message counters.
+    Important: batch seed rows write ok_count=0/fail_count=0 with status
+    "running" before any worker finishes. Those zeros must NOT be treated as
+    authoritative, or every poll reports running=0 while work is still live
+    (UI freeze / false completion). Prefer explicit runner progress fields
+    (imported/error/running/done/inflight) once real progress exists.
     """
-    imported = error = running = cancelled = missing = 0
-    for sid in session_ids:
-        sess = _load_reg_sess(sid)
-        if not sess:
-            missing += 1
-            continue
-        st = str(sess.get("status") or "").lower()
-        if st in ("imported", "success", "completed"):
-            imported += 1
-        elif st in ("cancelled", "stopped"):
-            cancelled += 1
-        elif st in ("error", "failed", "expired", "protocol_error", "protocol_blocked"):
-            error += 1
+    if not isinstance(batch, dict):
+        return None
+    explicit_keys = ("imported", "error", "cancelled", "running", "done")
+    has_explicit = any(k in batch for k in explicit_keys)
+    has_runner = any(k in batch for k in ("ok_count", "fail_count", "finished", "inflight"))
+    if not has_explicit and not has_runner:
+        return None
+    try:
+        if "imported" in batch:
+            imported = int(batch.get("imported") or 0)
         else:
-            running += 1
+            imported = int(batch.get("ok_count") or 0)
+        if "error" in batch:
+            error = int(batch.get("error") or 0)
+        else:
+            error = int(batch.get("fail_count") or 0)
+        cancelled = int(batch.get("cancelled") or 0)
+        if "running" in batch:
+            running = int(batch.get("running") or 0)
+        elif "inflight" in batch:
+            running = int(batch.get("inflight") or 0)
+        else:
+            running = 0
+        if "done" in batch:
+            done = int(batch.get("done") or 0)
+        elif "finished" in batch:
+            done = int(batch.get("finished") or 0)
+        else:
+            done = imported + error + cancelled
+    except Exception:
+        return None
 
-    total = len(session_ids)
-    observed = imported + error + cancelled + running
-    done = imported + error + cancelled
-    target = 0
-    if isinstance(batch, dict):
-        try:
-            target = int(batch.get("count") or 0)
-        except Exception:
-            target = 0
-    if target <= 0:
-        target = total
+    # Seed-only / pre-progress: all zeros and no explicit progress keys → live scan.
+    if (
+        not has_explicit
+        and imported == 0
+        and error == 0
+        and cancelled == 0
+        and done == 0
+        and running == 0
+    ):
+        return None
+    return {
+        "imported": max(0, imported),
+        "error": max(0, error),
+        "cancelled": max(0, cancelled),
+        "running": max(0, running),
+        "done": max(0, done),
+    }
 
+
+def _derive_batch_status(
+    *,
+    imported: int,
+    error: int,
+    cancelled: int,
+    running: int,
+    done: int,
+    total: int,
+    target: int,
+    batch: dict[str, Any] | None,
+    missing: int = 0,
+    observed: int | None = None,
+) -> str:
     status = "running"
-    if observed == 0:
-        # No live sessions left — trust last mirrored batch status if terminal.
+    obs = observed if observed is not None else (imported + error + cancelled + running)
+    if obs == 0:
         stored = ""
         if isinstance(batch, dict):
             stored = str(batch.get("batch_status") or batch.get("status") or "").lower()
         if stored in ("done", "partial", "error", "cancelled", "stopped"):
-            status = stored
-            # Prefer stored counters when present so UI keeps final totals.
-            try:
-                imported = int(batch.get("imported") or imported)
-            except Exception:
-                pass
-            try:
-                error = int(batch.get("error") or error)
-            except Exception:
-                pass
-            try:
-                cancelled = int(batch.get("cancelled") or cancelled)
-            except Exception:
-                pass
-            try:
-                done = int(batch.get("done") or (imported + error + cancelled))
-            except Exception:
-                done = imported + error + cancelled
-            running = 0
-        elif total and missing >= total:
-            # All session keys gone and no terminal marker.
-            # Prefer counters / message fragments; never keep a fully-missing
-            # batch as "running" forever (ghost cards after Redis TTL).
-            msg = str((batch or {}).get("message") or "")
-            if isinstance(batch, dict):
-                try:
-                    imported = int(batch.get("imported") or imported or 0)
-                except Exception:
-                    pass
-                try:
-                    error = int(batch.get("error") or error or 0)
-                except Exception:
-                    pass
-                try:
-                    cancelled = int(batch.get("cancelled") or cancelled or 0)
-                except Exception:
-                    pass
-            # Parse "ok=N fail=M" style messages written by the spawner.
-            if imported == 0 and error == 0 and cancelled == 0 and msg:
-                import re as _re
-
-                m_ok = _re.search(r"ok\s*=\s*(\d+)", msg)
-                m_fail = _re.search(r"fail\s*=\s*(\d+)", msg)
-                if m_ok:
-                    try:
-                        imported = int(m_ok.group(1))
-                    except Exception:
-                        pass
-                if m_fail:
-                    try:
-                        error = int(m_fail.group(1))
-                    except Exception:
-                        pass
-            done = imported + error + cancelled
+            return stored
+        if total and missing >= total:
             if cancelled and not imported and not error:
-                status = "cancelled"
-            elif imported and not error and not cancelled:
-                status = "done"
-            elif imported:
-                status = "partial"
-            elif error:
-                status = "error"
-            elif stored in ("stopping",):
-                status = "stopped"
-            else:
-                status = "done"
-            running = 0
-        else:
-            status = "running"
-    elif done >= max(target, total) and running == 0:
+                return "cancelled"
+            if imported and not error and not cancelled:
+                return "done"
+            if imported:
+                return "partial"
+            if error:
+                return "error"
+            if stored == "stopping":
+                return "stopped"
+            return "done"
+        return "running"
+    if done >= max(target, total) and running == 0:
         if cancelled and not imported and not error:
             status = "cancelled"
         elif error == 0 and cancelled == 0:
@@ -5083,8 +5263,7 @@ def _batch_stats(
             status = "partial"
         else:
             status = "error"
-    elif running == 0 and missing > 0 and done > 0 and observed < total:
-        # Partial visibility (some sessions expired) but nothing live.
+    elif running == 0 and missing > 0 and done > 0 and obs < total:
         if imported and (error or cancelled or missing):
             status = "partial"
         elif imported and not error and not cancelled:
@@ -5099,8 +5278,6 @@ def _batch_stats(
         status = "running"
     elif running:
         status = "running"
-
-    # Honour explicit cooperative stop marker on the batch itself.
     if isinstance(batch, dict):
         bst = str(batch.get("status") or "").lower()
         if bst in ("stopping", "cancelled", "stopped") and running == 0:
@@ -5108,7 +5285,142 @@ def _batch_stats(
                 status = "cancelled" if cancelled or bst != "stopping" else "stopped"
         if bst == "stopping" and running:
             status = "running"
+    return status
 
+
+def _batch_stats(
+    session_ids: list[str],
+    *,
+    batch: dict[str, Any] | None = None,
+    sessions_by_id: dict[str, dict[str, Any]] | None = None,
+    prefer_persisted: bool = True,
+) -> dict[str, Any]:
+    """Compute batch counters.
+
+    Prefer persisted batch counters (maintained by runner / terminal updates).
+    Only scan sessions when counters are missing/stale (legacy batches) or when
+    a preloaded ``sessions_by_id`` map is provided for a bounded embed load.
+    """
+    total = len(session_ids)
+    target = 0
+    if isinstance(batch, dict):
+        try:
+            target = int(batch.get("count") or 0)
+        except Exception:
+            target = 0
+    if target <= 0:
+        target = total
+
+    persisted = _batch_counters_from_batch(batch) if prefer_persisted else None
+    if persisted is not None and sessions_by_id is None:
+        imported = persisted["imported"]
+        error = persisted["error"]
+        cancelled = persisted["cancelled"]
+        running = persisted["running"]
+        done = persisted["done"]
+        # If runner tracks finished/ok/fail, keep running as residual when possible.
+        if running == 0 and isinstance(batch, dict):
+            try:
+                finished = int(batch.get("finished") or 0)
+                if finished and target and finished < target and not batch.get("runner_alive"):
+                    # finished jobs but no running flag — residual unknown; trust done
+                    pass
+                elif int(batch.get("inflight") or 0) > 0:
+                    running = int(batch.get("inflight") or 0)
+            except Exception:
+                pass
+        status = _derive_batch_status(
+            imported=imported,
+            error=error,
+            cancelled=cancelled,
+            running=running,
+            done=done,
+            total=max(total, target),
+            target=target,
+            batch=batch,
+            missing=0,
+            observed=imported + error + cancelled + running,
+        )
+        return {
+            "total": max(total, target),
+            "imported": imported,
+            "error": error,
+            "cancelled": cancelled,
+            "running": running,
+            "missing": 0,
+            "done": done if done else (imported + error + cancelled),
+            "batch_status": status,
+        }
+
+    # Live scan path: use preloaded map or load each id once.
+    imported = error = running = cancelled = missing = 0
+    for sid in session_ids:
+        sess = None
+        if sessions_by_id is not None:
+            sess = sessions_by_id.get(sid)
+        else:
+            sess = _load_reg_sess(sid)
+        if not sess:
+            missing += 1
+            continue
+        st = str(sess.get("status") or "").lower()
+        if st in ("imported", "success", "completed"):
+            imported += 1
+        elif st in ("cancelled", "stopped"):
+            cancelled += 1
+        elif st in ("error", "failed", "expired", "protocol_error", "protocol_blocked"):
+            error += 1
+        else:
+            running += 1
+
+    observed = imported + error + cancelled + running
+    done = imported + error + cancelled
+    if observed == 0 and isinstance(batch, dict):
+        # fall back to stored counters / message parse
+        try:
+            imported = int(batch.get("imported") or batch.get("ok_count") or imported or 0)
+        except Exception:
+            pass
+        try:
+            error = int(batch.get("error") or batch.get("fail_count") or error or 0)
+        except Exception:
+            pass
+        try:
+            cancelled = int(batch.get("cancelled") or cancelled or 0)
+        except Exception:
+            pass
+        msg = str(batch.get("message") or "")
+        if imported == 0 and error == 0 and cancelled == 0 and msg:
+            import re as _re
+
+            m_ok = _re.search(r"ok\s*=\s*(\d+)", msg)
+            m_fail = _re.search(r"fail\s*=\s*(\d+)", msg)
+            if m_ok:
+                try:
+                    imported = int(m_ok.group(1))
+                except Exception:
+                    pass
+            if m_fail:
+                try:
+                    error = int(m_fail.group(1))
+                except Exception:
+                    pass
+        done = imported + error + cancelled
+        running = 0
+        observed = done
+
+    status = _derive_batch_status(
+        imported=imported,
+        error=error,
+        cancelled=cancelled,
+        running=running,
+        done=done,
+        total=max(total, target),
+        target=target,
+        batch=batch,
+        missing=missing,
+        observed=observed,
+    )
     return {
         "total": max(total, target),
         "imported": imported,
@@ -5121,23 +5433,127 @@ def _batch_stats(
     }
 
 
+def _load_reg_sess_many(session_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Load many sessions with one Redis MGET + local cache merge."""
+    out: dict[str, dict[str, Any]] = {}
+    ids = [str(s) for s in session_ids if s]
+    if not ids:
+        return out
+    remote_map: dict[str, dict[str, Any]] = {}
+    if _reg_redis():
+        try:
+            from grok2api.store import sessions_redis
+
+            remote_map = sessions_redis.reg_sess_mget(ids) or {}
+        except Exception:
+            remote_map = {}
+    for sid in ids:
+        with _lock:
+            local = _sessions.get(sid)
+        remote = remote_map.get(sid)
+        if local is None and remote is None:
+            continue
+        if local is None:
+            with _lock:
+                _sessions[sid] = remote  # type: ignore[assignment]
+            out[sid] = remote  # type: ignore[assignment]
+            continue
+        if remote is None:
+            out[sid] = local
+            continue
+        local_ts = float(local.get("updated_at") or 0)
+        remote_ts = float(remote.get("updated_at") or 0)
+        if remote_ts > local_ts:
+            with _lock:
+                cur = _sessions.get(sid) or local
+                cur_ts = float(cur.get("updated_at") or 0)
+                if remote_ts > cur_ts:
+                    merged = _merge_reg_remote(cur, remote)
+                    _sessions[sid] = merged
+                    out[sid] = merged
+                else:
+                    out[sid] = cur
+        else:
+            out[sid] = local
+    return out
+
+
 def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
     b = _load_reg_batch(batch_id)
     if not b:
         return None
     sids = list(b.get("session_ids") or [])
-    stats = _batch_stats(sids, batch=b)
     # Keep response bounded for large batches. Prefer LIVE (non-terminal) sessions
     # so the admin log always shows in-flight progress, not only the newest finished ones.
     try:
-        MAX_BATCH_SESSIONS = max(8, min(32, int(os.environ.get("GROK2API_REG_BATCH_EMBED", "24") or 24)))
+        MAX_BATCH_SESSIONS = max(
+            8, min(32, int(os.environ.get("GROK2API_REG_BATCH_EMBED", "24") or 24))
+        )
     except (TypeError, ValueError):
         MAX_BATCH_SESSIONS = 24
+
+    persisted = _batch_counters_from_batch(b)
+    stats: dict[str, Any]
     loaded: list[dict[str, Any]] = []
-    for s in sids:
-        sess = _load_reg_sess(s)
-        if sess:
-            loaded.append(_compact_session(sess))
+
+    if persisted is not None:
+        # O(embed): only load a window of sessions for the UI, not all N.
+        # Prefer ids that are likely live: scan a modest tail of session_ids
+        # (newest are usually appended last) plus head fillers.
+        candidate_ids: list[str] = []
+        if sids:
+            # newest-first candidate window (2x embed) then fill from start
+            tail = list(reversed(sids[-max(MAX_BATCH_SESSIONS * 3, MAX_BATCH_SESSIONS) :]))
+            head = sids[:MAX_BATCH_SESSIONS]
+            seen: set[str] = set()
+            for sid in tail + head:
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                candidate_ids.append(sid)
+                if len(candidate_ids) >= max(MAX_BATCH_SESSIONS * 2, 16):
+                    break
+        by_id = _load_reg_sess_many(candidate_ids)
+        for sid in candidate_ids:
+            sess = by_id.get(sid)
+            if sess:
+                loaded.append(_compact_session(sess))
+        stats = _batch_stats(sids, batch=b, prefer_persisted=True)
+    else:
+        # Legacy batch without counters: one bulk load, then persist counters.
+        by_id = _load_reg_sess_many(sids)
+        stats = _batch_stats(
+            sids, batch=b, sessions_by_id=by_id, prefer_persisted=False
+        )
+        for sid in sids:
+            sess = by_id.get(sid)
+            if sess:
+                loaded.append(_compact_session(sess))
+        # Rewrite counters onto batch for subsequent polls.
+        try:
+            with _lock:
+                cur_b = _batches.get(batch_id) or dict(b)
+                cur_b.update(
+                    {
+                        "imported": stats.get("imported", 0),
+                        "error": stats.get("error", 0),
+                        "cancelled": stats.get("cancelled", 0),
+                        "running": stats.get("running", 0),
+                        "done": stats.get("done", 0),
+                        "batch_status": stats.get("batch_status"),
+                        "updated_at": _now(),
+                    }
+                )
+                _batches[batch_id] = cur_b
+                mirror_b = dict(cur_b)
+            try:
+                _mirror_reg_batch(batch_id, mirror_b)
+            except Exception:
+                pass
+            b = mirror_b
+        except Exception:
+            pass
+
     try:
         loaded.sort(
             key=lambda s: float(s.get("updated_at") or s.get("created_at") or 0),
@@ -5153,14 +5569,11 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
             term.append(sess)
         else:
             nonterm.append(sess)
-    # Live first (all of them up to cap), then recent terminal fillers.
     sessions = nonterm[:MAX_BATCH_SESSIONS]
     if len(sessions) < MAX_BATCH_SESSIONS:
         sessions.extend(term[: MAX_BATCH_SESSIONS - len(sessions)])
     out = {**b, **stats, "sessions": sessions}
-    # Surface effective status for older UIs that only read `status`.
     if stats.get("batch_status"):
-        # Don't clobber an explicit cooperative "stopping" marker while workers live.
         if str(b.get("status") or "").lower() != "stopping" or stats.get("running", 0) == 0:
             if stats.get("running", 0) == 0 or str(b.get("status") or "").lower() in (
                 "",

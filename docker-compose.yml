@@ -4,15 +4,18 @@ services:
   redis:
     image: redis:7-alpine
     container_name: grokcli-2api-redis
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"]
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
+      REDISCLI_AUTH: "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "--no-auth-warning", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
+    networks:
+      - backend
 
   postgres:
     image: postgres:16-alpine
@@ -21,7 +24,7 @@ services:
       TZ: "${TZ:-Asia/Shanghai}"
       PGTZ: "${TZ:-Asia/Shanghai}"
       POSTGRES_USER: grok2api
-      POSTGRES_PASSWORD: grok2api
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
       POSTGRES_DB: grok2api
     volumes:
       - grok2api_pg:/var/lib/postgresql/data
@@ -31,6 +34,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - backend
 
   # Single app container: API + inline Turnstile Solver (same process tree)
   grokcli-2api:
@@ -46,11 +51,8 @@ services:
       # Only the app API is published. Postgres/Redis stay internal-only
       # (compose network). Inline Turnstile Solver listens on container
       # loopback 127.0.0.1:5072 and is NOT published to the host.
-      - "3000:3000"
-      - "40081:40081"
+      - "127.0.0.1:${GROK2API_PUBLISHED_PORT:-3000}:40081"
     shm_size: "1gb"
-    security_opt:
-      - seccomp:unconfined
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
       GROK2API_HOST: "0.0.0.0"
@@ -63,10 +65,10 @@ services:
       # Multi-worker: default 2 (enough for hybrid; override via .env for large hosts)
       GROK2API_WORKERS: "${GROK2API_WORKERS:-2}"
       # In-stack service DNS (do not use 127.0.0.1 here)
-      REDIS_URL: "redis://redis:6379/0"
-      GROK2API_REDIS_URL: "redis://redis:6379/0"
-      DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
-      GROK2API_DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
+      REDIS_URL: "redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379/0"
+      GROK2API_REDIS_URL: "redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379/0"
+      DATABASE_URL: "postgresql://grok2api:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/grok2api"
+      GROK2API_DATABASE_URL: "postgresql://grok2api:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/grok2api"
       # Inline local Turnstile Solver (same container, Python captcha)
       GROK2API_CAPTCHA_PROVIDER: "${GROK2API_CAPTCHA_PROVIDER:-local}"
       CAPTCHA_PROVIDER: "${CAPTCHA_PROVIDER:-local}"
@@ -98,10 +100,10 @@ services:
       GROK2API_REGISTRATION_HOST: "127.0.0.1"
       GROK2API_REGISTRATION_PORT: "18070"
       GROK2API_REGISTRATION_SERVICE_URL: "${GROK2API_REGISTRATION_SERVICE_URL:-http://127.0.0.1:18070}"
-      GROK2API_REGISTRATION_TOKEN: "${GROK2API_REGISTRATION_TOKEN:-}"
+      GROK2API_REGISTRATION_TOKEN: "${GROK2API_REGISTRATION_TOKEN:?Set GROK2API_REGISTRATION_TOKEN in .env}"
       PYTHONPATH: "/app:/app/grok-build-auth"
-      # In-container hot-update (docker.sock + /compose mount; no host watcher)
-      GROK2API_HOT_UPDATE_MODE: "${GROK2API_HOT_UPDATE_MODE:-docker}"
+      # Hot update is disabled by default; keep Docker socket outside the Web app.
+      GROK2API_HOT_UPDATE_MODE: "${GROK2API_HOT_UPDATE_MODE:-disabled}"
       GROK2API_COMPOSE_DIR: "${GROK2API_COMPOSE_DIR:-/compose}"
       GROK2API_DOCKER_SERVICE: "${GROK2API_DOCKER_SERVICE:-grokcli-2api}"
       GROK2API_GHCR_IMAGE: "${GROK2API_GHCR_IMAGE:-ghcr.io/hm2899/grokcli-2api}"
@@ -115,10 +117,6 @@ services:
     volumes:
       - ./data:/app/data
       - ./turnstile-solver/logs:/app/turnstile-solver/logs
-      # In-container hot-update: docker CLI talks to host docker daemon.
-      - /var/run/docker.sock:/var/run/docker.sock
-      # Compose project for force-recreate (override file written under /compose).
-      - ./:/compose
     depends_on:
       redis:
         condition: service_healthy
@@ -129,6 +127,7 @@ services:
       default:
         aliases:
           - grokcli-2api
+      backend:
     restart: unless-stopped
 
 volumes:
@@ -141,6 +140,8 @@ volumes:
 #       external: true
 # Downstream DNS: http://grokcli-2api:<port>/v1
 networks:
+  backend:
+    internal: true
   default:
     name: grokcli-2api_default
     driver: bridge

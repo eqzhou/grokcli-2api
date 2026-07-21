@@ -7,13 +7,21 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"unicode/utf8"
 )
 
-const passwordIterations = 120_000
+const (
+	passwordIterations    = 120_000
+	minimumPasswordLength = 12
+	maximumPasswordBytes  = 256
+)
 
 func NewPassword(password string) (hashHex, saltHex string, err error) {
-	if len(password) < 4 {
-		return "", "", errors.New("password must contain at least 4 characters")
+	if utf8.RuneCountInString(password) < minimumPasswordLength {
+		return "", "", errors.New("password must contain at least 12 characters")
+	}
+	if len(password) > maximumPasswordBytes {
+		return "", "", errors.New("password must not exceed 256 bytes")
 	}
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {

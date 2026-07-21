@@ -992,6 +992,13 @@ class TurnstileAPIServer:
         except (TypeError, ValueError):
             rounds = 2
         rounds = max(1, min(4, rounds))
+        # Hard task deadline: stop before client poll timeout (default 180s client → 170s here).
+        try:
+            task_budget = float(os.getenv("TURNSTILE_TASK_TIMEOUT", "170") or 170)
+        except (TypeError, ValueError):
+            task_budget = 170.0
+        task_budget = max(30.0, min(600.0, task_budget))
+        task_deadline = start_time + task_budget
         try:
             poll_attempts = int(os.getenv("TURNSTILE_POLL_ATTEMPTS", "40") or 40)
         except (TypeError, ValueError):
@@ -1130,6 +1137,9 @@ class TurnstileAPIServer:
                     reinjected = False
 
                     for attempt in range(poll_attempts):
+                        if time.time() >= task_deadline:
+                            last_error = "task_deadline"
+                            break
                         try:
                             try:
                                 count = await locator.count()

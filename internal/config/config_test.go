@@ -56,7 +56,7 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.RequireSharedStores || !cfg.RequireMigrations {
 		t.Fatal("shared stores and migrations must default to required")
 	}
-	if cfg.Runtime != "go" || cfg.StoreBackend != "hybrid" || cfg.GoOwnershipMode != "all" || cfg.RequireAPIKey != "auto" {
+	if cfg.Runtime != "go" || cfg.StoreBackend != "hybrid" || cfg.GoOwnershipMode != "all" || cfg.RequireAPIKey != "true" {
 		t.Fatalf("unexpected defaults: runtime=%s store=%s ownership=%s auth=%s", cfg.Runtime, cfg.StoreBackend, cfg.GoOwnershipMode, cfg.RequireAPIKey)
 	}
 	if !cfg.GoWrites || !cfg.GoChat || !cfg.GoAdminWrite || !cfg.GoPublicRead || !cfg.GoMessages || !cfg.GoResponses || !cfg.GoAdminRead || !cfg.GoMaintainer {

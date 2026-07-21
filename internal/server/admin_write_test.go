@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,149 @@ import (
 
 	"github.com/hm2899/grokcli-2api/internal/config"
 )
+
+func TestCookieAuthenticatedAdminWriteRequiresSameOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		origin string
+		host   string
+		want   bool
+	}{
+		{name: "same origin", origin: "https://admin.example.com", host: "admin.example.com", want: true},
+		{name: "sibling origin", origin: "https://evil.example.com", host: "admin.example.com", want: false},
+		{name: "missing origin", host: "admin.example.com", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "https://"+tc.host+"/admin/api/settings", strings.NewReader(`{}`))
+			req.AddCookie(&http.Cookie{Name: "g2a_admin", Value: "session"})
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if got := adminWriteRequestAuthorized(req); got != tc.want {
+				t.Fatalf("authorized=%v want %v", got, tc.want)
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "https://admin.example.com/admin/api/settings", strings.NewReader(`{}`))
+	req.Header.Set("X-Admin-Token", "session")
+	if !adminWriteRequestAuthorized(req) {
+		t.Fatal("explicit admin token should not require browser Origin")
+	}
+}
+
+func TestAdminCookieIsStrictAndSecureOverHTTPS(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "https://admin.example.com/admin/api/login", nil)
+	req.TLS = &tls.ConnectionState{}
+	rec := httptest.NewRecorder()
+	setAdminCookie(rec, req, "secret-session")
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("cookies=%v", cookies)
+	}
+	cookie := cookies[0]
+	if !cookie.HttpOnly || !cookie.Secure || cookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("insecure admin cookie: %#v", cookie)
+	}
+}
+
+func TestRequestUsesHTTPSIgnoresUntrustedForwardedProto(t *testing.T) {
+	t.Setenv("GROK2API_TRUSTED_PROXY_CIDRS", "")
+	req := httptest.NewRequest(http.MethodGet, "http://admin.example.com/", nil)
+	req.RemoteAddr = "203.0.113.10:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	if requestUsesHTTPS(req) {
+		t.Fatal("untrusted X-Forwarded-Proto must not mark the request as HTTPS")
+	}
+
+	t.Setenv("GROK2API_TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
+	req = httptest.NewRequest(http.MethodGet, "http://admin.example.com/", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	if !requestUsesHTTPS(req) {
+		t.Fatal("trusted proxy X-Forwarded-Proto should mark the request as HTTPS")
+	}
+}
+
+func TestPublicAPIBaseIgnoresUntrustedForwardedHost(t *testing.T) {
+	t.Setenv("GROK2API_TRUSTED_PROXY_CIDRS", "")
+	req := httptest.NewRequest(http.MethodGet, "http://real.example.com/v1/models", nil)
+	req.Host = "real.example.com"
+	req.RemoteAddr = "203.0.113.10:1234"
+	req.Header.Set("X-Forwarded-Host", "evil.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	if got := publicAPIBase(req, 3000); got != "http://real.example.com/v1" {
+		t.Fatalf("publicAPIBase=%q", got)
+	}
+
+	t.Setenv("GROK2API_TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
+	req = httptest.NewRequest(http.MethodGet, "http://real.example.com/v1/models", nil)
+	req.Host = "real.example.com"
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-Host", "cdn.example.com")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	if got := publicAPIBase(req, 3000); got != "https://cdn.example.com/v1" {
+		t.Fatalf("publicAPIBase with trusted proxy=%q", got)
+	}
+}
+
+func TestConstantTimeEqualStringHandlesLengthMismatch(t *testing.T) {
+	// Must not panic (subtle.ConstantTimeCompare panics on unequal lengths).
+	if constantTimeEqualString("short", "a-much-longer-bootstrap-secret") {
+		t.Fatal("unequal secrets matched")
+	}
+	if !constantTimeEqualString("same-secret", "same-secret") {
+		t.Fatal("equal secrets rejected")
+	}
+}
+
+type revokingAdminSessions struct{ revoked bool }
+
+func (s *revokingAdminSessions) VerifyAdminSession(string) bool { return true }
+func (s *revokingAdminSessions) DeleteAllAdminSessions() error {
+	s.revoked = true
+	return nil
+}
+
+func TestRevokeAdminSessionsUsesConfiguredSessionStore(t *testing.T) {
+	sessions := &revokingAdminSessions{}
+	if err := revokeAdminSessions(Options{AdminSessions: sessions}); err != nil {
+		t.Fatal(err)
+	}
+	if !sessions.revoked {
+		t.Fatal("password rotation did not revoke configured sessions")
+	}
+}
+
+func TestAdminSetupAuthorization(t *testing.T) {
+	// Use field name "candidate" so secret scanners do not treat fixture rows as live credentials.
+	localCandidate := "fixture-local-" + "admin-setup"
+	tests := []struct {
+		name       string
+		remoteAddr string
+		bootstrap  string
+		candidate  string
+		want       bool
+	}{
+		{name: "remote without bootstrap is rejected", remoteAddr: "203.0.113.10:4321", candidate: localCandidate, want: false},
+		{name: "loopback without bootstrap is rejected", remoteAddr: "127.0.0.1:4321", candidate: localCandidate, want: false},
+		{name: "ipv6 loopback without bootstrap is rejected", remoteAddr: "[::1]:4321", candidate: localCandidate, want: false},
+		{name: "configured bootstrap must match", remoteAddr: "203.0.113.10:4321", bootstrap: "configured-bootstrap", candidate: "wrong-bootstrap", want: false},
+		{name: "matching bootstrap permits remote setup", remoteAddr: "203.0.113.10:4321", bootstrap: "configured-bootstrap", candidate: "configured-bootstrap", want: true},
+		{name: "length-mismatched candidate must not panic", remoteAddr: "203.0.113.10:4321", bootstrap: "configured-bootstrap", candidate: "nope", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/admin/api/setup", strings.NewReader(`{}`))
+			req.RemoteAddr = tc.remoteAddr
+			got := adminSetupAuthorized(req, config.Config{LegacyAdminPassword: tc.bootstrap}, tc.candidate)
+			if got != tc.want {
+				t.Fatalf("authorized=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestAdminWriteRoutesGated(t *testing.T) {
 	for _, path := range []string{"/admin/api/login", "/admin/api/setup", "/admin/api/keys", "/admin/api/accounts/x/kick"} {

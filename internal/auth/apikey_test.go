@@ -50,3 +50,14 @@ func TestAuthRequiredModes(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthRequiredFailsClosedForUnspecifiedMode(t *testing.T) {
+	verifier := NewAPIKeyVerifier(config.Config{}, nil)
+	got, err := verifier.AuthRequired(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got {
+		t.Fatal("unspecified API key mode must require authentication")
+	}
+}

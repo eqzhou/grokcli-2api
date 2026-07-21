@@ -103,3 +103,28 @@ func TestInContainerUpdateScriptFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateUpdateTarget(t *testing.T) {
+	t.Setenv("GROK2API_GHCR_IMAGE", "ghcr.io/example/grokcli-2api")
+
+	for _, tc := range []struct {
+		name  string
+		tag   string
+		image string
+		ok    bool
+	}{
+		{name: "release", tag: "2.0.4", image: "ghcr.io/example/grokcli-2api", ok: true},
+		{name: "latest", tag: "latest", image: "ghcr.io/example/grokcli-2api", ok: true},
+		{name: "shell metacharacters in tag", tag: "2.0.4; touch /tmp/pwned", image: "ghcr.io/example/grokcli-2api", ok: false},
+		{name: "newline in tag", tag: "2.0.4\nmalicious", image: "ghcr.io/example/grokcli-2api", ok: false},
+		{name: "arbitrary image", tag: "2.0.4", image: "ghcr.io/attacker/payload", ok: false},
+		{name: "yaml injection in image", tag: "2.0.4", image: "ghcr.io/example/grokcli-2api\n    volumes: [/:/host]", ok: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateUpdateTarget(tc.tag, tc.image)
+			if (err == nil) != tc.ok {
+				t.Fatalf("validateUpdateTarget(%q, %q) error=%v, ok want %v", tc.tag, tc.image, err, tc.ok)
+			}
+		})
+	}
+}

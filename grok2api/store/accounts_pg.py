@@ -577,6 +577,8 @@ def upsert_account_merged(
                         merge_durable_account_fields(entry, old_payload)
 
                 # Drop other rows that collide on user_id / access token.
+                # Collect deleted ids so pool cleanup stays O(collisions), not full-table.
+                deleted_ids: list[str] = []
                 if uid and token:
                     cur.execute(
                         """
@@ -588,9 +590,11 @@ def upsert_account_merged(
                             OR payload->>'principal_id' = %s
                             OR payload->>'key' = %s
                           )
+                        RETURNING id
                         """,
                         (account_id, str(uid), str(uid), str(uid), str(token)),
                     )
+                    deleted_ids = [str(r[0]) for r in (cur.fetchall() or []) if r and r[0]]
                 elif uid:
                     cur.execute(
                         """
@@ -601,24 +605,27 @@ def upsert_account_merged(
                             OR payload->>'user_id' = %s
                             OR payload->>'principal_id' = %s
                           )
+                        RETURNING id
                         """,
                         (account_id, str(uid), str(uid), str(uid)),
                     )
+                    deleted_ids = [str(r[0]) for r in (cur.fetchall() or []) if r and r[0]]
                 elif token:
                     cur.execute(
                         """
                         DELETE FROM accounts
                         WHERE id <> %s AND payload->>'key' = %s
+                        RETURNING id
                         """,
                         (account_id, str(token)),
                     )
-                # Clean orphan pool rows for deleted accounts
-                cur.execute(
-                    """
-                    DELETE FROM account_pool ap
-                    WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = ap.account_id)
-                    """
-                )
+                    deleted_ids = [str(r[0]) for r in (cur.fetchall() or []) if r and r[0]]
+                # Scoped pool cleanup for just the rows we deleted (no full-table orphan sweep).
+                if deleted_ids:
+                    cur.execute(
+                        "DELETE FROM account_pool WHERE account_id = ANY(%s)",
+                        (deleted_ids,),
+                    )
             _upsert_one(cur, account_id, entry)
         conn.commit()
     invalidate_auth_map_cache()

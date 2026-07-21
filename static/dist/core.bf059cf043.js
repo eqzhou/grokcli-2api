@@ -5329,11 +5329,11 @@ function renderGuide() {
   $("guide-base").textContent = base;
   $("guide-model").textContent = model;
   $("guide-curl").textContent = `curl ${base}/chat/completions \\
-  -H "Authorization: Bearer sk-g2a-YOUR_KEY" \\
+  -H "Authorization: Bearer YOUR_G2A_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{"model":"${model}","messages":[{"role":"user","content":"你好"}],"stream":false}'`;
   $("guide-py").textContent = `from openai import OpenAI
-client = OpenAI(base_url="${base}", api_key="sk-g2a-YOUR_KEY")
+client = OpenAI(base_url="${base}", api_key=os.environ["G2A_API_KEY"])
 r = client.chat.completions.create(
     model="${model}",
     messages=[{"role": "user", "content": "Hello"}],
@@ -5364,14 +5364,14 @@ print(r.choices[0].message.tool_calls or r.choices[0].message.content)`;
     $("guide-anthropic").textContent = `# Anthropic Messages API
 # Base URL 填网关根地址（或带 /v1）；鉴权用 x-api-key
 curl ${origin}/v1/messages \\
-  -H "x-api-key: sk-g2a-YOUR_KEY" \\
+  -H "x-api-key: YOUR_G2A_API_KEY" \\
   -H "anthropic-version: 2023-06-01" \\
   -H "Content-Type: application/json" \\
   -d '{"model":"${model}","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
 
 # Python anthropic SDK
 from anthropic import Anthropic
-client = Anthropic(base_url="${origin}", api_key="sk-g2a-YOUR_KEY")
+client = Anthropic(base_url="${origin}", api_key=os.environ["G2A_API_KEY"])
 msg = client.messages.create(
     model="${model}",
     max_tokens=1024,
@@ -7689,8 +7689,9 @@ on("auth-submit", "onclick", async () => {  const password = $("password").value
     const data = setup
       ? await api("/setup", { method: "POST", body: JSON.stringify({ password }) })
       : await api("/login", { method: "POST", body: JSON.stringify({ password }) });
-    token = data.token;
-    localStorage.setItem(TOKEN_KEY, token);
+    token = "";
+    localStorage.removeItem(TOKEN_KEY);
+    if (window.G2A && G2A.markAuthOk) G2A.markAuthOk();
     if ($("password")) $("password").value = "";
     statusCache = await api("/status");
     await loadDashboard();
@@ -10036,7 +10037,8 @@ async function changeAdminPassword() {
   const nw = ($("set-new-password") && $("set-new-password").value) || "";
   const cf = ($("set-confirm-password") && $("set-confirm-password").value) || "";
   if (!cur) throw new Error("请输入当前密码（不会自动填入，需手动输入）");
-  if (!nw || nw.length < 4) throw new Error("新密码至少 4 位");
+  if (!nw || Array.from(nw).length < 12) throw new Error("新密码至少 12 位");
+  if (new TextEncoder().encode(nw).length > 256) throw new Error("新密码不能超过 256 字节");
   if (nw !== cf) throw new Error("两次输入的新密码不一致");
   if (cur === nw) throw new Error("新密码不能与当前密码相同");
   const btn = $("btn-change-password");

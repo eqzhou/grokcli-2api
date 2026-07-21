@@ -48,7 +48,10 @@ API_PREFIX = "/internal/registration/v1"
 def _require_auth(request: Request) -> None:
     expected = (os.environ.get("GROK2API_REGISTRATION_TOKEN") or "").strip()
     if not expected:
-        return
+        raise HTTPException(
+            status_code=503,
+            detail="registration token is not configured",
+        )
     auth = (request.headers.get("authorization") or "").strip()
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="registration token required")

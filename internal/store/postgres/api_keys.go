@@ -125,13 +125,7 @@ func (r APIKeyRecord) PublicMap() map[string]any {
 		"last_used_at":  unixOrNil(r.LastUsedAt),
 		"request_count": r.RequestCount,
 		"key_hint":      r.Prefix + "…****",
-		"has_secret":    r.Secret != nil && strings.TrimSpace(*r.Secret) != "",
-	}
-	if r.Secret != nil {
-		secret := strings.TrimSpace(*r.Secret)
-		if secret != "" && !strings.HasPrefix(secret, "enc:v1:") {
-			out["secret"] = secret
-		}
+		"has_secret":    false,
 	}
 	return out
 }
@@ -180,13 +174,12 @@ func (c *Connector) CreateAPIKey(ctx context.Context, name, note string) (Create
 	now := time.Now()
 	_, err = c.Pool.Exec(ctx, `
 		INSERT INTO api_keys (id, name, prefix, key_hash, secret, enabled, note, created_at)
-		VALUES ($1, $2, $3, $4, $5, true, $6, $7)
-	`, id, name, prefix, hash, secret, note, now)
+		VALUES ($1, $2, $3, $4, NULL, true, $5, $6)
+	`, id, name, prefix, hash, note, now)
 	if err != nil {
 		return CreateAPIKeyResult{}, err
 	}
-	secretCopy := secret
-	rec := APIKeyRecord{ID: id, Name: name, Prefix: prefix, KeyHash: hash, Secret: &secretCopy, Enabled: true, Note: note, CreatedAt: &now}
+	rec := APIKeyRecord{ID: id, Name: name, Prefix: prefix, KeyHash: hash, Enabled: true, Note: note, CreatedAt: &now}
 	return CreateAPIKeyResult{Record: rec, Secret: secret}, nil
 }
 
@@ -244,15 +237,14 @@ func (c *Connector) RegenerateAPIKey(ctx context.Context, id string) (CreateAPIK
 	}
 	hash := hashAPIKey(secret)
 	_, err = c.Pool.Exec(ctx, `
-		UPDATE api_keys SET prefix = $2, key_hash = $3, secret = $4 WHERE id = $1
-	`, id, prefix, hash, secret)
+		UPDATE api_keys SET prefix = $2, key_hash = $3, secret = NULL WHERE id = $1
+	`, id, prefix, hash)
 	if err != nil {
 		return CreateAPIKeyResult{}, err
 	}
-	secretCopy := secret
 	current.Prefix = prefix
 	current.KeyHash = hash
-	current.Secret = &secretCopy
+	current.Secret = nil
 	return CreateAPIKeyResult{Record: *current, Secret: secret}, nil
 }
 

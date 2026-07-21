@@ -99,6 +99,14 @@ def _sql_like_or(column: str, n: int) -> str:
 @dataclass
 class CF:
     token: str
+    _session: Any = None
+
+    def _http(self) -> Any:
+        if self._session is None:
+            sess = requests.Session()
+            sess.trust_env = False
+            self._session = sess
+        return self._session
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = API_BASE + path
@@ -112,9 +120,7 @@ class CF:
         last_error: Exception | None = None
         for attempt in range(4):
             try:
-                with requests.Session() as sess:
-                    sess.trust_env = False
-                    r = sess.request(method, url, headers=headers, timeout=30, **kwargs)
+                r = self._http().request(method, url, headers=headers, timeout=30, **kwargs)
                 break
             except requests.exceptions.SSLError as exc:
                 last_error = exc

@@ -10,11 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/buildinfo"
+)
+
+var (
+	updateTagPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	updateImagePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$`)
 )
 
 const (
@@ -254,9 +260,10 @@ func serveVersionUpdate(w http.ResponseWriter, r *http.Request, options Options)
 		return
 	}
 	var body map[string]any
-	decoder := json.NewDecoder(r.Body)
-	decoder.UseNumber()
-	_ = decoder.Decode(&body)
+	if err := decodeJSONRequest(w, r, &body, maxAdminJSONBodyBytes); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, statusForDecodeError(err), map[string]any{"ok": false, "detail": err.Error()})
+		return
+	}
 	if body == nil {
 		body = map[string]any{}
 	}
@@ -277,6 +284,10 @@ func serveVersionUpdate(w http.ResponseWriter, r *http.Request, options Options)
 	image := strings.TrimSpace(stringValue(body["image"]))
 	if image == "" {
 		image = ghcrImage()
+	}
+	if err := validateUpdateTarget(tag, image); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "detail": err.Error()})
+		return
 	}
 	mode, supported, hint := updateMode()
 	if !supported {
@@ -344,6 +355,22 @@ func serveVersionUpdate(w http.ResponseWriter, r *http.Request, options Options)
 			"file":    filepath.Join(dataDir(options), updateRequestFile),
 		})
 	}
+}
+
+func validateUpdateTarget(tag, image string) error {
+	tag = strings.TrimSpace(strings.TrimPrefix(tag, "v"))
+	image = strings.TrimSpace(image)
+	configuredImage := ghcrImage()
+	if !updateTagPattern.MatchString(tag) {
+		return errors.New("invalid update tag")
+	}
+	if !updateImagePattern.MatchString(image) {
+		return errors.New("invalid update image")
+	}
+	if image != configuredImage {
+		return errors.New("update image override is not allowed")
+	}
+	return nil
 }
 
 func checkLatestVersion(ctx context.Context, force bool) versionCheckResult {

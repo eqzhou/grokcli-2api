@@ -37,6 +37,9 @@ This client reproduces the wire format faithfully; it does not bypass those.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import gzip
 import http.cookiejar
 import io
@@ -319,6 +322,13 @@ class XConsoleAuthClient:
 
     # Chunks that are likely to contain the action ID (from the RSC flight data).
     # We search these first; the sign-up action chunk has field-name keywords.
+    # Process-level cache: next-action id keyed by chunk URL set (TTL ~15 min).
+    _ACTION_ID_CACHE: dict = {}
+    _ACTION_ID_CACHE_LOCK = threading.Lock()
+    _ACTION_ID_CACHE_TTL = 15 * 60
+    _CHUNK_BODY_CACHE: dict = {}
+    _CHUNK_BODY_CACHE_LOCK = threading.Lock()
+
     _PRIORITY_CHUNK_PATTERNS = [
         r'06rqcsyrqa6v-',   # sign-up action (contains createUserAndSessionRequest)
         r'0ewiyh8jhugm9',   # actionId dispatch / extractInfoFromServerReferenceId
@@ -354,6 +364,16 @@ class XConsoleAuthClient:
         if self.debug:
             print(f"  [scrape] searching {len(js_urls)} JS chunks...")
 
+        cache_key = tuple(sorted(js_urls))
+        now = time.time()
+        with self._ACTION_ID_CACHE_LOCK:
+            hit = self._ACTION_ID_CACHE.get(cache_key)
+            if hit and (now - float(hit.get("ts") or 0)) < float(self._ACTION_ID_CACHE_TTL):
+                if self.debug:
+                    print(f"  [scrape] action ID cache hit ({len(hit.get('id') or '')} chars)")
+                return str(hit["id"])
+
+
         # 2. sort: priority chunks first, then the rest
         priority: List[str] = []
         rest: List[str] = []
@@ -372,9 +392,26 @@ class XConsoleAuthClient:
         def _fetch_and_search(path: str) -> Tuple[Optional[str], bool]:
             """Return (hash_or_None, is_signup_chunk)."""
             try:
-                full = f"https://accounts.x.ai{path}"
-                _s, _h, _sc, raw = self._request("GET", full, headers=self._base_headers())
-                text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+                text = None
+                with self._CHUNK_BODY_CACHE_LOCK:
+                    cached = self._CHUNK_BODY_CACHE.get(path)
+                    if cached and (time.time() - float(cached.get("ts") or 0)) < float(
+                        self._ACTION_ID_CACHE_TTL
+                    ):
+                        text = cached.get("text")
+                if text is None:
+                    full = f"https://accounts.x.ai{path}"
+                    _s, _h, _sc, raw = self._request("GET", full, headers=self._base_headers())
+                    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+                    with self._CHUNK_BODY_CACHE_LOCK:
+                        self._CHUNK_BODY_CACHE[path] = {"ts": time.time(), "text": text}
+                        if len(self._CHUNK_BODY_CACHE) > 80:
+                            oldest = sorted(
+                                self._CHUNK_BODY_CACHE.items(),
+                                key=lambda kv: float((kv[1] or {}).get("ts") or 0),
+                            )[:20]
+                            for k, _ in oldest:
+                                self._CHUNK_BODY_CACHE.pop(k, None)
                 hashes = set(re.findall(r'"([a-f0-9]{42})"', text))
                 if not hashes:
                     return (None, False)
@@ -415,6 +452,11 @@ class XConsoleAuthClient:
         if self.debug:
             print(f"  [scrape] action ID={action_hash[:16]}... "
                   f"({len(action_hash)} chars, {'signup-chunk' if signup_hash else 'fallback'})")
+        try:
+            with self._ACTION_ID_CACHE_LOCK:
+                self._ACTION_ID_CACHE[cache_key] = {"ts": time.time(), "id": action_hash}
+        except Exception:
+            pass
         return action_hash
 
     @property

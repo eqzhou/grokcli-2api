@@ -45,6 +45,14 @@ class TempmailInbox:
     address: str = ""
     token: str = ""
     _created: bool = field(default=False, init=False)
+    _http: requests.Session | None = field(default=None, init=False, repr=False)
+
+    def _session(self) -> requests.Session:
+        if self._http is None:
+            sess = requests.Session()
+            sess.headers.update(self._auth_headers())
+            self._http = sess
+        return self._http
 
     def _auth_headers(self) -> dict:
         return {"Authorization": f"Bearer {self.api_key}"}
@@ -54,9 +62,8 @@ class TempmailInbox:
         if self._created:
             raise RuntimeError("Inbox already created")
 
-        resp = requests.post(
+        resp = self._session().post(
             f"{self.base_url}/v2/inbox/create",
-            headers=self._auth_headers(),
             json={"prefix": self.prefix},
             timeout=15,
         )
@@ -80,9 +87,8 @@ class TempmailInbox:
         if not self._created:
             raise RuntimeError("Call create() first")
 
-        resp = requests.get(
+        resp = self._session().get(
             f"{self.base_url}/v2/inbox",
-            headers=self._auth_headers(),
             params={"token": self.token},
             timeout=15,
         )

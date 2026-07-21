@@ -1202,6 +1202,21 @@ def export_cliproxyapi_payload(
     return payload
 
 
+
+def _total_accounts_fast() -> int:
+    """Cheap account total for import responses (avoid full-table read_auth_map)."""
+    try:
+        from grok2api.store.accounts_pg import enabled as pg_on, count_accounts
+
+        if pg_on():
+            return int(count_accounts() or 0)
+    except Exception:
+        pass
+    try:
+        return int(len(read_auth_map() or {}))
+    except Exception:
+        return 0
+
 def merge_normalized_accounts(
     normalized: dict[str, dict[str, Any]], *, merge: bool = True
 ) -> dict[str, Any]:
@@ -1217,7 +1232,7 @@ def merge_normalized_accounts(
             "ok": False,
             "error": "no valid account entries found",
             "imported": [],
-            "total_accounts": len(read_auth_map()),
+            "total_accounts": _total_accounts_fast(),
         }
 
     storage = _accounts_store_source()
@@ -1259,7 +1274,7 @@ def merge_normalized_accounts(
                 invalidate_pool_summary_cache()
             except Exception:
                 pass
-            total = len(read_auth_map())
+            total = _total_accounts_fast()
             ok = len(imported_rows) > 0 and not errors
             out = {
                 "ok": ok or (len(imported_rows) > 0 and len(errors) < len(normalized)),
@@ -1444,7 +1459,7 @@ def import_auth_payload(
             "imported": [],
             "count": 0,
             "auth_file": str(AUTH_FILE),
-            "total_accounts": len(read_auth_map()),
+            "total_accounts": _total_accounts_fast(),
             "format": dry.get("format"),
         }
     result = merge_normalized_accounts(normalized, merge=merge)

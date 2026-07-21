@@ -113,3 +113,17 @@ func (c *Connector) DeleteAdminSession(token string) error {
 	_, err = c.Pool.Exec(ctx, `UPDATE app_settings SET value = $1::jsonb, updated_at = now() WHERE key = 'sessions'`, encoded)
 	return err
 }
+
+func (c *Connector) DeleteAllAdminSessions() error {
+	if c == nil || c.Pool == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := c.Pool.Exec(ctx, `
+		INSERT INTO app_settings (key, value, updated_at)
+		VALUES ('sessions', '{}'::jsonb, now())
+		ON CONFLICT (key) DO UPDATE SET value = '{}'::jsonb, updated_at = now()
+	`)
+	return err
+}

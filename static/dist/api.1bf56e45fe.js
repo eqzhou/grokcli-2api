@@ -13,15 +13,17 @@ window.G2A = window.G2A || {};
   // Soft trust window: after successful auth, do not force-redirect on transient 401
   // for a short period (cookie / redis touch races, multi-worker lag).
   const AUTH_GRACE_MS = 5 * 60 * 1000;
-  let token = localStorage.getItem(TOKEN_KEY) || "";
+  // Admin authentication is cookie-only. Remove legacy bearer tokens from
+  // script-readable storage so an XSS cannot recover a seven-day session.
+  let token = "";
+  try { localStorage.removeItem(TOKEN_KEY); } catch (_) {}
   const listeners = { unauthorized: [] };
   let lastAuthOkAt = Number(localStorage.getItem(TOKEN_TS_KEY) || 0) || 0;
 
   function getToken() { return token; }
   function setToken(t) {
-    token = t || "";
-    if (token) {
-      localStorage.setItem(TOKEN_KEY, token);
+    token = "";
+    if (t) {
       lastAuthOkAt = Date.now();
       localStorage.setItem(TOKEN_TS_KEY, String(lastAuthOkAt));
     } else {
@@ -36,12 +38,11 @@ window.G2A = window.G2A || {};
     try { localStorage.setItem(TOKEN_TS_KEY, String(lastAuthOkAt)); } catch (_) {}
   }
   function inAuthGrace() {
-    return !!(token && lastAuthOkAt && (Date.now() - lastAuthOkAt) < AUTH_GRACE_MS);
+    return !!(lastAuthOkAt && (Date.now() - lastAuthOkAt) < AUTH_GRACE_MS);
   }
   function headers(json = true) {
     const h = {};
     if (json) h["Content-Type"] = "application/json";
-    if (token) h["X-Admin-Token"] = token;
     return h;
   }
   function onUnauthorized(fn) { listeners.unauthorized.push(fn); }
@@ -181,7 +182,7 @@ window.G2A = window.G2A || {};
       throw err;
     }
     // Successful authenticated call refreshes grace window.
-    if (token && !String(path || "").startsWith("/status")) {
+    if (!String(path || "").startsWith("/status")) {
       markAuthOk();
     }
     return data;

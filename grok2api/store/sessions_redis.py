@@ -47,6 +47,14 @@ def _admin_key(token: str) -> str:
     return key("admin", "sess", token)
 
 
+def _admin_generation() -> str:
+    client = get_client()
+    if client is None:
+        return ""
+    value = client.get(key("admin", "session_generation"))
+    return str(value).strip() if value is not None else ""
+
+
 # ── device login ─────────────────────────────────────────────────────────────
 
 
@@ -135,6 +143,40 @@ def reg_sess_get(session_id: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def reg_sess_mget(session_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Bulk-load registration sessions via Redis MGET (bounded id list)."""
+    out: dict[str, dict[str, Any]] = {}
+    ids = [str(s).strip() for s in (session_ids or []) if str(s or "").strip()]
+    if not ids or not redis_enabled():
+        return out
+    c = get_client()
+    if c is None:
+        return out
+    import json as _json
+
+    keys = [_reg_sess_key(sid) for sid in ids]
+    try:
+        vals = c.mget(keys)
+    except Exception:
+        for sid in ids:
+            data = reg_sess_get(sid)
+            if isinstance(data, dict):
+                out[sid] = data
+        return out
+    for sid, raw in zip(ids, vals or []):
+        if raw is None:
+            continue
+        try:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "replace")
+            data = _json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            out[sid] = data
+    return out
+
+
 def reg_sess_delete(session_id: str) -> None:
     if not redis_enabled():
         return
@@ -197,23 +239,38 @@ def reg_batch_list() -> list[dict[str, Any]]:
 def admin_session_put(token: str, *, ttl: int = ADMIN_TTL) -> None:
     if not redis_enabled() or not token:
         return
-    set_json(_admin_key(token), {"ts": __import__("time").time()}, ttl)
+    set_json(
+        _admin_key(token),
+        {"ts": __import__("time").time(), "generation": _admin_generation()},
+        ttl,
+    )
 
 
 def admin_session_touch(token: str, *, ttl: int = ADMIN_TTL) -> bool:
     if not redis_enabled() or not token:
         return False
     existing = get_json(_admin_key(token))
-    if existing is None:
+    if not isinstance(existing, dict):
         return False
-    set_json(_admin_key(token), {"ts": __import__("time").time()}, ttl)
+    generation = _admin_generation()
+    if str(existing.get("generation") or "") != generation:
+        return False
+    set_json(
+        _admin_key(token),
+        {"ts": __import__("time").time(), "generation": generation},
+        ttl,
+    )
     return True
 
 
 def admin_session_get(token: str) -> bool:
     if not redis_enabled() or not token:
         return False
-    return get_json(_admin_key(token)) is not None
+    existing = get_json(_admin_key(token))
+    return (
+        isinstance(existing, dict)
+        and str(existing.get("generation") or "") == _admin_generation()
+    )
 
 
 def admin_session_delete(token: str) -> None:

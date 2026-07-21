@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -574,7 +575,21 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("POST /admin/api/settings/sub2api/groups", func(w http.ResponseWriter, r *http.Request) {
 		serveSub2APIGroupsCreate(w, r, options)
 	})
-	return mux
+	return withSecurityHeaders(withRequestBodyLimits(mux))
+}
+
+func withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+		if requestUsesHTTPS(r) {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func serveModels(w http.ResponseWriter, r *http.Request, options Options) {
@@ -633,9 +648,10 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxPublicRequestBodyBytes)
 	chatReq, err := proxy.DecodeChatRequest(r.Body)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		writeJSON(w, statusForDecodeError(err), map[string]any{"detail": err.Error()})
 		return
 	}
 	chatReq.UserAgent = r.UserAgent()
@@ -1664,10 +1680,8 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	// anthropic-beta: prompt-caching-* is accepted (sticky routing + usage fields).
 	_ = r.Header.Get("anthropic-beta")
 	var raw map[string]any
-	decoder := json.NewDecoder(r.Body)
-	decoder.UseNumber()
-	if err := decoder.Decode(&raw); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+	if err := decodeJSONRequest(w, r, &raw, maxPublicRequestBodyBytes); err != nil {
+		writeAnthropicError(w, statusForDecodeError(err), err.Error(), "invalid_request_error")
 		return
 	}
 	messages, _ := raw["messages"].([]any)
@@ -1884,10 +1898,8 @@ func serveMessagesCountTokens(w http.ResponseWriter, r *http.Request, options Op
 		return
 	}
 	var raw map[string]any
-	decoder := json.NewDecoder(r.Body)
-	decoder.UseNumber()
-	if err := decoder.Decode(&raw); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := decodeJSONRequest(w, r, &raw, maxPublicRequestBodyBytes); err != nil {
+		writeJSON(w, statusForDecodeError(err), map[string]any{"detail": err.Error()})
 		return
 	}
 	if !anthropic.HasMessagesOrSystem(raw) {
@@ -2148,10 +2160,8 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		return
 	}
 	var raw map[string]any
-	decoder := json.NewDecoder(r.Body)
-	decoder.UseNumber()
-	if err := decoder.Decode(&raw); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := decodeJSONRequest(w, r, &raw, maxPublicRequestBodyBytes); err != nil {
+		writeJSON(w, statusForDecodeError(err), map[string]any{"detail": err.Error()})
 		return
 	}
 	stream, _ := raw["stream"].(bool)
@@ -4174,17 +4184,19 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 			return
 		}
 	} else {
-		// Unprotected /admin/api/status is polled every ~8s by the admin UI.
-		// Serve a short-lived snapshot so reverse proxies never hit 502 on
-		// 7k-account PoolSummary scans.
-		statusPayloadMu.Lock()
-		if statusPayloadCache != nil && time.Since(statusPayloadAt) < 3*time.Second {
-			out := cloneStringAnyMap(statusPayloadCache)
-			statusPayloadMu.Unlock()
-			writeJSON(w, http.StatusOK, out)
-			return
+		setupNeeded := false
+		if options.Store != nil {
+			if has, err := options.Store.HasAdminPassword(r.Context()); err == nil {
+				setupNeeded = !has
+			}
 		}
-		statusPayloadMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"ready":        true,
+			"setup_needed": setupNeeded,
+			"version":      buildinfo.Version,
+		})
+		return
 	}
 	store := options.Store
 	accountCount, modelCount := int64(0), int64(0)
@@ -4268,17 +4280,10 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 		// Never block /status on a live upstream probe — only attach a recent cache.
 		"upstream_status": cachedUpstreamStatus(),
 	}
-	if protected {
-		payload["credentials"] = map[string]any{"email": nil, "active_count": pool.Live, "account_count": accountCount, "ok": pool.Live > 0}
-		payload["models"] = modelCatalog(options).PublicModels(r.Context())
-		payload["account_modes"] = []string{"round_robin", "random", "least_used"}
-		payload["full"] = false
-	} else {
-		statusPayloadMu.Lock()
-		statusPayloadCache = cloneStringAnyMap(payload)
-		statusPayloadAt = time.Now()
-		statusPayloadMu.Unlock()
-	}
+	payload["credentials"] = map[string]any{"email": nil, "active_count": pool.Live, "account_count": accountCount, "ok": pool.Live > 0}
+	payload["models"] = modelCatalog(options).PublicModels(r.Context())
+	payload["account_modes"] = []string{"round_robin", "random", "least_used"}
+	payload["full"] = false
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -4484,6 +4489,14 @@ func sharedRegistrationHTTP() *http.Client {
 	return regHTTPClient
 }
 
+// registrationStartHTTP is only for Start/create calls (not poll).
+func registrationStartHTTP() *http.Client {
+	return &http.Client{
+		Timeout:   8 * time.Second,
+		Transport: sharedRegistrationHTTP().Transport,
+	}
+}
+
 func registrationClient(options Options) *regclient.Client {
 	base := strings.TrimSpace(options.RegistrationURL)
 	if base == "" {
@@ -4568,10 +4581,6 @@ func touchRedisPool(options Options, accountID string, success bool, errText str
 // Never run full UsageSummary / full-table scans here — reverse proxies
 // (Cloudflare/nginx) return HTML 502 when this path stalls.
 var (
-	statusPayloadMu    sync.Mutex
-	statusPayloadCache map[string]any
-	statusPayloadAt    time.Time
-
 	usageLightMu         sync.Mutex
 	usageLightCache      map[string]any
 	usageLightAt         time.Time
@@ -5834,6 +5843,9 @@ func serveRegistrationStart(w http.ResponseWriter, r *http.Request, options Opti
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
 		return
 	}
+	// Start-only: allow more than the poll hop (750ms) while keeping poll snappy.
+	startClient := *client
+	startClient.HTTP = registrationStartHTTP()
 	var body map[string]any
 	decoder := json.NewDecoder(r.Body)
 	decoder.UseNumber()
@@ -5863,7 +5875,7 @@ func serveRegistrationStart(w http.ResponseWriter, r *http.Request, options Opti
 	if idem == "" {
 		idem = strings.TrimSpace(stringValue(body["idempotency_key"]))
 	}
-	payload, err := client.Start(r.Context(), body, idem)
+	payload, err := startClient.Start(r.Context(), body, idem)
 	if err != nil {
 		writeRegistrationError(w, err)
 		return
@@ -6339,12 +6351,19 @@ func modelCatalog(options Options) *models.Catalog {
 
 func publicAPIBase(r *http.Request, port int) string {
 	host := r.Host
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); forwarded != "" {
-		host = forwarded
+	proto := "http"
+	if r != nil && r.TLS != nil {
+		proto = "https"
 	}
-	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
-	if proto == "" {
-		proto = "http"
+	// Only honor reverse-proxy host/proto headers from configured trusted peers.
+	// Blind trust lets clients forge absolute URLs in API metadata responses.
+	if requestFromTrustedProxy(r) {
+		if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); forwarded != "" {
+			host = forwarded
+		}
+		if p := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); p != "" {
+			proto = strings.ToLower(p)
+		}
 	}
 	if strings.TrimSpace(host) == "" {
 		host = "127.0.0.1"
@@ -6364,8 +6383,8 @@ func serveAdminSetAccountEnabled(w http.ResponseWriter, r *http.Request, options
 		return
 	}
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := decodeJSONRequest(w, r, &body, maxAdminJSONBodyBytes); err != nil {
+		writeJSON(w, statusForDecodeError(err), map[string]any{"detail": err.Error()})
 		return
 	}
 	enabled, ok := body["enabled"].(bool)
@@ -6510,8 +6529,8 @@ func serveAdminDeleteAccountsBatch(w http.ResponseWriter, r *http.Request, optio
 		return
 	}
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := decodeJSONRequest(w, r, &body, maxAdminJSONBodyBytes); err != nil {
+		writeJSON(w, statusForDecodeError(err), map[string]any{"detail": err.Error()})
 		return
 	}
 	ids := stringSlice(body["ids"])
@@ -6857,17 +6876,13 @@ func serveChangeAdminPassword(w http.ResponseWriter, r *http.Request, options Op
 		return
 	}
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := decodeAdminAuthRequest(w, r, &body); err != nil {
+		writeJSON(w, statusForDecodeError(err), map[string]any{"detail": err.Error()})
 		return
 	}
 	current := stringValue(body["current_password"])
 	newPW := stringValue(body["new_password"])
 	confirm := stringValue(body["confirm_password"])
-	if len(newPW) < 4 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "password must contain at least 4 characters"})
-		return
-	}
 	if confirm != "" && confirm != newPW {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "两次输入的新密码不一致"})
 		return
@@ -6879,13 +6894,23 @@ func serveChangeAdminPassword(w http.ResponseWriter, r *http.Request, options Op
 	}
 	hash, salt, err := adminauth.NewPassword(newPW)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
 	if err := options.Store.SetAdminPassword(r.Context(), hash, salt); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
+	if err := revokeAdminSessions(options); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "password changed but old sessions could not be revoked"})
+		return
+	}
+	token, err := createAdminSession(options)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "password changed but a new session could not be created"})
+		return
+	}
+	setAdminCookie(w, r, token)
 	settings, _ := options.Store.PublicSettings(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "密码已更新", "settings": settings})
 }
@@ -8050,8 +8075,8 @@ func serveIntegrationSettingsPut(w http.ResponseWriter, r *http.Request, options
 		return
 	}
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := decodeJSONRequest(w, r, &body, maxAdminJSONBodyBytes); err != nil {
+		writeJSON(w, statusForDecodeError(err), map[string]any{"detail": err.Error()})
 		return
 	}
 	doTest := false
@@ -9089,7 +9114,51 @@ func adminWriteAllowed(w http.ResponseWriter, r *http.Request, options Options) 
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
 		return false
 	}
+	if !adminWriteRequestAuthorized(r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "Cross-origin admin write rejected"})
+		return false
+	}
 	return true
+}
+
+// adminWriteRequestAuthorized protects cookie-authenticated state changes from
+// same-site sibling-origin CSRF. Explicit bearer/header tokens are not ambient
+// browser credentials and continue to support non-browser admin clients.
+func adminWriteRequestAuthorized(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+		return true
+	}
+	if strings.TrimSpace(r.Header.Get("X-Admin-Token")) != "" || strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Authorization"))), "bearer ") {
+		return true
+	}
+	if _, err := r.Cookie(admin.AdminCookie); err != nil {
+		return true
+	}
+	source := strings.TrimSpace(r.Header.Get("Origin"))
+	if source == "" {
+		source = strings.TrimSpace(r.Header.Get("Referer"))
+	}
+	u, err := url.Parse(source)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(canonicalRequestHost(u.Host), canonicalRequestHost(r.Host))
+}
+
+func canonicalRequestHost(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	host, port, err := net.SplitHostPort(value)
+	if err != nil {
+		return strings.TrimSuffix(value, ".")
+	}
+	host = strings.TrimSuffix(strings.Trim(host, "[]"), ".")
+	if (port == "80" || port == "443") && host != "" {
+		return host
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func serveAdminSetup(w http.ResponseWriter, r *http.Request, options Options) {
@@ -9097,13 +9166,13 @@ func serveAdminSetup(w http.ResponseWriter, r *http.Request, options Options) {
 		return
 	}
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := decodeAdminAuthRequest(w, r, &body); err != nil {
+		writeJSON(w, statusForDecodeError(err), map[string]any{"detail": err.Error()})
 		return
 	}
 	password := stringValue(body["password"])
-	if len(password) < 4 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "password must contain at least 4 characters"})
+	if !adminSetupAuthorized(r, options.Config, password) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "Admin setup requires the configured GROK2API_ADMIN_PASSWORD bootstrap secret"})
 		return
 	}
 	has, err := options.Store.HasAdminPassword(r.Context())
@@ -9120,8 +9189,13 @@ func serveAdminSetup(w http.ResponseWriter, r *http.Request, options Options) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
-	if err := options.Store.SetAdminPassword(r.Context(), hash, salt); err != nil {
+	created, err := options.Store.SetAdminPasswordIfUnset(r.Context(), hash, salt)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusConflict, map[string]any{"detail": "admin password already configured"})
 		return
 	}
 	token, err := createAdminSession(options)
@@ -9129,8 +9203,16 @@ func serveAdminSetup(w http.ResponseWriter, r *http.Request, options Options) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
-	setAdminCookie(w, token)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "token": token, "message": "Admin password created"})
+	setAdminCookie(w, r, token)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Admin password created"})
+}
+
+func adminSetupAuthorized(_ *http.Request, cfg config.Config, password string) bool {
+	bootstrap := strings.TrimSpace(cfg.LegacyAdminPassword)
+	if bootstrap == "" {
+		bootstrap = strings.TrimSpace(os.Getenv("GROK2API_ADMIN_PASSWORD"))
+	}
+	return bootstrap != "" && constantTimeEqualString(password, bootstrap)
 }
 
 func serveAdminLogin(w http.ResponseWriter, r *http.Request, options Options) {
@@ -9146,28 +9228,49 @@ func serveAdminLogin(w http.ResponseWriter, r *http.Request, options Options) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
 		return
 	}
+	clientKey := loginClientKey(r)
+	if !adminLoginAttempts.Allow(clientKey) {
+		w.Header().Set("Retry-After", "900")
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"detail": "Too many failed login attempts"})
+		return
+	}
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := decodeAdminAuthRequest(w, r, &body); err != nil {
+		writeJSON(w, statusForDecodeError(err), map[string]any{"detail": err.Error()})
 		return
 	}
 	password := stringValue(body["password"])
+	if len(password) > 1024 {
+		adminLoginAttempts.RecordFailure(clientKey)
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "password must not exceed 1024 bytes"})
+		return
+	}
+	select {
+	case adminLoginSlots <- struct{}{}:
+		defer func() { <-adminLoginSlots }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"detail": "Too many concurrent login attempts"})
+		return
+	}
 	ok, err := verifyAdminPassword(r.Context(), options, password)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
 	if !ok {
+		adminLoginAttempts.RecordFailure(clientKey)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Invalid admin password"})
 		return
 	}
+	adminLoginAttempts.Reset(clientKey)
 	token, err := createAdminSession(options)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
-	setAdminCookie(w, token)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "token": token})
+	setAdminCookie(w, r, token)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func serveAdminSession(w http.ResponseWriter, r *http.Request, options Options) {
@@ -9179,12 +9282,12 @@ func serveAdminSession(w http.ResponseWriter, r *http.Request, options Options) 
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": readyReason(options)})
 		return
 	}
-	token, ok := admin.RequireSession(r, options.AdminSessions)
+	_, ok := admin.RequireSession(r, options.AdminSessions)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "authenticated": false})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "authenticated": true, "token": token})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "authenticated": true})
 }
 
 func serveAdminLogout(w http.ResponseWriter, r *http.Request, options Options) {
@@ -9192,11 +9295,15 @@ func serveAdminLogout(w http.ResponseWriter, r *http.Request, options Options) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Go admin routes are not enabled"})
 		return
 	}
+	if !adminWriteRequestAuthorized(r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "Cross-origin admin write rejected"})
+		return
+	}
 	token := admin.ExtractSession(r)
 	if token != "" {
 		deleteAdminSession(options, token)
 	}
-	clearAdminCookie(w)
+	clearAdminCookie(w, r)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -9307,8 +9414,15 @@ func verifyAdminPassword(ctx context.Context, options Options, password string) 
 	if options.Store == nil {
 		return false, errors.New("store unavailable")
 	}
-	pw, err := options.Store.LoadAdminPassword(ctx)
-	if err == nil && pw.Hash != "" && pw.Salt != "" {
+	hasStoredPassword, err := options.Store.HasAdminPassword(ctx)
+	if err != nil {
+		return false, err
+	}
+	if hasStoredPassword {
+		pw, loadErr := options.Store.LoadAdminPassword(ctx)
+		if loadErr != nil {
+			return false, loadErr
+		}
 		return adminauth.VerifyPassword(password, pw.Hash, pw.Salt), nil
 	}
 	// bootstrap via env password only when no store hash exists
@@ -9317,10 +9431,19 @@ func verifyAdminPassword(ctx context.Context, options Options, password string) 
 		// fallback common env already loaded? use os.Getenv for ADMIN_PASSWORD
 		envPW = strings.TrimSpace(os.Getenv("GROK2API_ADMIN_PASSWORD"))
 	}
-	if envPW != "" && subtle.ConstantTimeCompare([]byte(password), []byte(envPW)) == 1 {
+	if envPW != "" && constantTimeEqualString(password, envPW) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// constantTimeEqualString compares secrets without leaking length via panic.
+// crypto/subtle.ConstantTimeCompare panics when lengths differ.
+func constantTimeEqualString(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func createAdminSession(options Options) (string, error) {
@@ -9331,9 +9454,10 @@ func createAdminSession(options Options) (string, error) {
 	token := base64.RawURLEncoding.EncodeToString(buf)
 	// Prefer Redis session store (Python path), fall back to Postgres sessions map.
 	if rc, ok := options.AdminSessions.(interface{ CreateAdminSession(string) error }); ok {
-		if err := rc.CreateAdminSession(token); err == nil {
-			return token, nil
+		if err := rc.CreateAdminSession(token); err != nil {
+			return "", err
 		}
+		return token, nil
 	}
 	if options.Store != nil {
 		if err := options.Store.CreateAdminSession(token); err != nil {
@@ -9353,19 +9477,61 @@ func deleteAdminSession(options Options, token string) {
 	}
 }
 
-func setAdminCookie(w http.ResponseWriter, token string) {
+func revokeAdminSessions(options Options) error {
+	var revokeErrors []error
+	if sessions, ok := options.AdminSessions.(interface{ DeleteAllAdminSessions() error }); ok {
+		if err := sessions.DeleteAllAdminSessions(); err != nil {
+			revokeErrors = append(revokeErrors, err)
+		}
+	}
+	if options.Store != nil {
+		if err := options.Store.DeleteAllAdminSessions(); err != nil {
+			revokeErrors = append(revokeErrors, err)
+		}
+	}
+	return errors.Join(revokeErrors...)
+}
+
+func setAdminCookie(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     admin.AdminCookie,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		Secure:   requestUsesHTTPS(r),
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   int((7 * 24 * time.Hour).Seconds()),
 	})
 }
 
-func clearAdminCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{Name: admin.AdminCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+func clearAdminCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{Name: admin.AdminCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: requestUsesHTTPS(r), SameSite: http.SameSiteStrictMode})
+}
+
+func requestUsesHTTPS(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	// X-Forwarded-Proto is attacker-controlled unless the peer is a trusted proxy.
+	if !requestFromTrustedProxy(r) {
+		return false
+	}
+	proto := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])
+	return strings.EqualFold(proto, "https")
+}
+
+func requestFromTrustedProxy(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(r.RemoteAddr), "[]")
+	}
+	return trustedProxyIP(net.ParseIP(host))
 }
 
 func serveAdminPage(w http.ResponseWriter, r *http.Request, staticDir, page string) {

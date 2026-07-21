@@ -11,11 +11,29 @@ func TestPythonCompatibilityVector(t *testing.T) {
 }
 
 func TestPasswordRoundTrip(t *testing.T) {
-	hash, salt, err := NewPassword("secret")
+	hash, salt, err := NewPassword("a-strong-password")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !VerifyPassword("secret", hash, salt) || VerifyPassword("wrong", hash, salt) {
+	if !VerifyPassword("a-strong-password", hash, salt) || VerifyPassword("wrong", hash, salt) {
 		t.Fatal("password verification mismatch")
+	}
+}
+
+func TestNewPasswordRejectsWeakPassword(t *testing.T) {
+	if _, _, err := NewPassword("short"); err == nil {
+		t.Fatal("weak password accepted")
+	}
+}
+
+func TestNewPasswordCountsCharactersAndCapsBytes(t *testing.T) {
+	if _, _, err := NewPassword("密码密码密码密码"); err == nil {
+		t.Fatal("four multibyte characters bypassed minimum length")
+	}
+	if _, _, err := NewPassword("密码密码密码密码密码密码密码密码密码密码密码密码"); err != nil {
+		t.Fatalf("twelve characters rejected: %v", err)
+	}
+	if _, _, err := NewPassword(string(make([]byte, 257))); err == nil {
+		t.Fatal("oversized password accepted")
 	}
 }

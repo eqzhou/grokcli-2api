@@ -96,13 +96,18 @@
 git clone https://github.com/HM2899/grokcli-2api.git
 cd grokcli-2api
 cp .env.example .env
-# 编辑 .env：至少改 GROK2API_ADMIN_PASSWORD；生产请改 Postgres 密码
+# 编辑 .env：设置强 GROK2API_ADMIN_PASSWORD，并为 POSTGRES_PASSWORD、
+# REDIS_PASSWORD、GROK2API_REGISTRATION_TOKEN 分别生成 URL-safe 随机值
+#（可用 openssl rand -hex 32）
 
 docker compose up -d --build
 curl -fsS http://127.0.0.1:3000/health
 ```
 
-浏览器打开：`http://127.0.0.1:3000/admin`
+浏览器打开：`http://127.0.0.1:3000/admin`。Compose 默认仅绑定宿主 loopback；
+远程部署请通过启用 HTTPS 的反向代理访问，不要直接把管理端口暴露到公网。
+若反向代理会转发客户端地址，请把其实际来源网段配置到
+`GROK2API_TRUSTED_PROXY_CIDRS`；未配置时服务不会信任 `X-Forwarded-For`。
 
 #### 启动时指定打码线程数
 
@@ -139,7 +144,7 @@ TURNSTILE_THREAD=3 GROK2API_REG_CONCURRENCY=3 docker compose up -d --build
 
 | 服务 | 容器内地址 | 是否映射到宿主机 |
 |------|------------|------------------|
-| app | `0.0.0.0:3000` | 是 → `127.0.0.1:3000` |
+| app | `0.0.0.0:40081` | 是 → `127.0.0.1:3000` |
 | postgres | `postgres:5432` | **否**（compose 内网） |
 | redis | `redis:6379` | **否**（compose 内网） |
 | 本地过盾 | `127.0.0.1:5072` | **否**（主容器 loopback 内联） |
@@ -147,8 +152,8 @@ TURNSTILE_THREAD=3 GROK2API_REG_CONCURRENCY=3 docker compose up -d --build
 因此 compose 里应用环境变量应使用服务名，而不是 `127.0.0.1`：
 
 ```env
-REDIS_URL=redis://redis:6379/0
-DATABASE_URL=postgresql://grok2api:grok2api@postgres:5432/grok2api
+REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+DATABASE_URL=postgresql://grok2api:${POSTGRES_PASSWORD}@postgres:5432/grok2api
 ```
 
 > `.env.example` 中的 `127.0.0.1` 仅适用于「本机直接跑 Python、自己起 DB」的场景。
@@ -182,7 +187,7 @@ services:
     # 不要 ports —— 仅容器网络内访问
     environment:
       TZ: Asia/Shanghai
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "${REDIS_PASSWORD:?set in .env}"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -195,7 +200,7 @@ services:
       TZ: Asia/Shanghai
       PGTZ: Asia/Shanghai
       POSTGRES_USER: grok2api
-      POSTGRES_PASSWORD: change-me
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set in .env}"
       POSTGRES_DB: grok2api
     volumes:
       - grok2api_pg:/var/lib/postgresql/data
@@ -210,20 +215,23 @@ services:
     image: ghcr.io/hm2899/grokcli-2api:2.0.4
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       TZ: Asia/Shanghai
       GROK2API_HOST: "0.0.0.0"
       GROK2API_PORT: "3000"
-      GROK2API_ADMIN_PASSWORD: "change-me"
+      GROK2API_ADMIN_PASSWORD: "${GROK2API_ADMIN_PASSWORD:?set in .env}"
+      GROK2API_REQUIRE_API_KEY: "true"
+      GROK2API_API_KEY: "${GROK2API_API_KEY:?set in .env}"
+      GROK2API_REGISTRATION_TOKEN: "${GROK2API_REGISTRATION_TOKEN:?set in .env}"
       GROK2API_STORE_BACKEND: "hybrid"
       GROK2API_REQUIRE_SHARED_STORES: "1"
       GROK2API_WORKERS: "4"
       # 内联本地过盾（主容器 loopback，无需对外端口）
       GROK2API_CAPTCHA_PROVIDER: "local"
       GROK2API_INLINE_SOLVER: "1"
-      REDIS_URL: "redis://redis:6379/0"
-      DATABASE_URL: "postgresql://grok2api:change-me@postgres:5432/grok2api"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      DATABASE_URL: "postgresql://grok2api:${POSTGRES_PASSWORD}@postgres:5432/grok2api"
     volumes:
       - ./data:/app/data
     depends_on:
@@ -249,7 +257,7 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-s
 | `GROK2API_ADMIN_PASSWORD` | 管理台密码**首次种子**（无库内哈希时导入；之后以数据库为准） |
 | `GROK2API_STORE_BACKEND=hybrid` | 生产模式 |
 | `GROK2API_REQUIRE_SHARED_STORES=1` | Redis/PG 不可用则拒绝启动 |
-| `REDIS_URL` | Compose 内：`redis://redis:6379/0` |
+| `REDIS_URL` | Compose 内：`redis://:${REDIS_PASSWORD}@redis:6379/0` |
 | `DATABASE_URL` | Compose 内：`postgresql://…@postgres:5432/…` |
 | `GROK2API_WORKERS` | 建议 ≥2（按 CPU） |
 | `TZ` | 容器时区，默认 `Asia/Shanghai` |
@@ -799,35 +807,38 @@ docker-compose.yml                       # redis + postgres（内网）+ app
 管理台 **系统设置 → 版本与热更新**：
 
 1. 自动对照 GitHub Release 最新版（侧栏版本号 + 顶部横幅）
-2. 点击「热更新」在**容器内**执行：
+2. 默认只提供版本检查；热更新为 **disabled**
+3. 若运维显式启用旧的容器内更新，会执行：
    - `docker pull ghcr.io/hm2899/grokcli-2api:<tag>`
    - 写入 compose override 并 `docker compose up -d --force-recreate`
-3. **无需宿主机 watcher**（`g2a-update-watcher` 仅为兼容旧部署可选）
+4. 推荐让独立、受限的宿主部署流程完成更新，不要把 Docker Socket 暴露给 Web 应用
 
-### 容器内热更新要求（compose 已默认配好）
+### 旧容器内热更新（高权限，不默认启用）
+
+以下配置会让应用拥有近似宿主 root 的 Docker 权限，仅适合已理解风险的受控环境：
 
 ```yaml
 volumes:
   - /var/run/docker.sock:/var/run/docker.sock
   - ./:/compose          # 项目目录，用于 compose force-recreate
 environment:
-  GROK2API_HOT_UPDATE_MODE: docker          # 默认；缺 sock 时自动 disabled
+  GROK2API_HOT_UPDATE_MODE: docker          # 必须显式启用
   GROK2API_COMPOSE_DIR: /compose
   GROK2API_DOCKER_SERVICE: grokcli-2api
   GROK2API_GHCR_IMAGE: ghcr.io/hm2899/grokcli-2api
 ```
 
-镜像内置静态 `docker` 客户端 + `/app/scripts/g2a-hot-update-incontainer.sh`。
+默认镜像不再内置 Docker CLI。若显式启用旧容器内更新，运维方必须自行提供
+受控 Docker 客户端与权限；推荐使用容器外部署流程。
 
 可选环境变量：
 
 | 变量 | 说明 |
 |------|------|
-| `GROK2API_HOT_UPDATE_MODE` | `docker`（默认）/ `cmd` / `request_file` / `disabled` |
+| `GROK2API_HOT_UPDATE_MODE` | `disabled`（默认）/ `docker` / `cmd` / `request_file` |
 | `GROK2API_HOT_UPDATE_CMD` | 自定义 shell（占位 `{{TAG}}` `{{IMAGE}}`），MODE=cmd 或未设 MODE 时优先 |
 | `GROK2API_HOT_UPDATE_SCRIPT` | 覆盖内置更新脚本路径 |
 | `GROK2API_HOT_UPDATE_ALLOW_REQUEST_FILE=1` | 允许回退到写 `data/update.request`（旧 watcher） |
 | `GROK2API_GITHUB_TOKEN` | 提高 GitHub Release 检查限流额度 |
 
 兼容：若仍要宿主机 watcher，设置 `GROK2API_HOT_UPDATE_MODE=request_file` 并运行 `scripts/g2a-update-watcher.sh`。
-

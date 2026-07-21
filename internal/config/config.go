@@ -195,7 +195,7 @@ func Load() (Config, error) {
 		StoreBackend:                    storeBackend,
 		LegacyAPIKey:                    envString("GROK2API_API_KEY", ""),
 		LegacyAdminPassword:             envString("GROK2API_ADMIN_PASSWORD", ""),
-		RequireAPIKey:                   strings.ToLower(strings.TrimSpace(envString("GROK2API_REQUIRE_API_KEY", "auto"))),
+		RequireAPIKey:                   strings.ToLower(strings.TrimSpace(envString("GROK2API_REQUIRE_API_KEY", "true"))),
 		RequireSharedStores:             requireShared,
 		RequireMigrations:               requireMigrations,
 		Runtime:                         runtime,

@@ -284,10 +284,22 @@ func (c *Connector) HasAdminPassword(ctx context.Context) (bool, error) {
 }
 
 func (c *Connector) SetAdminPassword(ctx context.Context, hash, salt string) error {
+	_, err := c.setAdminPassword(ctx, hash, salt, false)
+	return err
+}
+
+// SetAdminPasswordIfUnset atomically claims first-time admin setup. A separate
+// HasAdminPassword/SetAdminPassword sequence permits two concurrent setup
+// requests to both pass the check and lets the later request replace the first.
+func (c *Connector) SetAdminPasswordIfUnset(ctx context.Context, hash, salt string) (bool, error) {
+	return c.setAdminPassword(ctx, hash, salt, true)
+}
+
+func (c *Connector) setAdminPassword(ctx context.Context, hash, salt string, onlyIfUnset bool) (bool, error) {
 	hash = strings.TrimSpace(hash)
 	salt = strings.TrimSpace(salt)
 	if hash == "" || salt == "" {
-		return errors.New("password hash/salt required")
+		return false, errors.New("password hash/salt required")
 	}
 	payload := map[string]any{
 		"admin_password_hash":       hash,
@@ -297,14 +309,22 @@ func (c *Connector) SetAdminPassword(ctx context.Context, hash, salt string) err
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if onlyIfUnset {
+		tag, execErr := c.Pool.Exec(ctx, `
+			INSERT INTO app_settings (key, value, updated_at)
+			VALUES ('admin_password', $1::jsonb, now())
+			ON CONFLICT (key) DO NOTHING
+		`, encoded)
+		return execErr == nil && tag.RowsAffected() == 1, execErr
 	}
 	_, err = c.Pool.Exec(ctx, `
 		INSERT INTO app_settings (key, value, updated_at)
 		VALUES ('admin_password', $1::jsonb, now())
 		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
 	`, encoded)
-	return err
+	return err == nil, err
 }
 
 func (c *Connector) SetSetting(ctx context.Context, key string, value any) error {

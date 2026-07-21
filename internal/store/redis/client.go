@@ -3,6 +3,7 @@ package redis
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -78,6 +79,17 @@ func (c *Client) VerifyAdminSession(token string) bool {
 	if err != nil || value == "" {
 		return false
 	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(value), &payload); err != nil {
+		return false
+	}
+	// encoding/json numbers decode as float64; accept string or numeric forms so
+	// mixed writers cannot permanently invalidate every session.
+	storedGeneration := redisScalarString(payload["generation"])
+	currentGeneration, err := c.currentAdminSessionGeneration(ctx)
+	if err != nil || storedGeneration != currentGeneration {
+		return false
+	}
 	_, _ = c.command(ctx, "EXPIRE", key, strconv.Itoa(adminSessionTTLSeconds))
 	return true
 }
@@ -91,8 +103,15 @@ func (c *Client) CreateAdminSession(token string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	payload := fmt.Sprintf(`{"ts":%d}`, time.Now().Unix())
-	_, err := c.command(ctx, "SET", c.key("admin", "sess", token), payload, "EX", strconv.Itoa(adminSessionTTLSeconds))
+	generation, err := c.currentAdminSessionGeneration(ctx)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(map[string]any{"ts": time.Now().Unix(), "generation": generation})
+	if err != nil {
+		return err
+	}
+	_, err = c.command(ctx, "SET", c.key("admin", "sess", token), string(payload), "EX", strconv.Itoa(adminSessionTTLSeconds))
 	return err
 }
 
@@ -105,6 +124,47 @@ func (c *Client) DeleteAdminSession(token string) error {
 	defer cancel()
 	_, err := c.command(ctx, "DEL", c.key("admin", "sess", token))
 	return err
+}
+
+func (c *Client) DeleteAllAdminSessions() error {
+	if !c.Enabled() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := c.command(ctx, "INCR", c.key("admin", "session_generation"))
+	return err
+}
+
+func (c *Client) currentAdminSessionGeneration(ctx context.Context) (string, error) {
+	value, err := c.command(ctx, "GET", c.key("admin", "session_generation"))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(value), nil
+}
+
+func redisScalarString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case json.Number:
+		return strings.TrimSpace(v.String())
+	case float64:
+		// JSON numbers without UseNumber land here.
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strings.TrimSpace(strconv.FormatFloat(v, 'f', -1, 64))
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
 }
 
 func (c *Client) key(parts ...string) string {

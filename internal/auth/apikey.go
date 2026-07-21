@@ -90,6 +90,12 @@ func (v *APIKeyVerifier) AuthRequired(ctx context.Context) (bool, error) {
 		return true, nil
 	case "0", "false", "no", "off":
 		return false, nil
+	case "auto":
+		// Explicit compatibility mode: require authentication after the first
+		// enabled database or legacy key exists.
+	default:
+		// Missing or malformed configuration must fail closed.
+		return true, nil
 	}
 	if strings.TrimSpace(v.cfg.LegacyAPIKey) != "" {
 		return true, nil
