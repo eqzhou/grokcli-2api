@@ -146,7 +146,7 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		return ChatResult{}, err
 	}
 	accounts := upstreamAccounts(chain)
-		body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
+	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	ensureUpstreamCacheKey(body, request)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
@@ -249,7 +249,7 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 		return StreamOpen{}, err
 	}
 	accounts := upstreamAccounts(chain)
-		body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
+	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	ensureUpstreamCacheKey(body, request)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
@@ -1777,7 +1777,6 @@ func (s *ChatService) clearStickyPins(ctx context.Context, request ChatRequest) 
 	}
 }
 
-
 // shouldDropStickyPin reports whether a sticky-primary open failure is durable
 // enough to abandon the multi-turn pin. Transient network/timeouts keep the pin
 // so the next turn can retry the cache-warm account (avoids intermittent cache
@@ -1929,7 +1928,6 @@ func upstreamAccounts(chain []pool.Candidate) []grok.Account {
 	}
 	return accounts
 }
-
 
 // ensureUpstreamCacheKey guarantees body.prompt_cache_key survives Stabilize/Sanitize
 // so cli-chat-proxy /responses receives the same key that affinity used. Without this,

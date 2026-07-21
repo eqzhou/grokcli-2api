@@ -58,7 +58,10 @@ type Service struct {
 
 	mu         sync.Mutex
 	started    bool
+	stopping   bool
 	stop       chan struct{}
+	done       chan struct{}
+	cancel     context.CancelFunc
 	runSoon    chan struct{}
 	last       map[string]any
 	modelRR    int
@@ -101,7 +104,6 @@ func New(store *postgres.Connector, redisClient *redis.Client, upstream string, 
 		ManualMaxWaves:      envInt("GROK2API_MODEL_PROBE_MANUAL_MAX_WAVES", defaultManualMaxWaves, 1, 200),
 		Enabled:             func() bool { return true },
 		IsLeader:            func() bool { return true },
-		stop:                make(chan struct{}),
 		runSoon:             make(chan struct{}, 1),
 		last:                map[string]any{"ok": true, "started": false},
 		httpClient:          newProbeHTTPClient(),
@@ -189,26 +191,55 @@ func (s *Service) probeHTTP() *http.Client {
 }
 
 func (s *Service) Start() {
-	s.mu.Lock()
-	if s.started {
+	for {
+		s.mu.Lock()
+		if s.started {
+			s.mu.Unlock()
+			return
+		}
+		if s.stopping {
+			done := s.done
+			s.mu.Unlock()
+			if done != nil {
+				<-done
+			}
+			continue
+		}
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		loopCtx, cancel := context.WithCancel(context.Background())
+		s.started = true
+		s.stop = stop
+		s.done = done
+		s.cancel = cancel
 		s.mu.Unlock()
+		go s.loop(loopCtx, stop, done)
 		return
 	}
-	s.started = true
-	s.mu.Unlock()
-	go s.loop()
 }
 
 func (s *Service) Stop() {
 	s.mu.Lock()
 	if !s.started {
+		done := s.done
+		stopping := s.stopping
 		s.mu.Unlock()
+		if stopping && done != nil {
+			<-done
+		}
 		return
 	}
 	s.started = false
-	close(s.stop)
-	s.stop = make(chan struct{})
+	s.stopping = true
+	stop := s.stop
+	done := s.done
+	cancel := s.cancel
+	close(stop)
 	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	<-done
 }
 
 func (s *Service) RequestRunSoon() {
@@ -313,18 +344,19 @@ func (s *Service) Status() map[string]any {
 	return out
 }
 
-func (s *Service) loop() {
+func (s *Service) loop(ctx context.Context, stop <-chan struct{}, done chan struct{}) {
+	defer s.finishLoop(done)
 	timer := time.NewTimer(8 * time.Second)
 	defer timer.Stop()
 	for {
 		select {
-		case <-s.stop:
+		case <-stop:
 			return
 		case <-timer.C:
-			s.maybeRun()
+			s.maybeRun(ctx)
 			timer.Reset(s.Interval)
 		case <-s.runSoon:
-			s.maybeRun()
+			s.maybeRun(ctx)
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -336,7 +368,19 @@ func (s *Service) loop() {
 	}
 }
 
-func (s *Service) maybeRun() {
+func (s *Service) finishLoop(done chan struct{}) {
+	s.mu.Lock()
+	if s.done == done {
+		s.stopping = false
+		s.stop = nil
+		s.done = nil
+		s.cancel = nil
+	}
+	close(done)
+	s.mu.Unlock()
+}
+
+func (s *Service) maybeRun(parent context.Context) {
 	if s.Enabled != nil && !s.Enabled() {
 		return
 	}
@@ -352,7 +396,7 @@ func (s *Service) maybeRun() {
 		return
 	}
 	// Background cycles stay inside the maintenance lock budget (~3 min).
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 4*time.Minute)
 	defer cancel()
 	result := s.RunOnce(ctx, "background")
 	s.mu.Lock()

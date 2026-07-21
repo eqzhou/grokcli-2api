@@ -12,6 +12,7 @@ from camoufox.async_api import AsyncCamoufox
 from patchright.async_api import async_playwright
 from db_results import init_db, save_result, load_result, cleanup_old_results
 from browser_configs import browser_config
+from solver_auth import client_key_allowed, supplied_client_key
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -161,6 +162,7 @@ class TurnstileAPIServer:
     def _setup_routes(self) -> None:
         """Set up the application routes."""
         self.app.before_serving(self._startup)
+        self.app.before_request(self._authorize_request)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
         # YesCaptcha / CapSolver 兼容协议
@@ -170,6 +172,34 @@ class TurnstileAPIServer:
         self.app.route('/health', methods=['GET'])(self.health)
         self.app.route('/reclaim', methods=['POST', 'GET'])(self.reclaim)
         self.app.route('/')(self.index)
+
+    async def _authorize_request(self):
+        """Require the configured API key on every non-health endpoint."""
+        if request.path == '/health':
+            return None
+        expected = os.getenv("API_KEY", "").strip()
+        if not expected:
+            return None
+        body_key = None
+        if request.method in {'POST', 'PUT', 'PATCH'}:
+            try:
+                body = await request.get_json(force=False, silent=True) or {}
+                if isinstance(body, dict):
+                    body_key = body.get("clientKey")
+            except Exception:
+                body_key = None
+        supplied = supplied_client_key(
+            request.headers.get("Authorization"),
+            request.args.get("clientKey"),
+            body_key,
+        )
+        if client_key_allowed(expected, supplied):
+            return None
+        return jsonify({
+            "errorId": 1,
+            "errorCode": "ERROR_KEY_DOES_NOT_EXIST",
+            "errorDescription": "Invalid clientKey",
+        }), 401
         
 
     async def _startup(self) -> None:
@@ -1353,19 +1383,6 @@ class TurnstileAPIServer:
 
 
 
-    def _check_client_key(self, client_key: Optional[str]) -> Optional[dict]:
-        """校验 clientKey。未设置 API_KEY 时跳过鉴权。"""
-        expected = os.getenv("API_KEY", "").strip()
-        if not expected:
-            return None
-        if not client_key or client_key.strip() != expected:
-            return {
-                "errorId": 1,
-                "errorCode": "ERROR_KEY_DOES_NOT_EXIST",
-                "errorDescription": "Invalid clientKey"
-            }
-        return None
-
     async def _enqueue_turnstile(
         self,
         url: str,
@@ -1486,10 +1503,6 @@ class TurnstileAPIServer:
         except Exception:
             body = {}
 
-        auth_err = self._check_client_key(body.get("clientKey"))
-        if auth_err:
-            return jsonify(auth_err), 200
-
         task = body.get("task") or {}
         task_type = (task.get("type") or "").strip()
         # Local Camoufox solver only has one Turnstile path. Accept YesCaptcha /
@@ -1534,10 +1547,6 @@ class TurnstileAPIServer:
             body = await request.get_json(force=True, silent=True) or {}
         except Exception:
             body = {}
-
-        auth_err = self._check_client_key(body.get("clientKey"))
-        if auth_err:
-            return jsonify(auth_err), 200
 
         task_id = body.get("taskId") or body.get("id")
         if not task_id:
@@ -1676,7 +1685,7 @@ def parse_args():
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')
     parser.add_argument('--version', type=str, help='Specify browser version to use (e.g., 139, 141)')
-    parser.add_argument('--host', type=str, default='0.0.0.0', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
+    parser.add_argument('--host', type=str, default='127.0.0.1', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
     parser.add_argument('--port', type=str, default='5072', help='Set the port for the API solver to listen on. (Default: 5072)')
     return parser.parse_args()
 
@@ -1688,6 +1697,8 @@ def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, t
 
 if __name__ == '__main__':
     args = parse_args()
+    if args.host not in {'127.0.0.1', 'localhost', '::1'} and not os.getenv('API_KEY', '').strip():
+        raise SystemExit('API_KEY is required when --host is not loopback')
     browser_types = [
         'chromium',
         'chrome',

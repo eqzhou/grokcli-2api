@@ -9328,6 +9328,9 @@ func serveAdminCreateKey(w http.ResponseWriter, r *http.Request, options Options
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
+	if options.APIKeys != nil {
+		options.APIKeys.InvalidateAuthRequired()
+	}
 	// Flat record for existing UI + nested aliases for clients that expect {key, secret}.
 	payload := result.Record.PublicMap()
 	payload["secret"] = result.Secret
@@ -9368,6 +9371,9 @@ func serveAdminUpdateKey(w http.ResponseWriter, r *http.Request, options Options
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
+	if options.APIKeys != nil {
+		options.APIKeys.InvalidateAPIKey(id)
+	}
 	writeJSON(w, http.StatusOK, rec.PublicMap())
 }
 
@@ -9379,10 +9385,14 @@ func serveAdminRegenerateKey(w http.ResponseWriter, r *http.Request, options Opt
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
 		return
 	}
-	result, err := options.Store.RegenerateAPIKey(r.Context(), r.PathValue("key_id"))
+	id := r.PathValue("key_id")
+	result, err := options.Store.RegenerateAPIKey(r.Context(), id)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
+	}
+	if options.APIKeys != nil {
+		options.APIKeys.InvalidateAPIKey(id)
 	}
 	payload := result.Record.PublicMap()
 	payload["secret"] = result.Secret
@@ -9398,7 +9408,8 @@ func serveAdminDeleteKey(w http.ResponseWriter, r *http.Request, options Options
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
 		return
 	}
-	ok, err := options.Store.DeleteAPIKey(r.Context(), r.PathValue("key_id"))
+	id := r.PathValue("key_id")
+	ok, err := options.Store.DeleteAPIKey(r.Context(), id)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
@@ -9406,6 +9417,9 @@ func serveAdminDeleteKey(w http.ResponseWriter, r *http.Request, options Options
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "api key not found"})
 		return
+	}
+	if options.APIKeys != nil {
+		options.APIKeys.InvalidateAPIKey(id)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

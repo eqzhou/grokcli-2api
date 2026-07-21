@@ -28,7 +28,10 @@ type Service struct {
 
 	mu        sync.Mutex
 	started   bool
+	stopping  bool
 	stop      chan struct{}
+	done      chan struct{}
+	cancel    context.CancelFunc
 	runSoon   chan struct{}
 	last      map[string]any
 	forceNext bool
@@ -45,33 +48,61 @@ func New(store *postgres.Connector, redisClient *redis.Client, oidcClient *oidc.
 		Skew:     envDurationSec("GROK2API_TOKEN_REFRESH_SKEW", 180*time.Second, 30*time.Second, 2*time.Hour),
 		Enabled:  func() bool { return true },
 		IsLeader: func() bool { return true },
-		stop:     make(chan struct{}),
 		runSoon:  make(chan struct{}, 1),
 		last:     map[string]any{"ok": true, "started": false},
 	}
 }
 
 func (s *Service) Start() {
-	s.mu.Lock()
-	if s.started {
+	for {
+		s.mu.Lock()
+		if s.started {
+			s.mu.Unlock()
+			return
+		}
+		if s.stopping {
+			done := s.done
+			s.mu.Unlock()
+			if done != nil {
+				<-done
+			}
+			continue
+		}
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		loopCtx, cancel := context.WithCancel(context.Background())
+		s.started = true
+		s.stop = stop
+		s.done = done
+		s.cancel = cancel
 		s.mu.Unlock()
+		go s.loop(loopCtx, stop, done)
 		return
 	}
-	s.started = true
-	s.mu.Unlock()
-	go s.loop()
 }
 
 func (s *Service) Stop() {
 	s.mu.Lock()
 	if !s.started {
+		done := s.done
+		stopping := s.stopping
 		s.mu.Unlock()
+		if stopping && done != nil {
+			<-done
+		}
 		return
 	}
 	s.started = false
-	close(s.stop)
-	s.stop = make(chan struct{})
+	s.stopping = true
+	stop := s.stop
+	done := s.done
+	cancel := s.cancel
+	close(stop)
 	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	<-done
 }
 
 func (s *Service) RequestRunSoon(force bool) {
@@ -143,16 +174,17 @@ func (s *Service) enrichStatusMinRemaining(out map[string]any) {
 	}
 }
 
-func (s *Service) loop() {
+func (s *Service) loop(ctx context.Context, stop <-chan struct{}, done chan struct{}) {
+	defer s.finishLoop(done)
 	// short startup delay like Python
 	timer := time.NewTimer(3 * time.Second)
 	defer timer.Stop()
 	for {
 		select {
-		case <-s.stop:
+		case <-stop:
 			return
 		case <-timer.C:
-			s.maybeRun(false)
+			s.maybeRun(ctx, false)
 			timer.Reset(s.Interval)
 		case <-s.runSoon:
 			force := false
@@ -160,7 +192,7 @@ func (s *Service) loop() {
 			force = s.forceNext
 			s.forceNext = false
 			s.mu.Unlock()
-			s.maybeRun(force)
+			s.maybeRun(ctx, force)
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -172,14 +204,26 @@ func (s *Service) loop() {
 	}
 }
 
-func (s *Service) maybeRun(force bool) {
+func (s *Service) finishLoop(done chan struct{}) {
+	s.mu.Lock()
+	if s.done == done {
+		s.stopping = false
+		s.stop = nil
+		s.done = nil
+		s.cancel = nil
+	}
+	close(done)
+	s.mu.Unlock()
+}
+
+func (s *Service) maybeRun(parent context.Context, force bool) {
 	if s.Enabled != nil && !s.Enabled() {
 		return
 	}
 	if s.IsLeader != nil && !s.IsLeader() {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
 	defer cancel()
 	result := s.RunOnce(ctx, force)
 	s.mu.Lock()

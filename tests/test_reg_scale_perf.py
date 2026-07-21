@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -208,7 +209,8 @@ class AdmissionAndStopTests(unittest.TestCase):
         import inspect
         src = inspect.getsource(gba._run_registration)
         self.assertIn("_release_reg_admission_once(admission_flag)", src)
-        self.assertIn("_dispose_reg_handles", src)
+        self.assertIn("_detach_reg_handles", src)
+        self.assertIn("_close_reg_handles(handles)", src)
         # Promote stopping -> cancelled on worker exit
         self.assertIn('st_now == "stopping"', src)
 
@@ -229,7 +231,6 @@ class AdmissionAndStopTests(unittest.TestCase):
 
     def test_stop_sets_cancel_event_and_disposes(self) -> None:
         from grok2api.upstream import grok_build_adapter as gba
-        import threading
         sid = "gba_test_stop_1"
         closed = {"n": 0}
 
@@ -258,6 +259,74 @@ class AdmissionAndStopTests(unittest.TestCase):
             self.assertTrue(cur.get("cancel_requested"))
             self.assertEqual(str(cur.get("status")), "stopping")
             self.assertNotIn("_receiver", cur)
+        finally:
+            with gba._lock:
+                gba._sessions.pop(sid, None)
+
+    def test_stop_closes_handles_without_holding_global_lock(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+
+        sid = "gba_test_stop_nonblocking_close"
+        close_started = threading.Event()
+        allow_close = threading.Event()
+
+        class BlockingReceiver:
+            def close(self) -> None:
+                close_started.set()
+                allow_close.wait(timeout=2)
+
+        with gba._lock:
+            gba._sessions[sid] = {
+                "id": sid,
+                "status": "registering",
+                "updated_at": gba._now(),
+                "created_at": gba._now(),
+                "_receiver": BlockingReceiver(),
+                "_cancel_event": threading.Event(),
+            }
+
+        worker = threading.Thread(target=gba.stop_registration_session, args=(sid,))
+        worker.start()
+        try:
+            self.assertTrue(close_started.wait(timeout=1), "close was not called")
+            acquired = gba._lock.acquire(timeout=0.2)
+            self.assertTrue(acquired, "registration lock was held while closing a handle")
+            if acquired:
+                gba._lock.release()
+        finally:
+            allow_close.set()
+            worker.join(timeout=2)
+            with gba._lock:
+                gba._sessions.pop(sid, None)
+
+    def test_stop_closes_handles_before_redis_mirror(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+
+        sid = "gba_test_stop_close_before_mirror"
+        closed = threading.Event()
+
+        class Receiver:
+            def close(self) -> None:
+                closed.set()
+
+        with gba._lock:
+            gba._sessions[sid] = {
+                "id": sid,
+                "status": "registering",
+                "updated_at": gba._now(),
+                "created_at": gba._now(),
+                "_receiver": Receiver(),
+                "_cancel_event": threading.Event(),
+            }
+
+        def mirror(*args, **kwargs) -> None:
+            self.assertTrue(closed.is_set(), "Redis mirror ran before handles closed")
+
+        try:
+            with patch.object(gba, "_mirror_reg_sess", side_effect=mirror):
+                out = gba.stop_registration_session(sid)
+            self.assertTrue(out.get("ok"))
+            self.assertTrue(closed.is_set())
         finally:
             with gba._lock:
                 gba._sessions.pop(sid, None)
@@ -304,15 +373,32 @@ class AdmissionAndStopTests(unittest.TestCase):
 
     def test_run_registration_bails_admission_on_missing_session(self) -> None:
         from grok2api.upstream import grok_build_adapter as gba
-        import inspect
-        src = inspect.getsource(gba._run_registration)
-        self.assertIn("_bail_admission", src)
-        self.assertIn("except _RegCancelled:", src)
+
+        admission_flag = {"released": False}
+        with (
+            patch.object(gba, "_load_reg_sess", return_value=None),
+            patch.object(gba, "_release_reg_admission") as release,
+        ):
+            gba._run_registration(
+                "gba_missing_session",
+                "captcha-key",
+                "",
+                object(),
+                admission_flag=admission_flag,
+            )
+            gba._release_reg_admission_once(admission_flag)
+
+        release.assert_called_once_with()
+        self.assertTrue(admission_flag["released"])
 
 
 class TempmailCloseTests(unittest.TestCase):
     def test_tempmail_close_releases_session(self) -> None:
+        from grok2api.upstream import grok_build_adapter as gba
+
+        gba.ensure_xconsole()
         from xconsole_client.tempmail_transport import TempmailInbox
+
         inbox = TempmailInbox(api_key="k")
         # force-create session without network
         class Fake:

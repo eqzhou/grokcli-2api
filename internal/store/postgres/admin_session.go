@@ -59,33 +59,23 @@ func (c *Connector) CreateAdminSession(token string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	var data []byte
-	err := c.Pool.QueryRow(ctx, "SELECT value FROM app_settings WHERE key = 'sessions'").Scan(&data)
-	sessions := map[string]any{}
-	if err == nil {
-		_ = json.Unmarshal(data, &sessions)
-		if sessions == nil {
-			sessions = map[string]any{}
-		}
-	}
-	now := float64(time.Now().Unix())
-	// prune expired
-	for k, v := range sessions {
-		ts, ok := toFloat(v)
-		if !ok || time.Since(time.Unix(int64(ts), 0)) > adminSessionTTL {
-			delete(sessions, k)
-		}
-	}
-	sessions[token] = now
-	encoded, err := json.Marshal(sessions)
-	if err != nil {
-		return err
-	}
-	_, err = c.Pool.Exec(ctx, `
+	now := time.Now().Unix()
+	cutoff := now - int64(adminSessionTTL/time.Second)
+	_, err := c.Pool.Exec(ctx, `
 		INSERT INTO app_settings (key, value, updated_at)
-		VALUES ('sessions', $1::jsonb, now())
-		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-	`, encoded)
+		VALUES ('sessions', jsonb_build_object($1::text, $2::bigint), now())
+		ON CONFLICT (key) DO UPDATE SET
+			value = (
+				SELECT COALESCE(jsonb_object_agg(entry.key, entry.value), '{}'::jsonb)
+				FROM jsonb_each(
+					CASE WHEN jsonb_typeof(app_settings.value) = 'object'
+						THEN app_settings.value ELSE '{}'::jsonb END
+				) AS entry
+				WHERE jsonb_typeof(entry.value) = 'number'
+				  AND (entry.value #>> '{}')::double precision >= $3::double precision
+			) || jsonb_build_object($1::text, $2::bigint),
+			updated_at = now()
+	`, token, now, cutoff)
 	return err
 }
 
@@ -96,21 +86,13 @@ func (c *Connector) DeleteAdminSession(token string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	var data []byte
-	err := c.Pool.QueryRow(ctx, "SELECT value FROM app_settings WHERE key = 'sessions'").Scan(&data)
-	if err != nil {
-		return nil
-	}
-	var sessions map[string]any
-	if err := json.Unmarshal(data, &sessions); err != nil || sessions == nil {
-		return nil
-	}
-	delete(sessions, token)
-	encoded, err := json.Marshal(sessions)
-	if err != nil {
-		return err
-	}
-	_, err = c.Pool.Exec(ctx, `UPDATE app_settings SET value = $1::jsonb, updated_at = now() WHERE key = 'sessions'`, encoded)
+	_, err := c.Pool.Exec(ctx, `
+		UPDATE app_settings
+		SET value = CASE WHEN jsonb_typeof(value) = 'object'
+			THEN value - $1::text ELSE '{}'::jsonb END,
+			updated_at = now()
+		WHERE key = 'sessions'
+	`, token)
 	return err
 }
 

@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HOME=/root \
-    TURNSTILE_HOST=0.0.0.0 \
+    TURNSTILE_HOST=127.0.0.1 \
     TURNSTILE_PORT=5072 \
     TURNSTILE_THREAD=2 \
     TURNSTILE_BROWSER_TYPE=camoufox \
@@ -54,7 +54,7 @@ RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
 RUN python -m camoufox fetch \
     && python -m patchright install chromium || true
 
-COPY api_solver.py browser_configs.py db_results.py /app/
+COPY api_solver.py browser_configs.py db_results.py solver_auth.py /app/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh \
     && mkdir -p /app/logs /app/keys
@@ -63,6 +63,6 @@ EXPOSE 5072
 
 # Browsers need shared memory
 HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=8 \
-  CMD curl -fsS "http://127.0.0.1:${TURNSTILE_PORT:-5072}/" >/dev/null || exit 1
+  CMD curl -fsS "http://127.0.0.1:${TURNSTILE_PORT:-5072}/health" >/dev/null || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]

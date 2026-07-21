@@ -47,7 +47,7 @@ echo "[turnstile-solver] pid=$(cat logs/turnstile_solver.pid) log=${LOG_FILE}"
 
 # wait ready
 for i in $(seq 1 40); do
-  if curl -fsS -m 1 "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
+  if curl -fsS -m 1 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
     echo "[turnstile-solver] ready http://127.0.0.1:${PORT}"
     exit 0
   fi

@@ -31,9 +31,10 @@ type APIKeyVerifier struct {
 	cfg   config.Config
 	store *postgres.Connector
 
-	mu            sync.Mutex
-	keyCache      map[string]apiKeyCacheEntry
-	requiredCache *requiredCacheEntry
+	mu              sync.Mutex
+	keyCache        map[string]apiKeyCacheEntry
+	requiredCache   *requiredCacheEntry
+	cacheGeneration uint64
 }
 
 type apiKeyCacheEntry struct {
@@ -57,6 +58,39 @@ func NewAPIKeyVerifier(cfg config.Config, store *postgres.Connector) *APIKeyVeri
 		store:    store,
 		keyCache: map[string]apiKeyCacheEntry{},
 	}
+}
+
+// InvalidateAPIKey evicts cached verification results for one persisted key.
+// It also clears the auto-mode decision because enable, disable, delete, and
+// rotation operations can change whether authentication is required.
+func (v *APIKeyVerifier) InvalidateAPIKey(keyID string) {
+	if v == nil {
+		return
+	}
+	keyID = strings.TrimSpace(keyID)
+	v.mu.Lock()
+	v.cacheGeneration++
+	v.requiredCache = nil
+	if keyID != "" {
+		for hash, entry := range v.keyCache {
+			if entry.rec != nil && entry.rec.ID == keyID {
+				delete(v.keyCache, hash)
+			}
+		}
+	}
+	v.mu.Unlock()
+}
+
+// InvalidateAuthRequired clears the cached auto-mode decision. Call this after
+// creating a key so the first enabled key takes effect immediately.
+func (v *APIKeyVerifier) InvalidateAuthRequired() {
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	v.cacheGeneration++
+	v.requiredCache = nil
+	v.mu.Unlock()
 }
 
 func (v *APIKeyVerifier) Require(ctx context.Context, r *http.Request) (*APIKeyRecord, error) {
@@ -110,6 +144,7 @@ func (v *APIKeyVerifier) AuthRequired(ctx context.Context) (bool, error) {
 		v.mu.Unlock()
 		return required, nil
 	}
+	generation := v.cacheGeneration
 	v.mu.Unlock()
 
 	required, err := v.store.HasEnabledAPIKeys(ctx)
@@ -117,7 +152,9 @@ func (v *APIKeyVerifier) AuthRequired(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	v.mu.Lock()
-	v.requiredCache = &requiredCacheEntry{required: required, expires: now.Add(authRequiredCacheTTL)}
+	if v.cacheGeneration == generation {
+		v.requiredCache = &requiredCacheEntry{required: required, expires: now.Add(authRequiredCacheTTL)}
+	}
 	v.mu.Unlock()
 	return required, nil
 }
@@ -150,6 +187,7 @@ func (v *APIKeyVerifier) Verify(ctx context.Context, token string) (*APIKeyRecor
 		}
 		return rec, nil
 	}
+	generation := v.cacheGeneration
 	v.mu.Unlock()
 
 	row, err := v.store.FindAPIKeyByHash(ctx, h)
@@ -166,12 +204,14 @@ func (v *APIKeyVerifier) Verify(ctx context.Context, token string) (*APIKeyRecor
 		LastUsedAt:   row.LastUsedAt,
 	}
 	v.mu.Lock()
-	v.keyCache[h] = apiKeyCacheEntry{rec: cloneAPIKeyRecord(rec), expires: now.Add(apiKeyCacheTTL)}
-	// Opportunistic prune.
-	if len(v.keyCache) > 2048 {
-		for k, e := range v.keyCache {
-			if now.After(e.expires) {
-				delete(v.keyCache, k)
+	if v.cacheGeneration == generation {
+		v.keyCache[h] = apiKeyCacheEntry{rec: cloneAPIKeyRecord(rec), expires: now.Add(apiKeyCacheTTL)}
+		// Opportunistic prune.
+		if len(v.keyCache) > 2048 {
+			for k, e := range v.keyCache {
+				if now.After(e.expires) {
+					delete(v.keyCache, k)
+				}
 			}
 		}
 	}

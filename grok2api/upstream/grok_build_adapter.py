@@ -206,10 +206,10 @@ def _release_reg_admission_once(flag: dict[str, bool]) -> None:
     _release_reg_admission()
 
 
-def _dispose_reg_handles(sess: dict[str, Any] | None) -> None:
-    """Best-effort close process-local registration handles (mailbox/client)."""
+def _detach_reg_handles(sess: dict[str, Any] | None) -> list[Any]:
+    """Signal cancellation and remove process-local handles without closing them."""
     if not isinstance(sess, dict):
-        return
+        return []
     # Wake cooperative cancel waiters first.
     ev = sess.get("_cancel_event")
     if ev is not None:
@@ -218,10 +218,17 @@ def _dispose_reg_handles(sess: dict[str, Any] | None) -> None:
                 ev.set()
         except Exception:
             pass
+    handles: list[Any] = []
     for k in ("_receiver", "_client", "_oauth_client"):
         obj = sess.pop(k, None)
-        if obj is None:
-            continue
+        if obj is not None:
+            handles.append(obj)
+    return handles
+
+
+def _close_reg_handles(handles: list[Any]) -> None:
+    """Best-effort close detached handles; call only after releasing `_lock`."""
+    for obj in handles:
         for meth in ("close", "stop", "shutdown", "cancel"):
             fn = getattr(obj, meth, None)
             if callable(fn):
@@ -230,6 +237,11 @@ def _dispose_reg_handles(sess: dict[str, Any] | None) -> None:
                 except Exception:
                     pass
                 break
+
+
+def _dispose_reg_handles(sess: dict[str, Any] | None) -> None:
+    """Detach and close process-local registration handles outside shared locks."""
+    _close_reg_handles(_detach_reg_handles(sess))
 
 
 # Post-import probe queue: free registration workers immediately after durable
@@ -2080,6 +2092,7 @@ def _start_one_registration(
             )
         except _RegCancelled as e:
             mirror_copy = None
+            handles: list[Any] = []
             with _lock:
                 if sid in _sessions:
                     cur = _sessions[sid]
@@ -2088,8 +2101,9 @@ def _start_one_registration(
                     cur["message"] = str(e) or "cancelled"
                     cur["cancel_requested"] = True
                     cur["updated_at"] = _now()
-                    _dispose_reg_handles(cur)
+                    handles = _detach_reg_handles(cur)
                     mirror_copy = dict(cur)
+            _close_reg_handles(handles)
             if mirror_copy is not None:
                 try:
                     _mirror_reg_sess(sid, mirror_copy, force=True)
@@ -2098,9 +2112,11 @@ def _start_one_registration(
         finally:
             if admitted:
                 _release_reg_admission_once(admission_flag)
+            handles = []
             with _lock:
                 if sid in _sessions:
-                    _dispose_reg_handles(_sessions[sid])
+                    handles = _detach_reg_handles(_sessions[sid])
+            _close_reg_handles(handles)
 
     threading.Thread(
         target=_worker,
@@ -2750,6 +2766,9 @@ def _spawn_batch_runner(
             if not prepared.get("ok"):
                 return prepared
             sid = str(prepared.get("id") or "")
+            cancelled_result: dict[str, Any] | None = None
+            handles: list[Any] = []
+            receiver = None
             with _lock:
                 # Re-check cancel after prepare (user may stop mid-queue).
                 b1 = _batches.get(bid) or {}
@@ -2765,23 +2784,27 @@ def _spawn_batch_runner(
                         _sessions[sid]["error"] = "cancelled"
                         _sessions[sid]["cancel_requested"] = True
                         _sessions[sid]["updated_at"] = _now()
-                        _dispose_reg_handles(_sessions[sid])
+                        handles = _detach_reg_handles(_sessions[sid])
                         _mirror_reg_sess(sid, _sessions[sid])
-                    return {
+                    cancelled_result = {
                         "ok": False,
                         "id": sid,
                         "status": "cancelled",
                         "error": "cancelled",
                         "email": sess.get("email"),
                     }
-                receiver = sess.get("_receiver")
-                if sid in _sessions:
+                else:
+                    receiver = sess.get("_receiver")
+                if cancelled_result is None and sid in _sessions:
                     _sessions[sid]["status"] = "started"
                     _sessions[sid]["message"] = (
                         f"started; email={_sessions[sid].get('email') or ''}"
                     )
                     _sessions[sid]["updated_at"] = _now()
                     _mirror_reg_sess(sid, _sessions[sid])
+            _close_reg_handles(handles)
+            if cancelled_result is not None:
+                return cancelled_result
             if not sid or receiver is None:
                 return {"ok": False, "error": "registration session prepare failed", "id": sid}
             # Cross-batch admission control: many resumed batches otherwise all
@@ -2809,13 +2832,16 @@ def _spawn_batch_runner(
                     admission_flag=admission_flag,
                 )
             except _RegCancelled as e:
+                handles: list[Any] = []
                 with _lock:
                     if sid in _sessions:
                         _sessions[sid]["status"] = "cancelled"
                         _sessions[sid]["error"] = str(e)
                         _sessions[sid]["message"] = str(e)
                         _sessions[sid]["updated_at"] = _now()
+                        handles = _detach_reg_handles(_sessions[sid])
                         _mirror_reg_sess(sid, _sessions[sid])
+                _close_reg_handles(handles)
                 return {
                     "ok": False,
                     "id": sid,
@@ -2825,9 +2851,11 @@ def _spawn_batch_runner(
             finally:
                 if admitted:
                     _release_reg_admission_once(admission_flag)
+                handles = []
                 with _lock:
                     if sid in _sessions:
-                        _dispose_reg_handles(_sessions[sid])
+                        handles = _detach_reg_handles(_sessions[sid])
+                _close_reg_handles(handles)
             with _lock:
                 final = _sessions.get(sid) or {}
             st = str(final.get("status") or "")
@@ -4308,6 +4336,7 @@ def _run_registration(
         return
     except _RegCancelled as exc:
         mirror_copy = None
+        handles: list[Any] = []
         with _lock:
             cur = _sessions.get(sid) or sess
             cur["status"] = "cancelled"
@@ -4315,9 +4344,10 @@ def _run_registration(
             cur["error"] = "cancelled"
             cur["cancel_requested"] = True
             cur["updated_at"] = _now()
-            _dispose_reg_handles(cur)
+            handles = _detach_reg_handles(cur)
             _sessions[sid] = cur
             mirror_copy = dict(cur)
+        _close_reg_handles(handles)
         if mirror_copy is not None:
             try:
                 _mirror_reg_sess(sid, mirror_copy, force=True)
@@ -4332,6 +4362,7 @@ def _run_registration(
             prefer_cancel = _session_cancel_requested(cur0)
         if prefer_cancel:
             mirror_copy = None
+            handles = []
             with _lock:
                 cur = _sessions.get(sid) or sess
                 cur["status"] = "cancelled"
@@ -4339,9 +4370,10 @@ def _run_registration(
                 cur["error"] = "cancelled"
                 cur["cancel_requested"] = True
                 cur["updated_at"] = _now()
-                _dispose_reg_handles(cur)
+                handles = _detach_reg_handles(cur)
                 _sessions[sid] = cur
                 mirror_copy = dict(cur)
+            _close_reg_handles(handles)
             if mirror_copy is not None:
                 try:
                     _mirror_reg_sess(sid, mirror_copy, force=True)
@@ -4352,6 +4384,7 @@ def _run_registration(
                 update("error", f"failed: {exc}", error=str(exc))
             except _RegCancelled:
                 mirror_copy = None
+                handles = []
                 with _lock:
                     cur = _sessions.get(sid) or sess
                     cur["status"] = "cancelled"
@@ -4359,9 +4392,10 @@ def _run_registration(
                     cur["error"] = "cancelled"
                     cur["cancel_requested"] = True
                     cur["updated_at"] = _now()
-                    _dispose_reg_handles(cur)
+                    handles = _detach_reg_handles(cur)
                     _sessions[sid] = cur
                     mirror_copy = dict(cur)
+                _close_reg_handles(handles)
                 if mirror_copy is not None:
                     try:
                         _mirror_reg_sess(sid, mirror_copy, force=True)
@@ -4379,6 +4413,7 @@ def _run_registration(
         # Always drop process-local handles so mailbox / captcha clients do not
         # pin sockets after cancel/error/import. Mirror once more so other workers
         # see the stripped session promptly.
+        handles = []
         with _lock:
             final_sess = dict(_sessions.get(sid) or sess or {})
             if sid in _sessions:
@@ -4403,12 +4438,13 @@ def _run_registration(
                     cur["message"] = cur.get("message") or "cancelled by user"
                     cur["cancel_requested"] = True
                     cur["updated_at"] = _now()
-                _dispose_reg_handles(cur)
+                handles = _detach_reg_handles(cur)
                 try:
                     _mirror_reg_sess(sid, cur, force=True)
                 except Exception:
                     pass
                 final_sess = dict(cur)
+        _close_reg_handles(handles)
         # Single sessions write their own terminal task log. Batch sessions are
         # summarized once by the batch finalizer (avoids N noise rows).
         if final_sess and not final_sess.get("batch_id"):
@@ -5098,6 +5134,8 @@ def stop_registration_session(session_id: str) -> dict[str, Any]:
             "already_terminal": True,
             "message": sess.get("message") or st,
         }
+    handles: list[Any] = []
+    mirror_payload: dict[str, Any] | None = None
     with _lock:
         cur = _sessions.get(sid) or dict(sess)
         # Re-check under lock: worker may have finished (imported/error) while we loaded.
@@ -5129,14 +5167,17 @@ def stop_registration_session(session_id: str) -> dict[str, Any]:
                 pass
         # Best-effort immediate release of process-local handles so Camoufox /
         # mailbox sockets do not linger until the worker next hits update().
-        _dispose_reg_handles(cur)
+        handles = _detach_reg_handles(cur)
         try:
             _append_session_log(cur, "stopping", "stop requested")
         except Exception:
             pass
         _sessions[sid] = cur
-        _mirror_reg_sess(sid, cur, force=True)
+        mirror_payload = dict(cur)
         out = _compact_session(cur)
+    _close_reg_handles(handles)
+    if mirror_payload is not None:
+        _mirror_reg_sess(sid, mirror_payload, force=True)
     return {"ok": True, "id": sid, **out}
 
 

@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -46,13 +47,23 @@ class TempmailInbox:
     token: str = ""
     _created: bool = field(default=False, init=False)
     _http: requests.Session | None = field(default=None, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+    _state_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _close_event: threading.Event = field(
+        default_factory=threading.Event, init=False, repr=False
+    )
 
     def _session(self) -> requests.Session:
-        if self._http is None:
-            sess = requests.Session()
-            sess.headers.update(self._auth_headers())
-            self._http = sess
-        return self._http
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("Tempmail.lol inbox is closed")
+            if self._http is None:
+                sess = requests.Session()
+                sess.headers.update(self._auth_headers())
+                self._http = sess
+            return self._http
 
     def _auth_headers(self) -> dict:
         return {"Authorization": f"Bearer {self.api_key}"}
@@ -100,8 +111,11 @@ class TempmailInbox:
 
     def close(self) -> None:
         """Release the underlying requests.Session (safe to call multiple times)."""
-        sess = self._http
-        self._http = None
+        self._close_event.set()
+        with self._state_lock:
+            self._closed = True
+            sess = self._http
+            self._http = None
         if sess is not None:
             try:
                 sess.close()
@@ -117,7 +131,11 @@ class TempmailInbox:
         seen_ids: set[str] = set()
 
         while True:
+            if self._close_event.is_set():
+                raise RuntimeError("Tempmail.lol inbox is closed")
             emails = self.get_emails()
+            if self._close_event.is_set():
+                raise RuntimeError("Tempmail.lol inbox is closed")
             for email in emails:
                 # Use from+subject+date as a dedup key
                 eid = f"{email.get('from','')}:{email.get('subject','')}:{email.get('date','')}"
@@ -144,7 +162,8 @@ class TempmailInbox:
 
             if self.debug:
                 print(f"  [Tempmail] polling... ({len(seen_ids)} emails so far)")
-            time.sleep(self.interval)
+            if self._close_event.wait(max(0.0, self.interval)):
+                raise RuntimeError("Tempmail.lol inbox is closed")
 
 
 # --------------------------------------------------------------------------- #

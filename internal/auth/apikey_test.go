@@ -3,6 +3,7 @@ package auth
 import (
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/config"
 )
@@ -59,5 +60,45 @@ func TestAuthRequiredFailsClosedForUnspecifiedMode(t *testing.T) {
 	}
 	if !got {
 		t.Fatal("unspecified API key mode must require authentication")
+	}
+}
+
+func TestInvalidateAPIKeyDropsOnlyMatchingVerificationCache(t *testing.T) {
+	verifier := NewAPIKeyVerifier(config.Config{RequireAPIKey: "auto"}, nil)
+	expires := time.Now().Add(time.Minute)
+	verifier.keyCache["hash-a"] = apiKeyCacheEntry{
+		rec:     &APIKeyRecord{ID: "key-a", Enabled: true},
+		expires: expires,
+	}
+	verifier.keyCache["hash-b"] = apiKeyCacheEntry{
+		rec:     &APIKeyRecord{ID: "key-b", Enabled: true},
+		expires: expires,
+	}
+	verifier.requiredCache = &requiredCacheEntry{required: true, expires: expires}
+
+	verifier.InvalidateAPIKey("key-a")
+
+	if _, ok := verifier.keyCache["hash-a"]; ok {
+		t.Fatal("matching API key remained in verification cache")
+	}
+	if _, ok := verifier.keyCache["hash-b"]; !ok {
+		t.Fatal("unrelated API key was evicted")
+	}
+	if verifier.requiredCache != nil {
+		t.Fatal("API key mutation must invalidate auth-required cache")
+	}
+}
+
+func TestInvalidateAuthRequiredDropsFirstKeyDecisionCache(t *testing.T) {
+	verifier := NewAPIKeyVerifier(config.Config{RequireAPIKey: "auto"}, nil)
+	verifier.requiredCache = &requiredCacheEntry{
+		required: false,
+		expires:  time.Now().Add(time.Minute),
+	}
+
+	verifier.InvalidateAuthRequired()
+
+	if verifier.requiredCache != nil {
+		t.Fatal("cached pre-first-key auth decision was not invalidated")
 	}
 }
