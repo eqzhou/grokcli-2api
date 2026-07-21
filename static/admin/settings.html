@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.3f38a8fa48.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.f29e01a1a2.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -144,7 +144,21 @@
       <div class="g2a-mobile-nav" id="mobile-nav"></div>
       <div class="g2a-content">
 
-<section class="g2a-card">
+<nav class="g2a-settings-nav" id="settings-nav" aria-label="设置分区">
+  <div class="g2a-settings-nav-label">分区</div>
+  <div class="g2a-settings-nav-track">
+    <a class="g2a-settings-nav-item is-active" href="#sec-password" data-sec="sec-password">密码</a>
+    <a class="g2a-settings-nav-item" href="#sec-version" data-sec="sec-version">版本</a>
+    <a class="g2a-settings-nav-item" href="#sec-pool" data-sec="sec-pool">轮询</a>
+    <a class="g2a-settings-nav-item" href="#sec-outbound-proxy" data-sec="sec-outbound-proxy">出站代理</a>
+    <a class="g2a-settings-nav-item" href="#sec-relay" data-sec="sec-relay">Relay</a>
+    <a class="g2a-settings-nav-item" href="#sec-cooldown" data-sec="sec-cooldown">冷却</a>
+    <a class="g2a-settings-nav-item" href="#sec-sub2api" data-sec="sec-sub2api">sub2api</a>
+    <a class="g2a-settings-nav-item" href="#sec-cliproxyapi" data-sec="sec-cliproxyapi">CPA</a>
+  </div>
+</nav>
+
+<section class="g2a-card g2a-settings-section" id="sec-password">
   <div class="g2a-card-head">
     <div>
       <h3>修改管理员密码</h3>
@@ -189,7 +203,7 @@
   </form>
 </section>
 
-<section class="g2a-card" id="sec-version">
+<section class="g2a-card g2a-settings-section" id="sec-version">
   <div class="g2a-card-head">
     <div>
       <h3>版本与热更新</h3>
@@ -230,7 +244,7 @@
   </div>
 </section>
 
-<section class="g2a-card">
+<section class="g2a-card g2a-settings-section" id="sec-pool">
   <div class="g2a-card-head">
     <div>
       <h3>轮询与维护</h3>
@@ -298,7 +312,7 @@
   </div>
 </section>
 
-<section class="g2a-card" id="sec-outbound-proxy">
+<section class="g2a-card g2a-settings-section" id="sec-outbound-proxy">
   <div class="g2a-card-head">
     <div>
       <h3>账号出站代理池</h3>
@@ -338,7 +352,7 @@
   </div>
 </section>
 
-<section class="g2a-card" id="sec-relay">
+<section class="g2a-card g2a-settings-section" id="sec-relay">
   <div class="g2a-card-head">
     <div>
       <h3>Relay / sub2api 参数</h3>
@@ -399,7 +413,7 @@
 </section>
 
 
-<section class="g2a-card" id="sec-cooldown">
+<section class="g2a-card g2a-settings-section" id="sec-cooldown">
   <div class="g2a-card-head">
     <div>
       <h3>轮询 / 冷却 / 踢出策略</h3>
@@ -439,7 +453,7 @@
   </div>
 </section>
 
-<section class="g2a-card" id="sec-sub2api">
+<section class="g2a-card g2a-settings-section" id="sec-sub2api">
   <div class="g2a-card-head">
     <h2>sub2api 导入</h2>
     <span id="sub2api-pill" class="g2a-tag">—</span>
@@ -522,7 +536,7 @@
   </p>
 </section>
 
-<section class="g2a-card" id="sec-cliproxyapi">
+<section class="g2a-card g2a-settings-section" id="sec-cliproxyapi">
   <div class="g2a-card-head">
     <h2>CLIProxyAPI（CPA）导入</h2>
     <span id="cliproxyapi-pill" class="g2a-tag">—</span>
@@ -602,6 +616,6 @@
   <script src="/static/dist/api.1bf56e45fe.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4578b49216.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.98b47df3e5.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.b5b95eb524.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>
