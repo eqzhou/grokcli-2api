@@ -72,7 +72,7 @@
         }
         document.documentElement.setAttribute("data-theme", t);
         document.documentElement.style.colorScheme = t;
-        document.documentElement.style.background = t === "light" ? "#f5f7fb" : "#0a0a0f";
+        document.documentElement.style.background = t === "light" ? "#f3f6fb" : "#07090f";
         var tok = localStorage.getItem("g2a_admin_token") || "";
         var ts = Number(localStorage.getItem("g2a_admin_token_ts") || 0) || 0;
         var grace = tok && ts && (Date.now() - ts) < 7 * 24 * 3600 * 1000;
@@ -95,8 +95,8 @@
   <title>系统设置 · grokcli-2api</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.a9e41b9bdb.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.cc8af45fd7.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -131,6 +131,7 @@
     <div class="g2a-main">
       <header class="g2a-header">
         <div>
+          <div class="g2a-page-kicker">SYSTEM · CONFIG</div>
           <h1 id="page-title">系统设置</h1>
           <p id="page-sub">修改管理员密码、轮询策略与 sub2api / 维护参数</p>
         </div>
