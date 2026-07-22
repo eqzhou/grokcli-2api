@@ -438,17 +438,24 @@ def _auto_proxy_candidates() -> list[str]:
         v = (os.getenv(key) or "").strip()
         if v:
             out.append(v)
-    # Peer containers on shared docker networks.
-    out.extend(
-        [
-            "http://privoxy:8118",
-            "http://warp-proxy:1080",
-            "socks5://warp-proxy:1080",
-            "http://host.docker.internal:40080",
-            "http://host.docker.internal:7890",
-            "http://host.docker.internal:8118",
-        ]
+    containerized = os.path.exists("/.dockerenv") or (
+        (os.getenv("GROK2API_CONTAINERIZED") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
     )
+    if containerized:
+        # These names are only meaningful from a container network. On macOS
+        # host.docker.internal can accept TCP while rejecting CONNECT, which
+        # made an empty proxy setting silently choose a broken tunnel.
+        out.extend(
+            [
+                "http://privoxy:8118",
+                "http://warp-proxy:1080",
+                "socks5://warp-proxy:1080",
+                "http://host.docker.internal:40080",
+                "http://host.docker.internal:7890",
+                "http://host.docker.internal:8118",
+            ]
+        )
     # de-dupe preserve order
     seen: set[str] = set()
     uniq: list[str] = []

@@ -41,6 +41,7 @@ import threading
 import time
 
 import gzip
+import html as html_lib
 import http.cookiejar
 import io
 import json
@@ -199,6 +200,15 @@ class XConsoleAuthClient:
         html = raw.decode("utf-8", "replace")
         self._last_signup_html = html
 
+        if status >= 400:
+            detail = self._blocked_page_detail(html)
+            server = str(_hdrs.get("server") or "").strip()
+            edge = "Cloudflare" if "cloudflare" in server.lower() else (server or "upstream")
+            raise RuntimeError(
+                f"xAI sign-up page blocked by {edge} (HTTP {status}): {detail}. "
+                "Use a clean outbound proxy/IP and retry."
+            )
+
         # ---- scrape Next.js build-specific values from the live page ----
         try:
             self._scrape_rsc_payload(html)
@@ -221,6 +231,18 @@ class XConsoleAuthClient:
             print(f"  [scrape] turnstile_sitekey={self.turnstile_sitekey}")
 
         return status
+
+    @staticmethod
+    def _blocked_page_detail(page_html: str) -> str:
+        """Return a short human-readable reason from an HTML block page."""
+        for pattern in (r"<p[^>]*>(.*?)</p>", r"<title[^>]*>(.*?)</title>"):
+            match = re.search(pattern, page_html or "", flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                text = re.sub(r"<[^>]+>", " ", match.group(1))
+                text = " ".join(html_lib.unescape(text).split())
+                if text:
+                    return text[:240]
+        return "request rejected before the sign-up application loaded"
 
     @staticmethod
     def _scrape_turnstile_sitekey(html: str) -> Optional[str]:
@@ -363,6 +385,11 @@ class XConsoleAuthClient:
         js_urls = list(set(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html)))
         if self.debug:
             print(f"  [scrape] searching {len(js_urls)} JS chunks...")
+        if not js_urls:
+            raise RuntimeError(
+                "no JavaScript chunks found in the sign-up response; "
+                "the page may be an HTTP block or browser challenge"
+            )
 
         cache_key = tuple(sorted(js_urls))
         now = time.time()

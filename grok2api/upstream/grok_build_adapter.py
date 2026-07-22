@@ -37,6 +37,23 @@ ADAPTER_BUILD = "v1.9.99-reg-stop-cleanup"
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
 )
+try:
+    REG_RATE_LIMIT_CIRCUIT_THRESHOLD = max(
+        1,
+        int(os.environ.get("GROK2API_REG_RATE_LIMIT_CIRCUIT", "3") or 3),
+    )
+except (TypeError, ValueError):
+    REG_RATE_LIMIT_CIRCUIT_THRESHOLD = 3
+try:
+    REG_RATE_LIMIT_MAX_PAUSE_SEC = max(
+        1.0,
+        min(
+            3600.0,
+            float(os.environ.get("GROK2API_REG_RATE_LIMIT_MAX_PAUSE_SEC", "600") or 600),
+        ),
+    )
+except (TypeError, ValueError):
+    REG_RATE_LIMIT_MAX_PAUSE_SEC = 600.0
 
 YESCAPTCHA_KEY = (
     os.environ.get("GROK2API_YESCAPTCHA_KEY")
@@ -152,6 +169,108 @@ _xconsole_ready = False
 _xconsole_error: str | None = None
 
 
+def _classify_registration_failure(result: dict[str, Any] | None) -> dict[str, Any]:
+    """Classify terminal failures that should pause or stop a registration batch."""
+    row = result if isinstance(result, dict) else {}
+    kind = str(row.get("error_kind") or "").strip().lower()
+    message = str(row.get("error") or row.get("status") or "").strip()
+    lowered = message.lower()
+    reset_at = row.get("rate_limit_reset_at")
+    try:
+        status_code = int(row.get("status_code") or 0)
+    except (TypeError, ValueError):
+        status_code = 0
+    if kind == "mailbox_rate_limit" or status_code == 429:
+        return {
+            "kind": "rate_limit",
+            "stop_immediately": False,
+            "reason": message or "mailbox rate limited",
+            "rate_limit_reset_at": reset_at,
+        }
+    if any(marker in lowered for marker in ("http 429", "rate_limited", "rate limited")):
+        return {
+            "kind": "rate_limit",
+            "stop_immediately": False,
+            "reason": message or "upstream rate limited",
+            "rate_limit_reset_at": reset_at,
+        }
+    if kind == "mailbox":
+        return {
+            "kind": "mailbox_error",
+            "stop_immediately": True,
+            "reason": message or "mailbox acquisition failed",
+            "rate_limit_reset_at": None,
+        }
+    xai_markers = (
+        "abusive traffic",
+        "cf-mitigated",
+        "cloudflare",
+        "risk control",
+        "risk-control",
+        "xai rate limit",
+        "x.ai rate limit",
+        "xai sign-up page blocked",
+        "x.ai sign-up page blocked",
+        "xai email validation rejected",
+        "http 403",
+    )
+    if any(marker in lowered for marker in xai_markers):
+        return {
+            "kind": "xai_risk_control",
+            "stop_immediately": True,
+            "reason": message or "xAI risk control triggered",
+            "rate_limit_reset_at": reset_at,
+        }
+    return {
+        "kind": "failure",
+        "stop_immediately": False,
+        "reason": message or "registration failed",
+        "rate_limit_reset_at": reset_at,
+    }
+
+
+def _email_validation_send_failure(result: Any) -> str | None:
+    """Explain an xAI validation-code RPC rejection before mailbox polling starts."""
+    if getattr(result, "ok", None) is not False:
+        return None
+    http_status = getattr(result, "http_status", None)
+    grpc_status = getattr(result, "grpc_status", None)
+    raw = getattr(result, "raw", b"") or b""
+    empty_hint = "empty response before gRPC processing" if not raw else "gRPC rejected"
+    return (
+        "xAI email validation rejected: "
+        f"HTTP {http_status}, grpc={grpc_status}, {empty_hint}; "
+        "likely upstream risk control or email-domain policy"
+    )
+
+
+def _registration_progress_counts(
+    *,
+    total: int,
+    imported: int,
+    failed: int,
+    cancelled: int,
+    running: int,
+) -> dict[str, int]:
+    """Build mutually exclusive batch counters that always fit within total."""
+    total_n = max(0, int(total or 0))
+    imported_n = max(0, int(imported or 0))
+    failed_n = max(0, int(failed or 0))
+    cancelled_n = max(0, int(cancelled or 0))
+    terminal = imported_n + failed_n + cancelled_n
+    running_n = max(0, min(int(running or 0), max(0, total_n - terminal)))
+    done_n = terminal
+    return {
+        "total": total_n,
+        "imported": imported_n,
+        "error": failed_n,
+        "cancelled": cancelled_n,
+        "running": running_n,
+        "done": done_n,
+        "unattempted": max(0, total_n - done_n - running_n),
+    }
+
+
 def _note_reg_pressure(reason: str = "", *, pause_sec: float | None = None) -> None:
     """Backoff new admissions briefly when upstream rate-limits hit."""
     global _reg_soft_pause_until
@@ -256,6 +375,130 @@ except (TypeError, ValueError):
 _post_import_probe_q: queue.Queue | None = None
 _post_import_probe_started = False
 _post_import_probe_lock = threading.Lock()
+try:
+    _POST_IMPORT_PROBE_STALE_SEC = max(
+        60.0,
+        float(os.environ.get("GROK2API_REG_PROBE_STALE_SEC", "900") or 900),
+    )
+except (TypeError, ValueError):
+    _POST_IMPORT_PROBE_STALE_SEC = 900.0
+
+
+def _recover_orphaned_probe_counters(
+    batch: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Clear probe counters whose in-memory worker disappeared or timed out."""
+    current = dict(batch or {})
+    pending = max(
+        0,
+        int(current.get("probe_pending_count") or current.get("probing") or 0),
+    )
+    if pending <= 0:
+        return current
+
+    heartbeat = float(
+        current.get("probe_updated_at")
+        or current.get("probe_queued_at")
+        or current.get("updated_at")
+        or 0
+    )
+    reason = ""
+    if not heartbeat:
+        reason = "probe worker lease missing"
+    elif time.time() - heartbeat > _POST_IMPORT_PROBE_STALE_SEC:
+        reason = "probe worker timed out"
+    if not reason:
+        return current
+
+    bid = str(current.get("id") or current.get("batch_id") or "")
+    current["probe_pending_count"] = 0
+    current["probing"] = 0
+    current["probe_fail_count"] = max(
+        0, int(current.get("probe_fail_count") or 0) + pending
+    )
+    current["probe_recovery_reason"] = reason
+    current["probe_updated_at"] = _now()
+    current["updated_at"] = _now()
+    current.pop("probe_owner_pid", None)
+    current.pop("probe_queued_at", None)
+    for sid in current.get("session_ids") or []:
+        session_id = str(sid or "")
+        sess = _load_reg_sess(session_id) if session_id else None
+        probe = dict((sess or {}).get("probe") or {})
+        if not sess or not probe.get("pending"):
+            continue
+        probe["pending"] = False
+        probe["error"] = f"probe recovery: {reason}"
+        probe["finished_at"] = _now()
+        recovered_sess = dict(sess)
+        recovered_sess["probe"] = probe
+        recovered_sess["updated_at"] = _now()
+        with _lock:
+            _sessions[session_id] = recovered_sess
+        try:
+            _mirror_reg_sess(session_id, recovered_sess, force=True)
+        except Exception:
+            pass
+    if bid:
+        with _lock:
+            _batches[bid] = dict(current)
+        try:
+            _mirror_reg_batch(bid, dict(current), force=True)
+        except Exception:
+            pass
+    return current
+
+
+def _update_batch_probe_counters(
+    sid: str,
+    *,
+    pending_delta: int = 0,
+    ok_delta: int = 0,
+    fail_delta: int = 0,
+) -> None:
+    """Persist batch-level probe counters so large batches remain observable."""
+    sess = _load_reg_sess(str(sid or ""))
+    bid = str((sess or {}).get("batch_id") or "")
+    if not bid:
+        return
+    batch = _load_reg_batch(bid)
+    if not batch:
+        return
+    mirror_batch = None
+    with _lock:
+        current = dict(_batches.get(bid) or batch)
+        previous_pending = max(
+            0,
+            int(current.get("probe_pending_count") or current.get("probing") or 0),
+        )
+        pending = max(
+            0,
+            previous_pending + int(pending_delta or 0),
+        )
+        current["probe_pending_count"] = pending
+        current["probing"] = pending
+        current["probe_ok_count"] = max(
+            0, int(current.get("probe_ok_count") or 0) + int(ok_delta or 0)
+        )
+        current["probe_fail_count"] = max(
+            0, int(current.get("probe_fail_count") or 0) + int(fail_delta or 0)
+        )
+        current["probe_updated_at"] = _now()
+        if pending > 0:
+            current["probe_owner_pid"] = os.getpid()
+            current.pop("probe_recovery_reason", None)
+            if previous_pending <= 0:
+                current["probe_queued_at"] = _now()
+        else:
+            current.pop("probe_owner_pid", None)
+            current.pop("probe_queued_at", None)
+        current["updated_at"] = _now()
+        _batches[bid] = current
+        mirror_batch = dict(current)
+    try:
+        _mirror_reg_batch(bid, mirror_batch, force=True)
+    except Exception:
+        pass
 
 
 def _ensure_post_import_probe_workers() -> None:
@@ -293,6 +536,7 @@ def _enqueue_post_import_probe(
         "delay_sec": max(0.0, float(delay_sec or 0.0)),
         "email": email or "",
     }
+    _update_batch_probe_counters(sid, pending_delta=len(ids))
     try:
         _post_import_probe_q.put_nowait(job)
         return
@@ -313,6 +557,9 @@ def _enqueue_post_import_probe(
         ).start()
     except Exception as e2:  # noqa: BLE001
         print(f"[grok-build-auth] WARN: probe oneshot failed: {e2}")
+        _update_batch_probe_counters(
+            sid, pending_delta=-len(ids), fail_delta=len(ids)
+        )
 
 
 def _post_import_probe_worker() -> None:
@@ -472,8 +719,17 @@ def _run_post_import_probe_job(job: dict[str, Any]) -> None:
                 _mirror_reg_sess(sid, mirror_copy, force=True)
             except Exception:
                 pass
+        _update_batch_probe_counters(
+            sid,
+            pending_delta=-len(ids),
+            ok_delta=int(probe.get("ok") or 0),
+            fail_delta=int(probe.get("fail") or 0),
+        )
     except Exception as e:  # noqa: BLE001
         print(f"[grok-build-auth] WARN: async probe failed sid={sid}: {e}")
+        _update_batch_probe_counters(
+            sid, pending_delta=-len(ids), fail_delta=len(ids)
+        )
 
 
 REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "90") or 90)
@@ -1946,7 +2202,16 @@ def _prepare_registration_session(
             domain_index=batch_index,
         )
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": str(e)}
+        status_code = getattr(e, "status_code", None)
+        rate_limited = bool(getattr(e, "rate_limited", False))
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_kind": "mailbox_rate_limit" if rate_limited else "mailbox",
+            "status_code": status_code,
+            "rate_limit_reset_at": getattr(e, "rate_limit_reset_at", None),
+            "mail_provider": getattr(e, "provider", mail_provider),
+        }
 
     # xAI password rules: mix upper/lower/digit/symbol.
     password = f"Aa{os.urandom(5).hex()}9!xZ"
@@ -2356,6 +2621,13 @@ def start_registration(
         "finished": 0,
         "ok_count": 0,
         "fail_count": 0,
+        "cancelled_count": 0,
+        "unattempted": n,
+        "probing": 0,
+        "probe_pending_count": 0,
+        "probe_ok_count": 0,
+        "probe_fail_count": 0,
+        "consecutive_rate_limits": 0,
         "spawned": 0,
         "reg_config": reg_cfg,
         "owner_pid": os.getpid(),
@@ -2605,6 +2877,7 @@ def _spawn_batch_runner(
         prior_finished = int(b.get("finished") or 0)
         prior_ok = int(b.get("ok_count") or 0)
         prior_fail = int(b.get("fail_count") or 0)
+        prior_cancelled = int(b.get("cancelled_count") or b.get("cancelled") or 0)
         b["message"] = (
             f"starting remaining={remaining} threads={workers}"
             + (f" requested={requested_workers}" if requested_workers != workers else "")
@@ -2615,10 +2888,14 @@ def _spawn_batch_runner(
             b["finished"] = 0
             b["ok_count"] = 0
             b["fail_count"] = 0
+            b["cancelled_count"] = 0
+            b["unattempted"] = int(b.get("count") or remaining)
+            b["consecutive_rate_limits"] = 0
         else:
             b["finished"] = prior_finished
             b["ok_count"] = prior_ok
             b["fail_count"] = prior_fail
+            b["cancelled_count"] = prior_cancelled
         _batches[bid] = b
         _mirror_reg_batch(bid, dict(b))
 
@@ -2631,6 +2908,8 @@ def _spawn_batch_runner(
         finished = int(_seed.get("finished") or 0)
         ok_n = int(_seed.get("ok_count") or 0)
         fail_n = int(_seed.get("fail_count") or 0)
+        cancelled_n = int(_seed.get("cancelled_count") or _seed.get("cancelled") or 0)
+        consecutive_rate_limits = int(_seed.get("consecutive_rate_limits") or 0)
         stop_renew = False
         # Feed the pool gradually: only keep ~workers(+prefetch) jobs prepared
         # at once. Submitting all remaining jobs up-front used to create hundreds
@@ -2683,6 +2962,33 @@ def _spawn_batch_runner(
             except Exception:
                 pass
             return False
+
+        def _rate_pause_remaining() -> float:
+            with _lock:
+                local = _batches.get(bid) or {}
+                until = float(local.get("rate_limit_pause_until") or 0)
+            return max(0.0, until - time.time())
+
+        def _trip_batch(*, kind: str, reason: str, reset_at: float | None = None) -> None:
+            mirror_bb = None
+            with _lock:
+                bb = _batches.get(bid)
+                if bb is not None:
+                    bb["cancel_requested"] = True
+                    bb["status"] = "stopping"
+                    bb["stop_kind"] = kind
+                    bb["stop_reason"] = reason
+                    bb["stopped_automatically"] = True
+                    if reset_at is not None:
+                        bb["rate_limit_reset_at"] = reset_at
+                    bb["updated_at"] = _now()
+                    bb["message"] = f"auto-stopping: {reason}"
+                    mirror_bb = dict(bb)
+            if mirror_bb is not None:
+                try:
+                    _mirror_reg_batch(bid, mirror_bb, force=True)
+                except Exception:
+                    pass
 
         def _renew_loop() -> None:
             while not stop_renew:
@@ -2869,13 +3175,14 @@ def _spawn_batch_runner(
             }
 
         def _note_result(idx: int, r: dict[str, Any] | None = None, exc: Exception | None = None) -> None:
-            nonlocal finished, ok_n, fail_n
+            nonlocal finished, ok_n, fail_n, cancelled_n, consecutive_rate_limits
             finished += 1
             if finished % 10 == 0:
                 try:
                     _clean_old_sessions()
                 except Exception:
                     pass
+            classification: dict[str, Any] | None = None
             if exc is not None:
                 fail_n += 1
                 errors.append(f"#{idx}: {exc}")
@@ -2884,11 +3191,57 @@ def _spawn_batch_runner(
                 errors.append(f"#{idx}: empty result")
             elif r.get("ok"):
                 ok_n += 1
+                consecutive_rate_limits = 0
+            elif str(r.get("status") or "").lower() in ("cancelled", "stopped"):
+                cancelled_n += 1
             else:
                 fail_n += 1
                 errors.append(
                     f"#{idx}: {r.get('error') or r.get('status') or 'failed'}"
                 )
+                classification = _classify_registration_failure(r)
+
+            if classification is not None:
+                failure_kind = str(classification.get("kind") or "failure")
+                reason = str(classification.get("reason") or "registration failed")
+                reset_value = classification.get("rate_limit_reset_at")
+                try:
+                    reset_at = float(reset_value) if reset_value is not None else None
+                except (TypeError, ValueError):
+                    reset_at = None
+                if failure_kind == "rate_limit":
+                    consecutive_rate_limits += 1
+                    now = time.time()
+                    requested_until = reset_at if reset_at and reset_at > now else now + 60.0
+                    pause_until = min(requested_until, now + REG_RATE_LIMIT_MAX_PAUSE_SEC)
+                    with _lock:
+                        rate_batch = _batches.get(bid)
+                        if rate_batch is not None:
+                            rate_batch["rate_limit_pause_until"] = max(
+                                float(rate_batch.get("rate_limit_pause_until") or 0),
+                                pause_until,
+                            )
+                            rate_batch["rate_limit_reset_at"] = reset_at or pause_until
+                            rate_batch["consecutive_rate_limits"] = consecutive_rate_limits
+                    _note_reg_pressure(
+                        reason,
+                        pause_sec=max(1.0, min(60.0, pause_until - now)),
+                    )
+                    if consecutive_rate_limits >= REG_RATE_LIMIT_CIRCUIT_THRESHOLD:
+                        _trip_batch(
+                            kind="rate_limit_circuit",
+                            reason=(
+                                f"continuous rate limit circuit opened "
+                                f"({consecutive_rate_limits}/{REG_RATE_LIMIT_CIRCUIT_THRESHOLD}): {reason}"
+                            ),
+                            reset_at=reset_at or pause_until,
+                        )
+                elif classification.get("stop_immediately"):
+                    consecutive_rate_limits = 0
+                    _trip_batch(kind=failure_kind, reason=reason, reset_at=reset_at)
+                else:
+                    consecutive_rate_limits = 0
+
             mirror_batch = None
             task_summary = None
             with _lock:
@@ -2901,17 +3254,24 @@ def _spawn_batch_runner(
                     b["finished"] = finished
                     b["ok_count"] = ok_n
                     b["fail_count"] = fail_n
-                    b["imported"] = ok_n
-                    b["error"] = fail_n
-                    b["done"] = finished
-                    b["running"] = len(in_flight)
+                    b["cancelled_count"] = cancelled_n
+                    b["consecutive_rate_limits"] = consecutive_rate_limits
+                    progress = _registration_progress_counts(
+                        total=target_total,
+                        imported=ok_n,
+                        failed=fail_n,
+                        cancelled=cancelled_n,
+                        running=len(in_flight),
+                    )
+                    b.update(progress)
                     b["spawned"] = len(b.get("session_ids") or [])
                     b["spawn_errors"] = errors[-20:]
                     b["runner_alive"] = True
                     b["inflight"] = len(in_flight)
                     b["message"] = (
                         f"running {finished}/{target_total} done "
-                        f"(ok={ok_n} fail={fail_n}, threads={workers}, "
+                        f"(ok={ok_n} fail={fail_n} cancelled={cancelled_n} "
+                        f"unattempted={progress['unattempted']}, threads={workers}, "
                         f"inflight={len(in_flight)})"
                     )
                     mirror_batch = dict(b)
@@ -2935,6 +3295,8 @@ def _spawn_batch_runner(
                             "batch_id": bid,
                             "ok_count": ok_n,
                             "fail_count": fail_n,
+                            "cancelled_count": cancelled_n,
+                            "unattempted": progress["unattempted"],
                             "threads": workers,
                             "inflight": len(in_flight),
                             "phase": "progress",
@@ -2956,6 +3318,7 @@ def _spawn_batch_runner(
                         next_i <= remaining
                         and len(in_flight) < max_inflight
                         and not _batch_cancel_requested()
+                        and _rate_pause_remaining() <= 0
                     ):
                         fut = pool.submit(_job, next_i)
                         in_flight[fut] = next_i
@@ -2969,7 +3332,15 @@ def _spawn_batch_runner(
                                 bb["running"] = len(in_flight)
                                 bb["imported"] = ok_n
                                 bb["error"] = fail_n
-                                bb["done"] = finished
+                                bb["cancelled"] = cancelled_n
+                                progress = _registration_progress_counts(
+                                    total=target_total,
+                                    imported=ok_n,
+                                    failed=fail_n,
+                                    cancelled=cancelled_n,
+                                    running=len(in_flight),
+                                )
+                                bb.update(progress)
                                 bb["updated_at"] = _now()
                                 if not bb.get("cancel_requested"):
                                     bb["status"] = "running"
@@ -2998,6 +3369,8 @@ def _spawn_batch_runner(
                                         "batch_id": bid,
                                         "ok_count": ok_n,
                                         "fail_count": fail_n,
+                                        "cancelled_count": cancelled_n,
+                                        "unattempted": progress["unattempted"],
                                         "threads": workers,
                                         "inflight": len(in_flight),
                                         "phase": "progress",
@@ -3009,6 +3382,14 @@ def _spawn_batch_runner(
                                 pass
 
                     if not in_flight:
+                        pause_remaining = _rate_pause_remaining()
+                        if (
+                            next_i <= remaining
+                            and pause_remaining > 0
+                            and not _batch_cancel_requested()
+                        ):
+                            time.sleep(min(1.0, pause_remaining))
+                            continue
                         break
 
                     done, _pending = wait(
@@ -3053,46 +3434,54 @@ def _spawn_batch_runner(
                     b["finished"] = finished
                     b["ok_count"] = ok_n
                     b["fail_count"] = fail_n
-                    b["imported"] = ok_n
-                    b["error"] = fail_n
-                    b["done"] = finished
-                    b["running"] = 0
+                    b["cancelled_count"] = cancelled_n
                     b["spawned"] = len(b.get("session_ids") or [])
                     b["spawn_errors"] = errors[-20:]
                     b["runner_alive"] = False
                     b["inflight"] = 0
                     target_total = int(b.get("count") or finished or 0)
-                    cancelled = bool(b.get("cancel_requested")) or str(b.get("status") or "").lower() in (
+                    progress = _registration_progress_counts(
+                        total=target_total,
+                        imported=ok_n,
+                        failed=fail_n,
+                        cancelled=cancelled_n,
+                        running=0,
+                    )
+                    b.update(progress)
+                    stop_requested = bool(b.get("cancel_requested")) or str(b.get("status") or "").lower() in (
                         "stopping",
                         "cancelled",
                         "stopped",
                     )
-                    if cancelled and finished < target_total:
+                    if stop_requested and finished < target_total:
                         b["status"] = "cancelled"
                         b["message"] = (
                             f"stopped {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"(ok={ok_n} fail={fail_n} cancelled={cancelled_n} "
+                            f"unattempted={progress['unattempted']}, threads={workers})"
                         )
+                        if b.get("stop_reason"):
+                            b["message"] += f"; reason={b['stop_reason']}"
                     elif fail_n and not ok_n:
                         b["status"] = "error"
-                        b["error"] = "; ".join(errors[:5]) or "all failed"
+                        b["last_error"] = "; ".join(errors[:5]) or "all failed"
                         b["message"] = (
                             f"finished {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"(ok={ok_n} fail={fail_n} cancelled={cancelled_n}, threads={workers})"
                             + (f"; errors={len(errors)}" if errors else "")
                         )
                     elif fail_n:
                         b["status"] = "partial"
                         b["message"] = (
                             f"finished {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"(ok={ok_n} fail={fail_n} cancelled={cancelled_n}, threads={workers})"
                             + (f"; errors={len(errors)}" if errors else "")
                         )
                     else:
                         b["status"] = "done"
                         b["message"] = (
                             f"finished {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"(ok={ok_n} fail={fail_n} cancelled={cancelled_n}, threads={workers})"
                         )
                     mirror_batch = dict(b)
                     st = str(b.get("status") or "done")
@@ -3108,6 +3497,10 @@ def _spawn_batch_runner(
                             "batch_id": bid,
                             "ok_count": ok_n,
                             "fail_count": fail_n,
+                            "cancelled_count": cancelled_n,
+                            "unattempted": progress["unattempted"],
+                            "stop_kind": b.get("stop_kind"),
+                            "stop_reason": b.get("stop_reason"),
                             "threads": workers,
                             "status": st,
                             "errors": (errors or [])[:10],
@@ -3609,12 +4002,14 @@ def _run_registration(
         update("registering", "sending email validation code")
         _check_cancel()
         send_res = client.create_email_validation_code(email)
-        if hasattr(send_res, "ok") and send_res.ok is False:
+        send_failure = _email_validation_send_failure(send_res)
+        if send_failure:
             print(
                 f"[grok-build-auth] CreateEmailValidationCode ok=False "
                 f"http={getattr(send_res, 'http_status', None)} "
                 f"grpc={getattr(send_res, 'grpc_status', None)}"
             )
+            raise RuntimeError(send_failure)
 
         update("waiting_email", "waiting for xAI verification code")
         # Poll mailbox with cancel-aware receiver so stop lands in ~0.25–1s.
@@ -4827,6 +5222,16 @@ def resume_registration_batch(
     with _lock:
         b = _batches.get(bid) or dict(batch)
         b["cancel_requested"] = False
+        if force:
+            for key_name in (
+                "stop_kind",
+                "stop_reason",
+                "stopped_automatically",
+                "rate_limit_pause_until",
+                "rate_limit_reset_at",
+            ):
+                b.pop(key_name, None)
+            b["consecutive_rate_limits"] = 0
         if str(b.get("status") or "").lower() in {"stopping", "cancelled", "stopped", "error"}:
             b["status"] = "running"
         b["updated_at"] = _now()
@@ -5401,6 +5806,7 @@ def _batch_counters_from_batch(batch: dict[str, Any] | None) -> dict[str, int] |
     """
     if not isinstance(batch, dict):
         return None
+    batch = _recover_orphaned_probe_counters(batch)
     explicit_keys = ("imported", "error", "cancelled", "running", "done")
     has_explicit = any(k in batch for k in explicit_keys)
     has_runner = any(k in batch for k in ("ok_count", "fail_count", "finished", "inflight"))
@@ -5428,6 +5834,12 @@ def _batch_counters_from_batch(batch: dict[str, Any] | None) -> dict[str, int] |
             done = int(batch.get("finished") or 0)
         else:
             done = imported + error + cancelled
+        if "unattempted" in batch:
+            unattempted = int(batch.get("unattempted") or 0)
+        else:
+            total = int(batch.get("count") or 0)
+            unattempted = max(0, total - imported - error - cancelled - running)
+        probing = int(batch.get("probing") or batch.get("probe_pending_count") or 0)
     except Exception:
         return None
 
@@ -5447,6 +5859,8 @@ def _batch_counters_from_batch(batch: dict[str, Any] | None) -> dict[str, int] |
         "cancelled": max(0, cancelled),
         "running": max(0, running),
         "done": max(0, done),
+        "unattempted": max(0, unattempted),
+        "probing": max(0, probing),
     }
 
 
@@ -5548,6 +5962,8 @@ def _batch_stats(
         cancelled = persisted["cancelled"]
         running = persisted["running"]
         done = persisted["done"]
+        unattempted = persisted["unattempted"]
+        probing = persisted["probing"]
         # If runner tracks finished/ok/fail, keep running as residual when possible.
         if running == 0 and isinstance(batch, dict):
             try:
@@ -5579,11 +5995,13 @@ def _batch_stats(
             "running": running,
             "missing": 0,
             "done": done if done else (imported + error + cancelled),
+            "unattempted": unattempted,
+            "probing": probing,
             "batch_status": status,
         }
 
     # Live scan path: use preloaded map or load each id once.
-    imported = error = running = cancelled = missing = 0
+    imported = error = running = cancelled = probing = missing = 0
     for sid in session_ids:
         sess = None
         if sessions_by_id is not None:
@@ -5594,6 +6012,9 @@ def _batch_stats(
             missing += 1
             continue
         st = str(sess.get("status") or "").lower()
+        probe = sess.get("probe") if isinstance(sess.get("probe"), dict) else {}
+        if probe.get("pending"):
+            probing += max(1, len(sess.get("imported_account_ids") or []))
         if st in ("imported", "success", "completed"):
             imported += 1
         elif st in ("cancelled", "stopped"):
@@ -5605,6 +6026,7 @@ def _batch_stats(
 
     observed = imported + error + cancelled + running
     done = imported + error + cancelled
+    unattempted = max(0, target - observed)
     if observed == 0 and isinstance(batch, dict):
         # fall back to stored counters / message parse
         try:
@@ -5617,6 +6039,10 @@ def _batch_stats(
             pass
         try:
             cancelled = int(batch.get("cancelled") or cancelled or 0)
+        except Exception:
+            pass
+        try:
+            probing = int(batch.get("probing") or batch.get("probe_pending_count") or probing or 0)
         except Exception:
             pass
         msg = str(batch.get("message") or "")
@@ -5638,6 +6064,7 @@ def _batch_stats(
         done = imported + error + cancelled
         running = 0
         observed = done
+        unattempted = max(0, target - observed)
 
     status = _derive_batch_status(
         imported=imported,
@@ -5659,6 +6086,8 @@ def _batch_stats(
         "running": running,
         "missing": missing,
         "done": done,
+        "unattempted": unattempted,
+        "probing": probing,
         "batch_status": status,
     }
 

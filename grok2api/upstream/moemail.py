@@ -18,6 +18,7 @@ import random
 import re
 import time
 from email import policy
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
@@ -49,6 +50,64 @@ CFMAIL_DEFAULT_BASE_URL = "https://temp-email-api.awsl.uk"
 
 # TempMail.lol (https://tempmail.lol/zh/api) — free tier needs no API key.
 TEMPMAIL_LOL_DEFAULT_BASE_URL = "https://api.tempmail.lol"
+
+
+def rate_limit_reset_at(headers: Any, *, now: float | None = None) -> float | None:
+    """Return an absolute reset timestamp from common rate-limit headers."""
+    current = time.time() if now is None else float(now)
+    normalized = {str(k).lower(): str(v).strip() for k, v in dict(headers or {}).items()}
+    raw = normalized.get("x-ratelimit-reset") or normalized.get("retry-after")
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+        if value >= 1_000_000_000_000:
+            value /= 1000.0
+        return value if value >= 1_000_000_000 else current + max(0.0, value)
+    except (TypeError, ValueError):
+        try:
+            parsed = parsedate_to_datetime(raw)
+            return parsed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+class MailboxProviderError(RuntimeError):
+    """Mailbox failure with HTTP/rate-limit metadata preserved for the runner."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        operation: str,
+        detail: str,
+        status_code: int | None = None,
+        rate_limit_reset_at: float | None = None,
+    ) -> None:
+        self.provider = provider
+        self.operation = operation
+        self.status_code = status_code
+        self.rate_limit_reset_at = rate_limit_reset_at
+        self.rate_limited = status_code == 429
+        label = "TempMail.lol" if provider == "tempmail" else provider
+        status = f" {status_code}" if status_code is not None else ""
+        super().__init__(f"{label} {operation} failed{status}: {detail}")
+
+
+def _mailbox_response_error(
+    provider: str,
+    operation: str,
+    response: "httpx.Response",
+    *,
+    detail: str | None = None,
+) -> MailboxProviderError:
+    return MailboxProviderError(
+        provider=provider,
+        operation=operation,
+        status_code=response.status_code,
+        detail=detail if detail is not None else response.text[:500],
+        rate_limit_reset_at=rate_limit_reset_at(response.headers),
+    )
 
 
 def _headers(api_key: str | None = None) -> dict[str, str]:
@@ -515,11 +574,13 @@ def moemail_create_mailbox(
                     last_err = (
                         f"MoeMail create failed {resp.status_code}: {resp.text[:500]}"
                     )
+                    if resp.status_code == 429:
+                        raise _mailbox_response_error("moemail", "create", resp)
                     transient = resp.status_code in {408, 425, 429, 500, 502, 503, 504}
                     if transient and attempt < max_attempts:
                         time.sleep(min(12.0, 0.8 * attempt + random.uniform(0.1, 0.6)))
                         continue
-                    raise RuntimeError(last_err)
+                    raise _mailbox_response_error("moemail", "create", resp)
                 data = resp.json()
                 break
             except RuntimeError:
@@ -635,9 +696,7 @@ def yyds_create_mailbox(
         headers = {**_headers(key), "Content-Type": "application/json"}
         resp = client.post(f"{base}/v1/accounts", json=payload, headers=headers)
         if resp.status_code >= 400:
-            raise RuntimeError(
-                f"YYDS create failed {resp.status_code}: {resp.text[:500]}"
-            )
+            raise _mailbox_response_error("yyds", "create", resp)
         data = resp.json()
 
     # Envelope: { success, data: { id, address, token, ... } }
@@ -970,9 +1029,7 @@ def gptmail_create_mailbox(
 
     def _parse_email_payload(resp: "httpx.Response") -> str:
         if resp.status_code >= 400:
-            raise RuntimeError(
-                f"GPTMail create failed {resp.status_code}: {resp.text[:500]}"
-            )
+            raise _mailbox_response_error("gptmail", "create", resp)
         data = resp.json() if resp.content else {}
         if isinstance(data, dict) and data.get("success") is False:
             raise RuntimeError(
@@ -1008,6 +1065,8 @@ def gptmail_create_mailbox(
                 raw = resp.json() if resp.content else {}
             except Exception:
                 raw = {}
+        except MailboxProviderError:
+            raise
         except Exception as first_err:
             # Docs: if you already know a live public domain, compose prefix@domain
             # locally and only use /api/emails (saves one generate call).
@@ -1414,6 +1473,17 @@ def cfmail_create_mailbox(
             )
         if resp is None or resp.status_code >= 400:
             detail = (resp.text[:500] if resp is not None else last_err)
+            if resp is not None:
+                raise _mailbox_response_error(
+                    "cfmail",
+                    "create",
+                    resp,
+                    detail=(
+                        f"{detail or last_err}. Use Workers API origin (not Pages UI), "
+                        "ADMIN_PASSWORDS in x-admin-auth, and a domain from "
+                        "/open_api/settings."
+                    ),
+                )
             raise RuntimeError(
                 f"CF Temp Email create failed ({base}): {detail or last_err}. "
                 "Use Workers API origin (not Pages UI), ADMIN_PASSWORDS in "
@@ -1689,8 +1759,12 @@ def tempmail_create_mailbox(
             payload.pop("domain", None)
             resp = client.post(f"{base}/v2/inbox/create", json=payload or {}, headers=headers)
         if resp.status_code >= 400:
-            raise RuntimeError(
-                f"TempMail.lol create failed {resp.status_code}: {resp.text[:500]}"
+            raise MailboxProviderError(
+                provider="tempmail",
+                operation="create",
+                status_code=resp.status_code,
+                detail=resp.text[:500],
+                rate_limit_reset_at=rate_limit_reset_at(resp.headers),
             )
         data = resp.json() if resp.content else {}
 

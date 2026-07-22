@@ -4462,12 +4462,14 @@ func serveAdminAccounts(w http.ResponseWriter, r *http.Request, options Options)
 // Shared registration HTTP client: admin UI polls batch/session every ~150–400ms.
 // Reusing one Transport avoids dial/TLS thrash and cuts log-refresh latency under load.
 var (
-	regHTTPClientOnce sync.Once
-	regHTTPClient     *http.Client
-	regClientMu       sync.Mutex
-	regClientCache    *regclient.Client
-	regClientBase     string
-	regClientToken    string
+	regHTTPClientOnce  sync.Once
+	regHTTPClient      *http.Client
+	regStartHTTPOnce   sync.Once
+	regStartHTTPClient *http.Client
+	regClientMu        sync.Mutex
+	regClientCache     *regclient.Client
+	regClientBase      string
+	regClientToken     string
 )
 
 func sharedRegistrationHTTP() *http.Client {
@@ -4491,10 +4493,22 @@ func sharedRegistrationHTTP() *http.Client {
 
 // registrationStartHTTP is only for Start/create calls (not poll).
 func registrationStartHTTP() *http.Client {
-	return &http.Client{
-		Timeout:   8 * time.Second,
-		Transport: sharedRegistrationHTTP().Transport,
-	}
+	regStartHTTPOnce.Do(func() {
+		transport, ok := sharedRegistrationHTTP().Transport.(*http.Transport)
+		if !ok {
+			regStartHTTPClient = &http.Client{Timeout: 60 * time.Second}
+			return
+		}
+		startTransport := transport.Clone()
+		// Mailbox creation may take tens of seconds. Keep the fast poll transport's
+		// 600ms header deadline isolated from this one-shot create request.
+		startTransport.ResponseHeaderTimeout = 55 * time.Second
+		regStartHTTPClient = &http.Client{
+			Timeout:   60 * time.Second,
+			Transport: startTransport,
+		}
+	})
+	return regStartHTTPClient
 }
 
 func registrationClient(options Options) *regclient.Client {

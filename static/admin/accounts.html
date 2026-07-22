@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.4c2fc8dc2b.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.6e5bba711f.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -313,16 +313,17 @@
       </div>
       <p>临时邮箱 + 过盾自动建号并导入账号池。各邮箱服务的 Key / 域名 / URL <strong>分库独立</strong>；本地过盾容器内联运行，也可切换 YesCaptcha。</p>
     </div>
-    <div class="g2a-actions g2a-reg-actions">
-      <button class="g2a-btn g2a-btn-default" id="btn-save-reg" type="button">保存配置</button>
-      <button class="g2a-btn g2a-btn-default" id="btn-test-reg-proxy" type="button">测试代理</button>
-      <button class="g2a-btn g2a-btn-default" id="btn-refresh-reg" type="button">刷新进度</button>
-      <span class="g2a-reg-actions-sep" aria-hidden="true"></span>
-      <button class="g2a-btn g2a-btn-danger" id="btn-stop-reg" type="button" title="停止当前/全部进行中的注册会话" disabled>停止注册</button>
-      <button class="g2a-btn g2a-btn-primary" id="btn-start-reg" type="button">开始注册</button>
-    </div>
   </div>
-  <div class="g2a-form-grid g2a-reg-form">
+  <dialog id="reg-settings-dialog" class="g2a-dialog g2a-reg-settings-dialog" aria-labelledby="reg-settings-title">
+    <div class="g2a-dialog-head">
+      <div>
+        <h3 id="reg-settings-title">协议注册设置</h3>
+        <p>配置邮箱服务、过盾并发、测活等待和代理池。</p>
+      </div>
+      <button class="g2a-dialog-close" id="btn-close-reg-settings" type="button" aria-label="关闭设置" title="关闭">×</button>
+    </div>
+    <div class="g2a-dialog-body">
+      <div class="g2a-form-grid g2a-reg-form">
     <div class="g2a-reg-section" style="grid-column:1/-1">
       <div class="g2a-reg-section-label">邮箱服务</div>
     </div>
@@ -441,7 +442,7 @@
       <p class="g2a-muted" style="margin:4px 0 0" id="reg-proxy-hint">支持多行代理池；批量注册时按策略轮换。共享账号可填下方用户名/密码。</p>
     </div>
     <div class="g2a-field"><label>代理用户名</label><input id="reg-proxy-username" placeholder="可选，共享认证" /></div>
-    <div class="g2a-field"><label>代理密码</label><input id="reg-proxy-password" type="password" placeholder="可选，共享认证" /></div>
+    <div class="g2a-field"><label>代理密码</label><input id="reg-proxy-password" type="password" placeholder="可选，共享认证" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-form-type="other" /></div>
     <div class="g2a-field">
       <label for="reg-proxy-strategy" title="round_robin=按序轮换 · random=随机 · sticky=始终用第一个">代理策略</label>
       <select id="reg-proxy-strategy">
@@ -450,8 +451,14 @@
         <option value="sticky">固定首个 (sticky)</option>
       </select>
     </div>
-  </div>
-  <div id="reg-session-box" class="g2a-subcard g2a-reg-progress hidden" style="margin-top:14px" hidden>
+      </div>
+    </div>
+    <div class="g2a-dialog-foot">
+      <button class="g2a-btn g2a-btn-default" id="btn-cancel-reg-settings" type="button">取消</button>
+      <button class="g2a-btn g2a-btn-primary" id="btn-save-reg" type="button">保存配置</button>
+    </div>
+  </dialog>
+  <div id="reg-session-box" class="g2a-subcard g2a-reg-progress">
     <div class="g2a-reg-progress-head">
       <div class="g2a-reg-progress-title">
         <span class="g2a-reg-live-dot" id="reg-live-dot" aria-hidden="true"></span>
@@ -462,9 +469,12 @@
       </div>
       <div class="g2a-actions g2a-reg-progress-actions">
         <span id="reg-status" class="g2a-tag g2a-reg-status-tag" data-reg-state="idle">idle</span>
-        <button class="g2a-btn g2a-btn-danger g2a-btn-sm" id="btn-stop-reg-inline" type="button">停止</button>
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-refresh-reg-inline" type="button">刷新</button>
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-close-reg-inline" type="button" title="关闭进度卡片（不停止后台注册）">关闭</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-open-reg-settings" type="button">设置</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-test-reg-proxy" type="button">测试代理</button>
+        <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-refresh-reg" type="button">刷新</button>
+        <span class="g2a-reg-actions-sep" aria-hidden="true"></span>
+        <button class="g2a-btn g2a-btn-danger g2a-btn-sm" id="btn-stop-reg" type="button" title="停止当前/全部进行中的注册会话" disabled>停止</button>
+        <button class="g2a-btn g2a-btn-primary g2a-btn-sm" id="btn-start-reg" type="button">开始注册</button>
       </div>
     </div>
     <div class="g2a-reg-stats" id="reg-stats" aria-live="polite">
@@ -472,7 +482,9 @@
       <div class="g2a-reg-stat is-ok"><span class="k">成功</span><span class="v" id="reg-stat-ok">0</span></div>
       <div class="g2a-reg-stat is-bad"><span class="k">失败</span><span class="v" id="reg-stat-fail">0</span></div>
       <div class="g2a-reg-stat is-run"><span class="k">进行中</span><span class="v" id="reg-stat-run">0</span></div>
-      <div class="g2a-reg-stat is-stop"><span class="k">已停</span><span class="v" id="reg-stat-stop">0</span></div>
+      <div class="g2a-reg-stat is-probing"><span class="k">测活中</span><span class="v" id="reg-stat-probing">0</span></div>
+      <div class="g2a-reg-stat is-stop"><span class="k">已取消</span><span class="v" id="reg-stat-stop">0</span></div>
+      <div class="g2a-reg-stat"><span class="k">未尝试</span><span class="v" id="reg-stat-unattempted">0</span></div>
     </div>
     <div class="g2a-reg-bar-wrap" id="reg-progress-wrap">
       <div class="g2a-reg-bar-meta">
@@ -600,7 +612,7 @@
   <script src="/static/dist/utils.ac10ff3b58.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/api.1bf56e45fe.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/auth.4578b49216.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.b5b95eb524.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/auth.4eb51a7835.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.0631f67707.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>
