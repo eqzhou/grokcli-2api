@@ -4820,6 +4820,73 @@ body[data-page="logs"] .g2a-table td:nth-child(5) {
   text-align: left !important;
   font-variant-numeric: tabular-nums;
 }
+
+
+/* Logs table — summary: fixed layout, max 5 lines + ellipsis (clamp INNER, not <td>) */
+body[data-page="logs"] .g2a-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+body[data-page="logs"] .g2a-table {
+  table-layout: fixed;
+  width: 100%;
+  min-width: 720px;
+}
+body[data-page="logs"] .g2a-table th:nth-child(1),
+body[data-page="logs"] .g2a-table td:nth-child(1) {
+  width: 150px;
+}
+body[data-page="logs"] .g2a-table th:nth-child(2),
+body[data-page="logs"] .g2a-table td:nth-child(2) {
+  width: 120px;
+}
+body[data-page="logs"] .g2a-table th:nth-child(3),
+body[data-page="logs"] .g2a-table td:nth-child(3) {
+  width: 100px;
+}
+body[data-page="logs"] .g2a-table th:nth-child(5),
+body[data-page="logs"] .g2a-table td:nth-child(5) {
+  width: 120px;
+}
+body[data-page="logs"] .g2a-table th:nth-child(6),
+body[data-page="logs"] .g2a-table td:nth-child(6) {
+  width: 88px;
+}
+body[data-page="logs"] .g2a-table th.g2a-logs-summary,
+body[data-page="logs"] .g2a-table td.g2a-logs-summary,
+body[data-page="logs"] .g2a-table th:nth-child(4),
+body[data-page="logs"] .g2a-table td:nth-child(4) {
+  text-align: left !important;
+  width: auto;
+  min-width: 160px;
+  /* remaining width after fixed cols — stays inside table */
+}
+body[data-page="logs"] .g2a-table td.g2a-logs-summary,
+body[data-page="logs"] .g2a-table td:nth-child(4) {
+  vertical-align: top;
+  /* Keep table-cell box model intact for borders */
+  overflow: hidden;
+}
+body[data-page="logs"] .g2a-logs-summary-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+  line-clamp: 5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+  font-size: 12.5px;
+  max-height: calc(1.45em * 5);
+  max-width: 100%;
+}
+@media (max-width: 900px) {
+  body[data-page="logs"] .g2a-logs-summary-text {
+    max-width: 100%;
+  }
+}
 body[data-page="logs"] .g2a-table td.g2a-logs-progress,
 body[data-page="logs"] .g2a-table td:nth-child(5) {
   font-family: var(--mono);
@@ -4867,8 +4934,13 @@ body[data-page="accounts"] .g2a-acc-probe .g2a-muted {
 }
 
 /* Logs / keys tables scroll in wrap */
-body[data-page="logs"] .g2a-table,
 body[data-page="keys"] .g2a-table {
   width: max-content;
   min-width: 100%;
+}
+/* logs table uses fixed layout (summary clamp) — see logs summary rules */
+body[data-page="logs"] .g2a-table {
+  width: 100%;
+  min-width: 720px;
+  table-layout: fixed;
 }

@@ -11705,7 +11705,18 @@ function paintLogsTable(items, { soft = false } = {}) {
       if (tds[0].textContent !== cells.when) tds[0].textContent = cells.when;
       if (tds[1].textContent !== cells.kind) tds[1].textContent = cells.kind;
       if (tds[2].textContent !== cells.st) tds[2].textContent = cells.st;
-      if (tds[3].textContent !== cells.summary) tds[3].textContent = cells.summary;
+      {
+        let sumEl = tds[3].querySelector(".g2a-logs-summary-text");
+        if (!sumEl) {
+          tds[3].classList.add("g2a-logs-summary");
+          tds[3].innerHTML = "";
+          sumEl = document.createElement("span");
+          sumEl.className = "g2a-logs-summary-text";
+          tds[3].appendChild(sumEl);
+        }
+        if (sumEl.textContent !== cells.summary) sumEl.textContent = cells.summary;
+        if (tds[3].getAttribute("title") !== cells.summary) tds[3].setAttribute("title", cells.summary);
+      }
       if (tds[4].textContent !== cells.progress) tds[4].textContent = cells.progress;
       if (tds[5].innerHTML !== cells.statusHtml) tds[5].innerHTML = cells.statusHtml;
       const wantOutline = cells.selected ? "1px solid var(--g2a-primary, #4f8cff)" : "";
@@ -11727,7 +11738,7 @@ function paintLogsTable(items, { soft = false } = {}) {
       <td class="g2a-muted" title="${esc(cells.title)}">${esc(cells.when)}</td>
       <td class="mono">${esc(cells.kind)}</td>
       <td class="mono g2a-muted g2a-logs-status">${esc(cells.st)}</td>
-      <td>${esc(cells.summary)}</td>
+      <td class="g2a-logs-summary" title="${esc(cells.summary)}"><span class="g2a-logs-summary-text">${esc(cells.summary)}</span></td>
       <td class="mono g2a-muted g2a-logs-progress">${esc(cells.progress)}</td>
       <td>${cells.statusHtml}</td>
     </tr>`;
