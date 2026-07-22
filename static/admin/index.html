@@ -72,7 +72,7 @@
         }
         document.documentElement.setAttribute("data-theme", t);
         document.documentElement.style.colorScheme = t;
-        document.documentElement.style.background = t === "light" ? "#f3f6fb" : "#07090f";
+        document.documentElement.style.background = t === "light" ? "#eef3f8" : "#070a10";
         var tok = localStorage.getItem("g2a_admin_token") || "";
         var ts = Number(localStorage.getItem("g2a_admin_token_ts") || 0) || 0;
         var grace = tok && ts && (Date.now() - ts) < 7 * 24 * 3600 * 1000;
@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.6e5bba711f.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.679920262e.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -137,7 +137,7 @@
         </div>
         <div class="g2a-header-actions">
           <span id="status-pill" class="g2a-tag">—</span>
-          <button type="button" class="g2a-theme-toggle" data-theme-toggle aria-label="切换主题"><span class="ico">☀️</span><span class="label">白天</span></button>
+          <button type="button" class="g2a-theme-toggle has-svg" data-theme-toggle aria-label="切换主题"><svg class="ico-svg is-active" data-theme-icon="sun" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="3.2" stroke="currentColor" stroke-width="1.6"/><path d="M10 2.8v1.6M10 15.6v1.6M2.8 10h1.6M15.6 10h1.6M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9l-1.1 1.1M6 14l-1.1 1.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><svg class="ico-svg" data-theme-icon="moon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M12.6 3.4A6.8 6.8 0 1 0 16.6 13a5.6 5.6 0 0 1-4-9.6Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg><span class="ico">☀️</span><span class="label">白天</span></button>
           <button type="button" class="g2a-btn g2a-btn-default" id="btn-refresh">刷新</button>
         </div>
       </header>
@@ -194,26 +194,28 @@
 <section class="g2a-card">
   <div class="g2a-card-head">
     <div>
+      <div class="g2a-section-kicker">SHORTCUTS</div>
       <h3>快速操作</h3>
-      <p>常用入口，一键跳转。</p>
+      <p>常用运维入口，一键跳转。</p>
     </div>
   </div>
-  <div class="g2a-actions">
-    <a class="g2a-btn g2a-btn-primary" href="/admin/keys">管理 API Keys</a>
-    <a class="g2a-btn g2a-btn-default" href="/admin/accounts">账号 / 设备码登录</a>
-    <a class="g2a-btn g2a-btn-default" href="/admin/models">查看模型列表</a>
-    <a class="g2a-btn g2a-btn-default" href="/admin/settings">系统设置</a>
-    <a class="g2a-btn g2a-btn-default" href="/admin/guide">接入指南</a>
+  <div class="g2a-quick-grid">
+    <a class="g2a-quick-tile" href="/admin/keys"><span class="ico">K</span><span class="title">API Keys</span><span class="sub">签发与停用客户端密钥</span></a>
+    <a class="g2a-quick-tile" href="/admin/accounts"><span class="ico">A</span><span class="title">账号 / 轮询</span><span class="sub">设备码登录与池状态</span></a>
+    <a class="g2a-quick-tile" href="/admin/usage"><span class="ico">U</span><span class="title">用量遥测</span><span class="sub">请求与 token 趋势</span></a>
+    <a class="g2a-quick-tile" href="/admin/models"><span class="ico">M</span><span class="title">模型目录</span><span class="sub">上游路由与健康</span></a>
+    <a class="g2a-quick-tile" href="/admin/settings"><span class="ico">S</span><span class="title">系统设置</span><span class="sub">鉴权、续期与探测</span></a>
+    <a class="g2a-quick-tile" href="/admin/guide"><span class="ico">G</span><span class="title">接入指南</span><span class="sub">cURL / SDK 片段</span></a>
   </div>
 </section>
 
       </div>
     </div>
   </div>
-  <script src="/static/dist/utils.ac10ff3b58.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/utils.e0a95cf6ed.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/api.1bf56e45fe.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4eb51a7835.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.0631f67707.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.38bf64722f.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

@@ -33,6 +33,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
+from .secure_files import secure_write_text
+
 
 ISSUER = "https://auth.x.ai"
 AUTHORIZATION_ENDPOINT = f"{ISSUER}/oauth2/authorize"
@@ -311,7 +313,9 @@ def save_oauth_record(
         "expires_at": token.get("expires_at", None),
         "scope": token.get("scope", ""),
     }
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    secure_write_text(
+        path, json.dumps(record, ensure_ascii=False, indent=2), secure_parent=True
+    )
     return path
 
 
@@ -414,7 +418,7 @@ def save_cliproxyapi_auth_record(
     else:
         fname = f"xai-{safe}"
     path = target / f"{fname}.json"
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    secure_write_text(path, json.dumps(record, ensure_ascii=False, indent=2))
     return path
 
 

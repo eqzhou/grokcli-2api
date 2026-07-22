@@ -36,8 +36,32 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from . import config as C
+from .secure_files import secure_write_text
+
+
+_TRUSTED_SSO_HOST_SUFFIXES = (
+    "x.ai",
+    "grok.com",
+    "grokusercontent.com",
+    "grokipedia.com",
+)
+
+
+def _is_trusted_sso_url(url: str) -> bool:
+    """Allow only HTTPS hops on xAI-controlled authentication domains."""
+    try:
+        parsed = urlparse(str(url or ""))
+        host = (parsed.hostname or "").rstrip(".").lower()
+        if parsed.scheme != "https" or not host or parsed.username or parsed.password:
+            return False
+        if parsed.port not in (None, 443):
+            return False
+        return any(host == suffix or host.endswith(f".{suffix}") for suffix in _TRUSTED_SSO_HOST_SUFFIXES)
+    except (TypeError, ValueError):
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -313,19 +337,19 @@ class SSOExtractor:
 
         if self.debug:
             print(f"  [sso] candidate hop URLs: {len(hop_urls)}")
-            for u in hop_urls[:5]:
-                print(f"  [sso]  - {u[:100]}")
 
         # 2. expand each hop with JWT success_url if present
         expanded: List[str] = []
         for sso_url in hop_urls:
+            if not _is_trusted_sso_url(sso_url):
+                continue
             if sso_url not in expanded:
                 expanded.append(sso_url)
             jwt = _extract_jwt_from_url(sso_url)
             if not jwt:
                 continue
             success_url = self._resolve_success_url(jwt)
-            if success_url and success_url not in expanded:
+            if _is_trusted_sso_url(success_url) and success_url not in expanded:
                 expanded.append(success_url)
         hop_urls = expanded
 
@@ -343,7 +367,10 @@ class SSOExtractor:
         set_cookies: List[str] = []
         last_exc: Optional[BaseException] = None
         token = None
-        for hop in list(hop_urls):
+        hop_index = 0
+        while hop_index < len(hop_urls) and hop_index < 8:
+            hop = hop_urls[hop_index]
+            hop_index += 1
             for attempt in range(2):
                 try:
                     try:
@@ -376,7 +403,7 @@ class SSOExtractor:
                     if loc:
                         if loc.startswith("/"):
                             loc = "https://accounts.x.ai" + loc
-                        if loc.startswith("http") and loc not in hop_urls:
+                        if _is_trusted_sso_url(loc) and loc not in hop_urls:
                             hop_urls.append(loc)
                     break
                 except Exception as exc:
@@ -413,7 +440,7 @@ class SSOExtractor:
         if payload:
             cfg = payload.get("config", {})
             url = cfg.get("success_url")
-            if isinstance(url, str) and url.startswith("https://"):
+            if isinstance(url, str) and _is_trusted_sso_url(url):
                 return url
         return self.GROKUSERCONTENT_SET_COOKIE
 
@@ -426,7 +453,7 @@ class SSOExtractor:
                 if name == "sso":
                     val = str(getattr(cookie, "value", ""))
                     if self.debug:
-                        print(f"  [sso] extracted: {val[:60]}...")
+                        print(f"  [sso] extracted token length={len(val)}")
                     return val
         return None
 
@@ -488,8 +515,8 @@ def save_sso(
         record["payload"] = payload
 
     filepath = target / filename
-    filepath.write_text(
-        json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+    secure_write_text(
+        filepath, json.dumps(record, ensure_ascii=False, indent=2), secure_parent=True
     )
     return filepath
 

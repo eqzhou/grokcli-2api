@@ -1,3 +1,11 @@
+
+async function g2aConfirm(message, opts) {
+  try {
+    if (window.G2A && typeof G2A.confirm === "function") return !!(await G2A.confirm(message, opts || {}));
+  } catch (_) {}
+  try { return window.confirm(String(message ?? "")); } catch (_) { return false; }
+}
+
 /* multi-page admin core — clean rebuild v2 */
 window.G2A = window.G2A || {};
 (function () {
@@ -309,24 +317,52 @@ function paintRegChrome(opts = {}) {
   if (stopInline && !regStopping) stopInline.disabled = !stopable && state === "idle";
 }
 
+function normalizeRegProgress(stats = {}) {
+  const totalRaw = Number(stats.total != null ? stats.total : (stats.count != null ? stats.count : stats.spawned)) || 0;
+  const success = Math.max(0, Number(stats.success != null ? stats.success : (stats.imported != null ? stats.imported : stats.ok)) || 0);
+  const running = Math.max(0, Number(stats.running != null ? stats.running : stats.inflight) || 0);
+  const probing = Math.max(0, Number(stats.probing != null ? stats.probing : stats.probe_pending_count) || 0);
+  const cancelled = Math.max(0, Number(stats.cancelled != null ? stats.cancelled : (stats.cancelled_count != null ? stats.cancelled_count : stats.stop)) || 0);
+  const hasUnattempted = stats.unattempted != null || stats.not_attempted != null || stats.remaining != null;
+  let unattempted = Math.max(0, Number(stats.unattempted != null ? stats.unattempted : (stats.not_attempted != null ? stats.not_attempted : stats.remaining)) || 0);
+  const status = String(stats.status || stats.batch_status || "").toLowerCase();
+  const terminal = ["done", "partial", "error", "failed", "cancelled", "stopped", "completed"].includes(status);
+  let fail = Math.max(0, Number(stats.fail != null ? stats.fail : (stats.error != null ? stats.error : stats.failed)) || 0);
+  if (!hasUnattempted && terminal && totalRaw > 0) {
+    unattempted = Math.max(0, totalRaw - success - fail - running - cancelled);
+  }
+  if ((hasUnattempted || terminal) && totalRaw > 0) {
+    fail = Math.min(fail, Math.max(0, totalRaw - success - running - cancelled - unattempted));
+  }
+  const total = Math.max(totalRaw, success + fail + running + cancelled + unattempted);
+  return { total, success, fail, running, probing, cancelled, unattempted };
+}
+
 function setRegStats(stats = {}) {
-  const total = Number(stats.total || 0) || 0;
-  const ok = Number(stats.success || stats.ok || 0) || 0;
-  const fail = Number(stats.fail || 0) || 0;
-  const run = Number(stats.running || 0) || 0;
-  const stop = Number(stats.cancelled || stats.stop || 0) || 0;
+  const progress = normalizeRegProgress(stats);
+  const total = progress.total;
+  const ok = progress.success;
+  const fail = progress.fail;
+  const run = progress.running;
+  const probing = progress.probing;
+  const stop = progress.cancelled;
+  const unattempted = progress.unattempted;
   const map = {
     "reg-stat-total": total,
     "reg-stat-ok": ok,
     "reg-stat-fail": fail,
     "reg-stat-run": run,
+    "reg-stat-probing": probing,
     "reg-stat-stop": stop,
+    "reg-stat-unattempted": unattempted,
   };
   for (const [id, val] of Object.entries(map)) {
     const el = $(id);
     if (el) el.textContent = String(val);
   }
-  const done = ok + fail + stop;
+  const status = String(stats.status || stats.batch_status || "").toLowerCase();
+  const terminal = ["done", "partial", "error", "failed", "cancelled", "stopped", "completed"].includes(status);
+  const done = ok + fail + stop + (terminal ? unattempted : 0);
   const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : (run > 0 ? 8 : 0);
   const fill = $("reg-progress-fill");
   const bar = $("reg-progress-bar");
@@ -339,10 +375,11 @@ function setRegStats(stats = {}) {
   if (label) {
     if (regStopping && run > 0) label.textContent = "停止中，等待进行中的任务退出…";
     else if (total <= 0 && run <= 0) label.textContent = "等待开始…";
-    else if (run > 0) label.textContent = `进行中 ${run} · 已完成 ${done}/${total || done}`;
+    else if (run > 0 || probing > 0) label.textContent = `进行中 ${run}` + (probing ? ` · 测活中 ${probing}` : "") + ` · 已完成 ${done}/${total || done}`;
     else if (fail > 0 && ok > 0) label.textContent = `部分完成 · 成功 ${ok} · 失败 ${fail}`;
     else if (fail > 0 && ok <= 0) label.textContent = `已结束 · 全部失败 ${fail}`;
-    else if (stop > 0 && ok + fail <= 0) label.textContent = `已停止 · ${stop}`;
+    else if (stop > 0 && ok + fail <= 0) label.textContent = `已停止 · 已取消 ${stop}` + (unattempted ? ` · 未尝试 ${unattempted}` : "");
+    else if (unattempted > 0 && run <= 0) label.textContent = `已结束 · 未尝试 ${unattempted}`;
     else label.textContent = total ? `已完成 ${done}/${total}` : "已完成";
   }
   if (wrap) {
@@ -514,9 +551,9 @@ async function softNavigate(name, opts) {
   // Theme-aware paint lock (avoid forcing pure black in light mode).
   try {
     const theme = document.documentElement.getAttribute("data-theme") || "dark";
-    document.documentElement.style.background = theme === "light" ? "#f3f6fb" : "#07090f";
+    document.documentElement.style.background = theme === "light" ? "#eef3f8" : "#070a10";
   } catch (_) {
-    document.documentElement.style.background = "#07090f";
+    document.documentElement.style.background = "#070a10";
   }
   // Hard timeout: never leave the UI dimmed/black if fetch hangs.
   // Mobile networks hang more often; 5s keeps 用量/日志 chips recoverable.
@@ -551,9 +588,13 @@ async function softNavigate(name, opts) {
 
     const nt = doc.querySelector("#page-title");
     const ns = doc.querySelector("#page-sub");
+    const nk = doc.querySelector(".g2a-page-kicker");
     if (nt && $("page-title")) $("page-title").textContent = nt.textContent;
     if (ns && $("page-sub")) $("page-sub").textContent = ns.textContent;
+    const currentKicker = document.querySelector(".g2a-page-kicker");
+    if (nk && currentKicker) currentKicker.textContent = nk.textContent;
     try { buildMobileNav(); } catch (_) {}
+    try { bindNavDrawer(); } catch (_) {}
     applyPageMeta(page);
     if (!opts.replace) history.pushState({ g2aPage: page }, "", href);
     else history.replaceState({ g2aPage: page }, "", href);
@@ -589,6 +630,7 @@ async function softNavigate(name, opts) {
         // Registration form is inside .g2a-content — rebind + repaint email panels
         // so switching MoeMail/YYDS/GPTMail/CF updates fields without hard refresh.
         try { bindRegMailFormControls(); } catch (_) {}
+        try { bindRegSettingsDialog(); } catch (_) {}
         try {
           if (typeof loadRegConfig === "function") {
             // Soft-nav: do not hard-force if we just saved (avoids flash-restore).
@@ -709,20 +751,9 @@ function hideEmptyLogPanels() {
   });
   const regBox = $("reg-session-box");
   if (regBox) {
-    // Keep the card visible while a registration is still tracked in this page session.
-    if (regBatchId || (regSessionIds && regSessionIds.length) || regSessionId) {
-      regBox.classList.remove("hidden");
-      regBox.hidden = false;
-      return;
-    }
-    const st = ((regBox.querySelector("#reg-status") && regBox.querySelector("#reg-status").textContent) || "").trim() || "idle";
-    const log = $("reg-log");
-    const logText = ((log && log.textContent) || "").trim();
-    const emptyLog = !log || log.classList.contains("hidden") || !logText || logText === "—";
-    if ((st === "idle" || st === "—" || st === "") && emptyLog) {
-      regBox.classList.add("hidden");
-      regBox.hidden = true;
-    }
+    // Registration controls live in this workbench, so it remains visible at idle.
+    regBox.classList.remove("hidden");
+    regBox.hidden = false;
   }
 }
 
@@ -1170,13 +1201,13 @@ function rebindPageControls() {
   // Always re-enable progressive device UI on each rebind.
   if (!loginSessionId) setDeviceLoginIdle(true);
   else setDeviceLoginIdle(false);
-  on("btn-login-device", "onclick", () => startDeviceLogin());
-  on("btn-poll-device", "onclick", () => pollDeviceSession());
-  on("btn-copy-device", "onclick", () => copyDeviceCode());
-  on("btn-import", "onclick", () => importJsonFiles());
-  on("btn-import-sso", "onclick", () => importSsoCookies());
-  on("btn-export-sso", "onclick", () => exportRegistrationSso());
-  if ($("btn-export")) on("btn-export", "onclick", () => exportAllAccounts());
+  on("btn-login-device", "onclick", async () => startDeviceLogin());
+  on("btn-poll-device", "onclick", async () => pollDeviceSession());
+  on("btn-copy-device", "onclick", async () => copyDeviceCode());
+  on("btn-import", "onclick", async () => importJsonFiles());
+  on("btn-import-sso", "onclick", async () => importSsoCookies());
+  on("btn-export-sso", "onclick", async () => exportRegistrationSso());
+  if ($("btn-export")) on("btn-export", "onclick", async () => exportAllAccounts());
   // Soft-nav swaps #main-content; rebind file pickers so name labels update again.
   on("import-file", "onchange", () => {
     const files = $("import-file") && $("import-file").files;
@@ -1196,7 +1227,7 @@ function rebindPageControls() {
     label.textContent = f ? `已选择：${f.name}（${(f.size / 1024).toFixed(1)} KB）` : "未选择文件";
   });
   on("btn-logout-cli", "onclick", async () => {
-    if (!confirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）")) return;
+    if (!(await g2aConfirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）", { danger: true, title: "危险操作", okText: "确认删除" }))) return;
     try {
       const r = await api("/accounts/logout", { method: "POST" });
       toast(r.message || "完成", !!r.ok);
@@ -1247,9 +1278,15 @@ function rebindPageControls() {
     } catch (e) { toast(e.message, false); }
     finally { if ($("btn-start-reg")) $("btn-start-reg").disabled = false; }
   });
-  if ($("btn-save-reg")) on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
+  if ($("btn-save-reg")) on("btn-save-reg", "onclick", async () => {
+    try {
+      await saveRegConfig();
+      closeRegSettingsDialog();
+    } catch (_) {}
+  });
   // Soft-nav swaps registration form DOM — rebind provider select + repaint panels.
   try { bindRegMailFormControls(); } catch (e) { console.warn("bindRegMailFormControls", e); }
+  try { bindRegSettingsDialog(); } catch (e) { console.warn("bindRegSettingsDialog", e); }
   if ($("btn-refresh-reg")) on("btn-refresh-reg", "onclick", () => {
     refreshRegistrationProgress({ toastIfEmpty: true }).catch(() => {});
   });
@@ -1390,7 +1427,7 @@ function rebindPageControls() {
           return;
         }
         if (btn.dataset.act === "rm-acc") {
-          if (!confirm("确定移除此账号？将从数据库与本地镜像同步删除。")) return;
+          if (!(await g2aConfirm("确定移除此账号？将从数据库与本地镜像同步删除。", { danger: true, title: "危险操作", okText: "确认删除" }))) return;
           setRowBusy(id, true, "移除中");
           try {
             await api("/accounts/" + encodeURIComponent(id), { method: "DELETE" });
@@ -1420,55 +1457,198 @@ function switchTab(name) {
 
 function bindSettingsNav() {
   const nav = $("settings-nav");
-  if (!nav || nav.dataset.bound === "1") return;
-  nav.dataset.bound = "1";
+  if (!nav) return;
   const items = Array.from(nav.querySelectorAll(".g2a-settings-nav-item[data-sec]"));
   if (!items.length) return;
+  const panels = Array.from(document.querySelectorAll("[data-settings-panel]"));
+  // Fallback: treat .g2a-settings-section as panels if attrs missing
+  const sections = panels.length
+    ? panels
+    : Array.from(document.querySelectorAll(".g2a-settings-section[id]"));
 
-  function setActive(id) {
+  function showSection(id, opts) {
+    opts = opts || {};
+    if (!id) return;
+    const target = document.getElementById(id);
+    if (!target) return;
+
     items.forEach((a) => {
-      a.classList.toggle("is-active", a.getAttribute("data-sec") === id);
+      const on = a.getAttribute("data-sec") === id;
+      a.classList.toggle("is-active", on);
+      a.setAttribute("aria-selected", on ? "true" : "false");
+      a.tabIndex = on ? 0 : -1;
     });
+
+    sections.forEach((sec) => {
+      const on = sec.id === id;
+      sec.classList.toggle("is-active", on);
+      if (on) {
+        sec.removeAttribute("hidden");
+        sec.setAttribute("aria-hidden", "false");
+      } else {
+        sec.setAttribute("hidden", "");
+        sec.setAttribute("aria-hidden", "true");
+      }
+    });
+
+    if (!opts.skipHash) {
+      try { history.replaceState(null, "", "#" + id); } catch (_) {}
+    }
+    if (opts.scrollNav !== false) {
+      try {
+        const active = nav.querySelector(".g2a-settings-nav-item.is-active");
+        if (active && active.scrollIntoView) {
+          active.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+        }
+      } catch (_) {}
+    }
+    // Keep page head in view when switching tabs
+    if (opts.focusPanel) {
+      try {
+        const head = target.querySelector("h3, h2");
+        if (head) head.focus?.();
+      } catch (_) {}
+    }
   }
 
-  items.forEach((a) => {
-    a.addEventListener("click", (e) => {
-      const id = a.getAttribute("data-sec");
-      const el = id && document.getElementById(id);
-      if (!el) return;
-      e.preventDefault();
-      setActive(id);
-      try {
-        el.scrollIntoView({ behavior: "smooth", block: "start" });
-      } catch (_) {
-        el.scrollIntoView(true);
+  // expose for deep-links / version card buttons
+  window.G2A = window.G2A || {};
+  G2A.showSettingsSection = showSection;
+
+  if (nav.dataset.bound === "1") {
+    // re-apply hash when soft-nav re-enters settings
+    try {
+      const hash = (location.hash || "").replace(/^#/, "");
+      if (hash && document.getElementById(hash)) showSection(hash, { skipHash: true, scrollNav: false });
+      else {
+        const cur = items.find((a) => a.classList.contains("is-active"));
+        showSection((cur && cur.getAttribute("data-sec")) || items[0].getAttribute("data-sec"), {
+          skipHash: true,
+          scrollNav: false,
+        });
       }
-      try { history.replaceState(null, "", "#" + id); } catch (_) {}
+    } catch (_) {}
+    return;
+  }
+  nav.dataset.bound = "1";
+
+  items.forEach((a, idx) => {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      const id = a.getAttribute("data-sec");
+      showSection(id, { focusPanel: true });
+    });
+    a.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft" && e.key !== "Home" && e.key !== "End") return;
+      e.preventDefault();
+      let next = idx;
+      if (e.key === "ArrowRight") next = (idx + 1) % items.length;
+      if (e.key === "ArrowLeft") next = (idx - 1 + items.length) % items.length;
+      if (e.key === "Home") next = 0;
+      if (e.key === "End") next = items.length - 1;
+      const id = items[next].getAttribute("data-sec");
+      showSection(id, { focusPanel: true });
+      try { items[next].focus(); } catch (_) {}
     });
   });
 
-  const sections = items
-    .map((a) => document.getElementById(a.getAttribute("data-sec")))
-    .filter(Boolean);
-  if (!sections.length || typeof IntersectionObserver === "undefined") return;
-  const obs = new IntersectionObserver(
-    (entries) => {
-      // pick the most visible intersecting section near top
-      const visible = entries
-        .filter((en) => en.isIntersecting)
-        .sort((a, b) => b.intersectionRatio - a.intersectionRatio);
-      if (visible[0] && visible[0].target && visible[0].target.id) {
-        setActive(visible[0].target.id);
-      }
-    },
-    { root: null, rootMargin: "-20% 0px -55% 0px", threshold: [0.1, 0.25, 0.5, 0.75] }
-  );
-  sections.forEach((sec) => obs.observe(sec));
-  // honor hash on enter
+  // Initial: hash > first tab
   try {
     const hash = (location.hash || "").replace(/^#/, "");
-    if (hash && document.getElementById(hash)) setActive(hash);
+    if (hash && document.getElementById(hash)) showSection(hash, { skipHash: true, scrollNav: false });
+    else showSection(items[0].getAttribute("data-sec"), { skipHash: true, scrollNav: false });
+  } catch (_) {
+    showSection(items[0].getAttribute("data-sec"), { skipHash: true, scrollNav: false });
+  }
+}
+
+
+function ensureNavChrome() {
+  try {
+    if (!document.querySelector(".g2a-sider-backdrop")) {
+      const bd = document.createElement("div");
+      bd.className = "g2a-sider-backdrop";
+      bd.setAttribute("data-nav-close", "1");
+      document.body.appendChild(bd);
+    }
+    document.querySelectorAll(".g2a-header-actions").forEach((actions) => {
+      if (actions.querySelector("[data-nav-toggle]")) return;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "g2a-burger";
+      btn.setAttribute("data-nav-toggle", "1");
+      btn.setAttribute("aria-label", "打开导航");
+      btn.innerHTML = '<svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M3.5 5.5h13M3.5 10h13M3.5 14.5h13" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>';
+      actions.insertBefore(btn, actions.firstChild);
+    });
+    // code theme toggle next to theme toggle
+    document.querySelectorAll(".g2a-header-actions").forEach((actions) => {
+      if (actions.querySelector("[data-code-theme-toggle]")) return;
+      const themeBtn = actions.querySelector("[data-theme-toggle]");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "g2a-code-toggle";
+      btn.setAttribute("data-code-theme-toggle", "1");
+      btn.setAttribute("aria-pressed", "false");
+      btn.innerHTML = '<span class="ico">&lt;/&gt;</span><span class="label">深码</span>';
+      if (themeBtn && themeBtn.nextSibling) actions.insertBefore(btn, themeBtn.nextSibling);
+      else if (themeBtn) actions.appendChild(btn);
+      else actions.appendChild(btn);
+    });
+    // login page theme wrap
+    const loginWrap = document.querySelector(".g2a-login-theme-wrap");
+    if (loginWrap && !loginWrap.querySelector("[data-code-theme-toggle]")) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "g2a-code-toggle";
+      btn.setAttribute("data-code-theme-toggle", "1");
+      btn.style.marginLeft = "8px";
+      btn.innerHTML = '<span class="ico">&lt;/&gt;</span><span class="label">深码</span>';
+      loginWrap.appendChild(btn);
+    }
   } catch (_) {}
+}
+
+function setNavOpen(open) {
+  document.body.classList.toggle("g2a-nav-open", !!open);
+  document.querySelectorAll("[data-nav-toggle]").forEach((b) => {
+    b.setAttribute("aria-label", open ? "关闭导航" : "打开导航");
+    b.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+}
+
+function bindNavDrawer() {
+  ensureNavChrome();
+  if (document.body.dataset.boundNav === "1") {
+    try { if (window.G2A && G2A.bindCodeThemeToggle) G2A.bindCodeThemeToggle(document); } catch (_) {}
+    return;
+  }
+  document.body.dataset.boundNav = "1";
+  document.addEventListener("click", (e) => {
+    const t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest("[data-nav-toggle]")) {
+      e.preventDefault();
+      setNavOpen(!document.body.classList.contains("g2a-nav-open"));
+      return;
+    }
+    if (t.closest("[data-nav-close]")) {
+      setNavOpen(false);
+      return;
+    }
+    // close after nav link click on small screens
+    const link = t.closest(".g2a-sider a.g2a-menu-item, .g2a-mobile-nav a");
+    if (link && window.matchMedia && window.matchMedia("(max-width: 960px)").matches) {
+      setNavOpen(false);
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") setNavOpen(false);
+  });
+  window.addEventListener("resize", () => {
+    if (window.matchMedia && window.matchMedia("(min-width: 961px)").matches) setNavOpen(false);
+  });
+  try { if (window.G2A && G2A.bindCodeThemeToggle) G2A.bindCodeThemeToggle(document); } catch (_) {}
 }
 
 function buildMobileNav() {
@@ -1507,6 +1687,7 @@ async function bootstrap() {
   try { if (window.G2A && G2A.bindThemeToggle) G2A.bindThemeToggle(document); } catch(_){}
   try {
     buildMobileNav();
+    try { bindNavDrawer(); } catch (_) {}
     const page = document.body.dataset.page || pageFromPath(location.pathname) || "overview";
     applyPageMeta(page);
 
@@ -1699,14 +1880,16 @@ async function loadDashboard() {
       try { window.__g2aCurrentVersion = String(ver).replace(/^v/, ""); } catch (_) {}
     }
     try { scheduleVersionBannerCheck(); } catch (_) {}
-    const pill = $("status-pill");
-    if (pill) {
-      const mode = st.account_mode || (dashCache && dashCache.account_mode) || "";
-      const live = (st.accounts && st.accounts.active_count) ?? (st.pool && st.pool.live) ?? (dashCache && dashCache.pool && dashCache.pool.live);
-      const email = st.credentials_email || "";
-      pill.className = "g2a-tag" + (st.credentials_ok ? " ok" : "");
-      pill.textContent = [email, mode, live != null ? ("账号 " + live) : ""].filter(Boolean).join(" · ") || "—";
-    }
+    const statusAccounts = st.accounts || (dashCache && dashCache.accounts) || {};
+    const statusPool = st.pool || (dashCache && dashCache.pool) || {};
+    const total = statusPool.total ?? statusAccounts.account_count ?? 0;
+    const live = statusPool.live ?? statusPool.enabled ?? statusAccounts.active_count ?? 0;
+    renderRuntimeStatusPill({
+      total,
+      live,
+      credentialsOk: !!st.credentials_ok || Number(live || 0) > 0,
+      email: st.credentials_email || "",
+    });
   } catch (_) {}
 }
 
@@ -1728,6 +1911,23 @@ function fmtTokens(n, unit = "token") {
   return `${fmtNum(n)}${unit ? " " + unit : ""}`;
 }
 
+function renderRuntimeStatusPill({ total = 0, live = 0, credentialsOk = false, email = "" } = {}) {
+  const pill = $("status-pill");
+  if (!pill) return;
+  if (Number(total || 0) <= 0) {
+    pill.className = "g2a-tag warn";
+    pill.textContent = "账号池为空";
+    return;
+  }
+  if (credentialsOk) {
+    pill.className = "g2a-tag ok";
+    pill.textContent = "上游可用" + (email ? (" · " + email) : "") + " · 账号 " + Number(live || 0);
+    return;
+  }
+  pill.className = "g2a-tag bad";
+  pill.textContent = "上游凭证异常 · 账号 " + Number(total || 0);
+}
+
 /** Prefer API billed_tokens (total − cache_read); fall back to total_tokens. */
 function usageBilled(obj) {
   if (!obj || typeof obj !== "object") return 0;
@@ -1741,17 +1941,17 @@ function renderStats() {
   const d = dashCache || {};
   // Prefer live /status pool counters over possibly-stale /dashboard cache.
   const pool = Object.assign({}, d.pool || {}, s.pool || {});
-  const credOk = !(d.credentials && d.credentials.error) && (s.credentials_ok || (pool.live > 0));
-  const pill = $("status-pill");
-  if (credOk) {
-    pill.className = "g2a-tag ok";
-    pill.textContent = "● 已登录 " + (s.credentials_email || "") + " · " + (d.account_mode || s.account_mode || "");
-  } else {
-    pill.className = "g2a-tag bad";
-    pill.textContent = "● 未登录 / 凭证异常";
-  }
   const keys = d.keys || s.keys || {};
   const acc = d.accounts || s.accounts || {};
+  const poolTotal = pool.total ?? acc.account_count ?? 0;
+  const poolLive = pool.live ?? pool.enabled ?? acc.active_count ?? 0;
+  const credOk = !(d.credentials && d.credentials.error) && (s.credentials_ok || poolLive > 0);
+  renderRuntimeStatusPill({
+    total: poolTotal,
+    live: poolLive,
+    credentialsOk: credOk,
+    email: s.credentials_email || "",
+  });
   const tm = d.token_maintainer || s.token_maintainer || {};
   const lastTm = tm.last || {};
   const rem = (tm.min_remaining_sec != null ? tm.min_remaining_sec : lastTm.min_remaining_sec);
@@ -1763,8 +1963,6 @@ function renderStats() {
   const apiBase = d.api_base || s.api_base || "—";
   const cliVer = d.cli_version || s.cli_version || "—";
   const upstream = d.upstream || s.upstream || "—";
-  const poolTotal = pool.total ?? acc.account_count ?? 0;
-  const poolLive = pool.live ?? pool.enabled ?? acc.active_count ?? 0;
   const keysEn = keys.enabled ?? 0;
   const keysTot = keys.total ?? 0;
   const usage = d.usage || s.usage || {};
@@ -1836,17 +2034,17 @@ function renderMaintainer() {
   if (!pill || !info) return;
   if (!enabled) {
     pill.className = "g2a-tag warn";
-    pill.textContent = "● 已关闭";
+    pill.textContent = "已关闭";
   } else if (tm.running || tm.cluster_running || tm.leader_running) {
     pill.className = "g2a-tag ok";
-    pill.textContent = "● 自动续期运行中";
+    pill.textContent = "自动续期运行中";
   } else if (tm.enabled) {
     // multi-worker: this response may come from a non-leader process
     pill.className = "g2a-tag ok";
-    pill.textContent = "● 已启用（后台）";
+    pill.textContent = "已启用（后台）";
   } else {
     pill.className = "g2a-tag bad";
-    pill.textContent = "● 未运行";
+    pill.textContent = "未运行";
   }
   const last = tm.last || {};
   const refresh = (last && last.refresh) || {};
@@ -2072,7 +2270,7 @@ async function handleKeyRowAction(btn) {
       let full = extractKeySecret(k);
       let regenerated = false;
       if (!full) {
-        if (!confirm("该 Key 未保存完整值，无法直接复制。是否重新生成？旧 Key 会立即失效。")) return;
+        if (!(await g2aConfirm("该 Key 未保存完整值，无法直接复制。是否重新生成？旧 Key 会立即失效。", { title: "请确认" }))) return;
         const data = await api("/keys/" + encodeURIComponent(id) + "/regenerate", { method: "POST" });
         const rec = extractKeyRecord(data);
         full = extractKeySecret(data) || extractKeySecret(rec);
@@ -2095,7 +2293,7 @@ async function handleKeyRowAction(btn) {
       return;
     }
     if (act === "del") {
-      if (!confirm("确定删除此 Key？删除后使用该密钥的客户端将立即失效。")) return;
+      if (!(await g2aConfirm("确定删除此 Key？删除后使用该密钥的客户端将立即失效。", { danger: true, title: "危险操作", okText: "确认删除" }))) return;
       await api("/keys/" + encodeURIComponent(id), { method: "DELETE" });
       if (keysCache && keysCache[id]) delete keysCache[id];
       toast("已删除");
@@ -2625,7 +2823,9 @@ function updateAccountSelectionInfo(filteredCount, pageCount) {
   if (accountsSsoFilter === "1") bits.push("有SSO");
   if (accountsSsoFilter === "0") bits.push("无SSO");
   if (q) bits.push(`关键词:${q}`);
-  el.textContent = bits.join(" · ");
+  const _selTxt = bits.join(" · ");
+  el.textContent = _selTxt;
+  el.classList.remove("is-empty");
   const pageCheck = $("acc-check-page");
   if (pageCheck) {
     const pageIds = Array.from(document.querySelectorAll(".acc-check-one")).map(x => accountIdKey(x.dataset.id)).filter(Boolean);
@@ -2660,37 +2860,53 @@ function renderAccountsPage() {
       }
       const enabled = p.enabled !== false;
       const poolLabel = poolStatusLabel(a, p);
-      const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
+      const usage = `<span class="g2a-usage-ok">${p.success_count || 0}</span><span class="g2a-usage-sep">✓</span> <span class="g2a-usage-bad">${p.fail_count || 0}</span><span class="g2a-usage-sep">✗</span> <span class="g2a-muted">共 ${p.request_count || 0}</span>`;
       const refreshPill = a.has_refresh_token
-        ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
-        : '<span class="g2a-tag warn">无 refresh</span>';
+        ? '<span class="g2a-tag ok g2a-status-pill" title="可自动 refresh">可续期</span>'
+        : '<span class="g2a-tag warn g2a-status-pill">无 refresh</span>';
       const ssoPill = a.has_sso
-        ? '<span class="g2a-tag ok" title="账号库已保存 SSO cookie">有SSO</span>'
-        : '<span class="g2a-tag" title="未保存 SSO cookie">无SSO</span>';
+        ? '<span class="g2a-tag ok g2a-status-pill" title="账号库已保存 SSO cookie">有SSO</span>'
+        : '<span class="g2a-tag g2a-status-pill" title="未保存 SSO cookie">无SSO</span>';
       const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
       const checked = selectedAccountIds.has(accountIdKey(a.id)) ? "checked" : "";
       const expiryCell = fmtExpiry(a.expires_at);
       const typeCell = fmtAccountTypeCell({ ...p, id: a.id, account_type: a.account_type || p.account_type, plan: a.plan || p.plan, plan_label: a.plan_label || p.plan_label, last_quota: p.last_quota }, liveQ);
+      const tokenPill = a.expired
+        ? '<span class="g2a-tag bad g2a-status-pill">已过期</span>'
+        : '<span class="g2a-tag ok g2a-status-pill">有效</span>';
       return `
     <tr data-acc-id="${esc(a.id)}">
-      <td><input type="checkbox" class="acc-check-one" data-id="${esc(a.id)}" ${checked} /></td>
-      <td>${esc(a.email || "—")}<div class="muted mono" style="font-size:0.72rem">${esc(a.id)}</div></td>
-      <td>${a.expired ? '<span class="g2a-tag bad">已过期</span>' : '<span class="g2a-tag ok">有效</span>'}</td>
-      <td style="min-width:88px">${typeCell}</td>
-      <td>${poolLabel}</td>
-      <td class="g2a-muted" style="font-size:0.8rem">${usage}</td>
-      <td style="font-size:0.82rem;min-width:150px">${fmtQuotaCell({ ...p, id: a.id }, liveQ)}</td>
-      <td style="font-size:0.78rem;min-width:160px">${probeCell}</td>
-      <td style="font-size:0.8rem;min-width:150px">
-        ${expiryCell}
-        <div style="margin-top:6px">${refreshPill} ${ssoPill}</div>
+      <td class="g2a-acc-check"><input type="checkbox" class="acc-check-one" data-id="${esc(a.id)}" ${checked} /></td>
+      <td class="g2a-acc-idcol">
+        <div class="g2a-acc-idcell" title="${esc((a.email || "") + " · " + (a.id || ""))}">
+          <span class="g2a-acc-email">${esc(a.email || "—")}</span>
+          <span class="g2a-cell-sub">${esc(a.id)}</span>
+        </div>
       </td>
-      <td class="g2a-actions">
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="renew-one" data-id="${esc(a.id)}" ${a.has_refresh_token ? "" : "disabled title=\"无 refresh_token，无法续期\""}>续期</button>
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="probe-one" data-id="${esc(a.id)}">模型测试</button>
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
-        <button class="g2a-btn g2a-btn-danger g2a-btn-sm" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
+      <td class="g2a-acc-token">${tokenPill}</td>
+      <td class="g2a-acc-type">${typeCell}</td>
+      <td class="g2a-acc-pool">${poolLabel}</td>
+      <td class="g2a-acc-usage mono">${usage}</td>
+      <td class="g2a-acc-quota">${fmtQuotaCell({ ...p, id: a.id }, liveQ)}</td>
+      <td class="g2a-acc-probe">${probeCell}</td>
+      <td class="g2a-acc-expiry">
+        <div class="g2a-acc-expiry-stack">
+          ${expiryCell}
+          <div class="g2a-acc-meta-pills">${refreshPill}${ssoPill}</div>
+        </div>
+      </td>
+      <td class="g2a-acc-actions">
+        <div class="g2a-acc-actions-inner">
+          <div class="g2a-acc-actions-row">
+            <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="renew-one" data-id="${esc(a.id)}" ${a.has_refresh_token ? "" : "disabled title=\"无 refresh_token，无法续期\""}>续期</button>
+            <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="probe-one" data-id="${esc(a.id)}">探测</button>
+            <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
+          </div>
+          <div class="g2a-acc-actions-row">
+            <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
+            <button class="g2a-btn g2a-btn-danger g2a-btn-sm" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
+          </div>
+        </div>
       </td>
     </tr>`;
     }).join("") || `<tr><td colspan="10" class="g2a-muted">${(accountsTotal || 0) ? "无匹配账号" : "无账号"}</td></tr>`;
@@ -3185,7 +3401,7 @@ async function deleteSelectedAccounts() {
     toast("请先勾选要删除的账号", false);
     return;
   }
-  if (!confirm(`确定删除选中的 ${ids.length} 个账号？将从数据库与本地镜像同步删除。`)) return;
+  if (!(await g2aConfirm(`确定删除选中的 ${ids.length} 个账号？将从数据库与本地镜像同步删除。`, { danger: true, title: "危险操作", okText: "确认删除" }))) return;
   try {
     const r = await api("/accounts/delete-batch", {
       method: "POST",
@@ -3568,7 +3784,7 @@ async function renewAccounts(ids, { confirmMany = true } = {}) {
     return;
   }
   if (confirmMany && list.length > 1) {
-    if (!confirm(`确认续期选中的 ${list.length} 个账号？将调用 refresh_token 更新 access token。`)) return;
+    if (!(await g2aConfirm(`确认续期选中的 ${list.length} 个账号？将调用 refresh_token 更新 access token。`, { title: "请确认" }))) return;
   }
   // Mark all selected rows busy for live feedback.
   list.forEach((id) => setRowBusy(id, true, "续期中"));
@@ -3932,7 +4148,7 @@ function poolStatusLabel(a, p) {
   let poolLabel;
   if (quotaOff) {
     const tip = [p.disabled_reason || "额度耗尽，已移出轮询", p.quota_source ? `source=${p.quota_source}` : ""].filter(Boolean).join(" · ");
-    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">额度冷却</span>`;
+    poolLabel = `<span class="g2a-tag bad g2a-status-pill" title="${esc(tip)}">额度冷却</span>`;
   } else if (expired) {
     const tip = [
       "已过期，已移出轮询",
@@ -3941,10 +4157,10 @@ function poolStatusLabel(a, p) {
       p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
       p.last_renew_status === "sso_failed" ? "SSO 重登失败" : "",
     ].filter(Boolean).join(" · ");
-    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
+    poolLabel = `<span class="g2a-tag bad g2a-status-pill" title="${esc(tip)}">过期</span>`;
   } else if (!enabled || p.pool_status === "disabled") {
     const tip = p.disabled_reason || p.last_error || "已禁用，不参与轮询";
-    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">已禁用</span>`;
+    poolLabel = `<span class="g2a-tag bad g2a-status-pill" title="${esc(tip)}">已禁用</span>`;
   } else if (cooling) {
     // Sticky cool: one state only — no stack-depth overlay (叠×N) on the pill.
     const tip = [
@@ -3954,7 +4170,7 @@ function poolStatusLabel(a, p) {
       cdTok ? `tokens ${cdTok}` : "",
       "单次测活成功即恢复正常",
     ].filter(Boolean).join(" · ");
-    poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">冷却中</span>`;
+    poolLabel = `<span class="g2a-tag warn g2a-status-pill" title="${esc(tip)}">冷却中</span>`;
   } else if (modelBlocked) {
     const tip = [
       "模型封禁（账号仍可轮询其他模型）",
@@ -3964,11 +4180,11 @@ function poolStatusLabel(a, p) {
     const short = blockedIds.length <= 2
       ? blockedIds.join(",")
       : `${blockedIds.slice(0, 2).join(",")}…+${blockedIds.length - 2}`;
-    poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">模型封禁${short ? " · " + esc(short) : ""}</span>`;
+    poolLabel = `<span class="g2a-tag warn g2a-status-pill" title="${esc(tip)}">模型封禁${short ? " · " + esc(short) : ""}</span>`;
   } else if (streak >= 2) {
-    poolLabel = `<span class="g2a-tag warn">轮询中 · 连败${streak}</span>`;
+    poolLabel = `<span class="g2a-tag warn g2a-status-pill">轮询中 · 连败${streak}</span>`;
   } else {
-    poolLabel = '<span class="g2a-tag ok">轮询中</span>';
+    poolLabel = '<span class="g2a-tag ok g2a-status-pill">轮询中</span>';
   }
   return poolLabel;
 }
@@ -4734,16 +4950,16 @@ function renderModelHealthInfo() {
   if (pill) {
     if (!enabled) {
       pill.className = "g2a-tag warn";
-      pill.textContent = "● 已关闭";
+      pill.textContent = "已关闭";
     } else if (mh.running || mh.cluster_running || mh.leader_running) {
       pill.className = "g2a-tag ok";
-      pill.textContent = "● 探测运行中";
+      pill.textContent = "探测运行中";
     } else if (mh.enabled) {
       pill.className = "g2a-tag ok";
-      pill.textContent = "● 已启用（后台）";
+      pill.textContent = "已启用（后台）";
     } else {
       pill.className = "g2a-tag bad";
-      pill.textContent = "● 未运行";
+      pill.textContent = "未运行";
     }
   }
   if (!el) return;
@@ -4939,7 +5155,7 @@ async function refreshUpstreamStatus({ force = false, toast: doToast = false } =
     const pill = $("upstream-status-pill");
     if (pill && force) {
       pill.className = "g2a-tag warn";
-      pill.textContent = "● 探测中";
+      pill.textContent = "探测中";
     }
   } catch (_) {}
   try {
@@ -4988,16 +5204,16 @@ function renderUpstreamMonitor(st) {
   const reachable = st.reachable !== false && (ok || st.status_code || st.dial_ms != null);
   const probing = !!st.probing;
   let tone = "bad";
-  let label = "● 不可达";
+  let label = "不可达";
   if (probing && !st.latency_ms) {
     tone = "warn";
-    label = "● 探测中";
+    label = "探测中";
   } else if (ok) {
     tone = "ok";
-    label = "● 正常";
+    label = "正常";
   } else if (reachable || (st.status_code && st.status_code < 500)) {
     tone = "warn";
-    label = "● 降级";
+    label = "降级";
   }
   if (pill) {
     pill.className = "g2a-tag " + tone;
@@ -5149,7 +5365,7 @@ async function probeAccounts(ids, { confirmMany = true } = {}) {
     return;
   }
   if (confirmMany && list.length > 1) {
-    if (!confirm(`确认对选中的 ${list.length} 个账号执行模型测试？状态会实时更新。`)) return;
+    if (!(await g2aConfirm(`确认对选中的 ${list.length} 个账号执行模型测试？状态会实时更新。`, { title: "请确认" }))) return;
   }
   if (list.length === 1) {
     await runAccountProbe(list[0]);
@@ -5598,6 +5814,48 @@ pip install -r requirements.txt
 /* ── Email registration ─────────────────────────────── */
 const REG_CONFIG_KEY = "g2a_registration_config_v1";
 
+
+function openRegSettingsDialog() {
+  const dialog = $("reg-settings-dialog");
+  if (!dialog) return;
+  try { syncRegCaptchaProviderUI(); } catch (_) {}
+  try { syncRegMailProviderUI(); } catch (_) {}
+  document.body.classList.add("g2a-dialog-open");
+  if (typeof dialog.showModal === "function") dialog.showModal();
+  else dialog.setAttribute("open", "");
+  setTimeout(() => {
+    const first = dialog.querySelector("select, input, textarea, button");
+    try { if (first) first.focus(); } catch (_) {}
+  }, 0);
+}
+
+function closeRegSettingsDialog() {
+  const dialog = $("reg-settings-dialog");
+  if (!dialog) return;
+  document.body.classList.remove("g2a-dialog-open");
+  try {
+    if (typeof dialog.close === "function" && dialog.open) dialog.close();
+    else dialog.removeAttribute("open");
+  } catch (_) {
+    dialog.removeAttribute("open");
+  }
+}
+
+function bindRegSettingsDialog() {
+  on("btn-open-reg-settings", "onclick", () => openRegSettingsDialog());
+  on("btn-close-reg-settings", "onclick", () => closeRegSettingsDialog());
+  on("btn-cancel-reg-settings", "onclick", () => closeRegSettingsDialog());
+  on("reg-settings-dialog", "oncancel", () => {
+    document.body.classList.remove("g2a-dialog-open");
+  });
+  on("reg-settings-dialog", "onclose", () => {
+    document.body.classList.remove("g2a-dialog-open");
+  });
+  on("reg-settings-dialog", "onclick", (event) => {
+    if (event && event.target === $("reg-settings-dialog")) closeRegSettingsDialog();
+  });
+}
+
 function clearRegTrack() {
   try { sessionStorage.removeItem(REG_TRACK_KEY); } catch (_) {}
 }
@@ -5698,7 +5956,7 @@ function dismissRegProgressCard() {
   regProbedIds = new Set();
   regProbeRunning = false;
   clearRegTrack();
-  hidePanel("reg-session-box");
+  showPanel("reg-session-box");
   setLogPanel("reg-log", "", { forceShow: false });
   setRegStatusText("idle");
   setRegEmailText("—");
@@ -5802,8 +6060,8 @@ async function stopRegistration() {
   const hasTrack = !!(regBatchId || regSessionId || (regSessionIds && regSessionIds.length));
   if (!hasTrack) {
     // Still allow stop-all for leftover server sessions.
-    if (!confirm("停止全部进行中的注册会话？")) return;
-  } else if (!confirm(regBatchId ? `停止批次 ${regBatchId} 的全部注册？` : "停止当前注册会话？")) {
+    if (!(await g2aConfirm("停止全部进行中的注册会话？", { warn: true, title: "请确认" }))) return;
+  } else if (!(await g2aConfirm(regBatchId ? `停止批次 ${regBatchId} 的全部注册？` : "停止当前注册会话？", { warn: true, title: "停止注册" }))) {
     return;
   }
   try {
@@ -6818,7 +7076,7 @@ function updateRegProxyHint(cfg) {
     el.textContent = `代理池 ${n} 个 · 策略：${stratLabel}。批量注册时每个任务取一个代理。`;
   }
 }
-const REG_TERMINAL_OK = new Set(["success", "completed", "imported"]);
+const REG_TERMINAL_OK = new Set(["success", "completed", "imported", "done"]);
 const REG_TERMINAL_BAD = new Set([
   "error",
   "failed",
@@ -6872,9 +7130,14 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
   const batchStatus = String(
     (batchObj && (batchObj.batch_status || batchObj.status)) || ""
   ).toLowerCase();
+  const batchTerminal = ["done", "partial", "error", "cancelled", "stopped", "failed", "completed"].includes(batchStatus);
   const batchRunning = Number((batchObj && batchObj.running) || 0) > 0;
+  const batchProgress = normalizeRegProgress(batchObj || {});
+  const batchProbeRunning = batchProgress.probing > 0;
+  const batchResolved = batchProgress.success + batchProgress.fail + batchProgress.cancelled + (batchTerminal ? batchProgress.unattempted : 0);
   const batchDone =
     !!batchObj &&
+    !batchProbeRunning &&
     (batchStatus === "done" ||
       batchStatus === "partial" ||
       batchStatus === "error" ||
@@ -6884,14 +7147,13 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
       (Number(batchObj.done || 0) > 0 &&
         Number(batchObj.done || 0) >= Number(batchObj.total || batchObj.count || 0) &&
         !batchRunning) ||
-      (Number((batchObj.imported || 0) + (batchObj.error || 0) + (batchObj.cancelled || 0)) > 0 &&
-        Number((batchObj.imported || 0) + (batchObj.error || 0) + (batchObj.cancelled || 0)) >=
-          Number(batchObj.total || batchObj.count || 0) &&
+      (batchResolved > 0 &&
+        batchResolved >= batchProgress.total &&
         !batchRunning));
   const allTerminal =
     list.length > 0 &&
     list.every((s) => isRegTerminalStatus(regStatusOf(s)));
-  const finished = !!wasFinished || !!batchDone || (allTerminal && !batchRunning);
+  const finished = !!wasFinished || !!batchDone || (allTerminal && !batchRunning && !batchProbeRunning);
 
   // Placeholder sessions for UI only when real session objects are missing.
   // Never fake "running" for an already-finished batch — that freezes the card.
@@ -6916,7 +7178,9 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
       { batch: batchObj }
     );
   } else {
-    showRegSessionGroup(list.length ? list : placeholderSessions, { batch: batchObj });
+    showRegSessionGroup(list.length ? list : (finished ? [] : placeholderSessions), {
+      batch: batchObj,
+    });
   }
 
   if (finished) {
@@ -6925,13 +7189,18 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
     stopRegPolling();
     // Ensure status text is not left as "restoring…"
     try {
-      const total = Number((batchObj && (batchObj.total || batchObj.count)) || regSessionIds.length || 0);
-      const done = Number((batchObj && batchObj.done) || total || 0);
-      const ok = Number((batchObj && (batchObj.imported || batchObj.success)) || 0);
-      const fail = Number((batchObj && (batchObj.error || batchObj.failed)) || 0);
+      const total = Math.max(batchProgress.total, regSessionIds.length || 0);
+      const done = Number((batchObj && batchObj.done) || batchResolved || total || 0);
+      const ok = batchProgress.success;
+      const fail = batchProgress.fail;
+      const cancelled = batchProgress.cancelled;
+      const unattempted = batchProgress.unattempted;
       setRegStatusText(
         total > 0
-          ? `已结束 · ${done}/${total}` + (ok || fail ? ` · 成功 ${ok} / 失败 ${fail}` : "")
+          ? `已结束 · ${done}/${total}` +
+            (ok || fail ? ` · 成功 ${ok} / 失败 ${fail}` : "") +
+            (cancelled ? ` · 已取消 ${cancelled}` : "") +
+            (unattempted ? ` · 未尝试 ${unattempted}` : "")
           : "已结束"
       );
       setRegEmailText(regBatchId ? `batch ${regBatchId}` : (regSessionId || "—"));
@@ -7194,22 +7463,30 @@ function summarizeRegSessions(sessions) {
   const list = Array.isArray(sessions) ? sessions : [];
   let success = 0;
   let fail = 0;
+  let cancelled = 0;
   let probing = 0;
   let running = 0;
   for (const s of list) {
     const st = regStatusOf(s);
+    const probePending = !!(s && s.probe && s.probe.pending);
+    if (probePending) {
+      const importedIds = Array.isArray(s.imported_account_ids) ? s.imported_account_ids : [];
+      probing += Math.max(1, importedIds.length);
+    }
     if (REG_TERMINAL_OK.has(st)) success += 1;
+    else if (st === "cancelled" || st === "stopped") cancelled += 1;
     else if (REG_TERMINAL_BAD.has(st)) fail += 1;
-    else if (st === "probing") probing += 1;
+    else if (st === "probing" && !probePending) probing += 1;
     else running += 1;
   }
   return {
     total: list.length,
     success,
     fail,
+    cancelled,
     probing,
     running,
-    done: success + fail,
+    done: success + fail + cancelled,
   };
 }
 
@@ -7256,24 +7533,19 @@ function formatRegSessionLine(s, idx) {
 
 function buildRegLogText(sessions, { batch = null, extraLines = [] } = {}) {
   const stats = summarizeRegSessions(sessions);
-  const success = Math.max(stats.success, Number((batch && batch.imported) || 0) || 0);
-  const fail = Math.max(stats.fail, Number((batch && batch.error) || 0) || 0);
-  const cancelled = Math.max(
-    (sessions || []).filter((s) => {
-      const st = regStatusOf(s);
-      return st === "cancelled" || st === "stopped";
-    }).length,
-    Number((batch && batch.cancelled) || 0) || 0
-  );
-  const running = Math.max(
-    stats.running + stats.probing,
-    Number((batch && batch.running) || 0) || 0
-  );
-  const total = Math.max(
-    stats.total,
-    Number((batch && (batch.total || batch.count || batch.spawned)) || 0) || 0,
-    Array.isArray(batch && batch.session_ids) ? batch.session_ids.length : 0
-  );
+  const progress = normalizeRegProgress(Object.assign({}, batch || {}, {
+    total: Math.max(
+      stats.total,
+      Number((batch && (batch.total || batch.count || batch.spawned)) || 0) || 0,
+      Array.isArray(batch && batch.session_ids) ? batch.session_ids.length : 0
+    ),
+    success: Math.max(stats.success, Number((batch && (batch.imported ?? batch.success)) || 0) || 0),
+    fail: Math.max(stats.fail, Number((batch && (batch.error ?? batch.failed)) || 0) || 0),
+    running: Math.max(stats.running, Number((batch && batch.running) || 0) || 0),
+    probing: Math.max(stats.probing, Number((batch && (batch.probing ?? batch.probe_pending_count)) || 0) || 0),
+    cancelled: Math.max(stats.cancelled, Number((batch && (batch.cancelled ?? batch.cancelled_count)) || 0) || 0),
+  }));
+  const { total, success, fail, running, probing, cancelled, unattempted } = progress;
   const lines = [];
   lines.push("======== 协议注册进度 ========");
   if (batch && (batch.batch_id || batch.id)) {
@@ -7284,9 +7556,18 @@ function buildRegLogText(sessions, { batch = null, extraLines = [] } = {}) {
   lines.push(
     `统计: 总数 ${total || stats.total} · 成功 ${success} · 失败 ${fail}` +
       (cancelled ? ` · 已停止 ${cancelled}` : "") +
-      (stats.probing ? ` · 测活中 ${stats.probing}` : "") +
+      (unattempted ? ` · 未尝试 ${unattempted}` : "") +
+      (probing ? ` · 测活中 ${probing}` : "") +
       (running ? ` · 进行中 ${running}` : "")
   );
+  if (batch && batch.stop_reason) {
+    lines.push(`自动停止: ${String(batch.stop_reason)}`);
+  }
+  if (batch && batch.rate_limit_reset_at) {
+    const resetMs = Number(batch.rate_limit_reset_at) * 1000;
+    const resetText = Number.isFinite(resetMs) ? new Date(resetMs).toLocaleString() : String(batch.rate_limit_reset_at);
+    lines.push(`限流恢复时间: ${resetText}`);
+  }
   if (batch && batch.message) lines.push(`batch: ${batch.message}`);
   lines.push("-------- 会话明细 --------");
   (sessions || []).forEach((s, i) => lines.push(formatRegSessionLine(s, i)));
@@ -7360,11 +7641,14 @@ function showRegSession(s, opts = {}) {
     total: Math.max(stats.total, 1),
     success: stats.success,
     fail: stats.fail,
-    running: stats.running + stats.probing,
-    cancelled: cancelledN,
+    running: stats.running,
+    probing: stats.probing,
+    cancelled: Math.max(stats.cancelled, cancelledN),
+    unattempted: 0,
   });
   const head = `成功 ${stats.success} · 失败 ${stats.fail}` +
-    (stats.probing || stats.running ? ` · 进行中 ${stats.probing + stats.running}` : "");
+    (stats.probing ? ` · 测活中 ${stats.probing}` : "") +
+    (stats.running ? ` · 进行中 ${stats.running}` : "");
   const liveLog = Array.isArray(s && s.log_lines) && s.log_lines.length
     ? s.log_lines.slice(-30).join("\n")
     : (s && (s.output_tail || s.log) ? String(s.output_tail || s.log).slice(0, 2000) : "");
@@ -7384,25 +7668,20 @@ function showRegSessionGroup(sessions, opts = {}) {
   const stats = summarizeRegSessions(sessions);
   const batch = opts.batch || null;
   // Prefer batch-level counters for large jobs (UI may only hold a compact session window).
-  const success = Math.max(stats.success, Number((batch && batch.imported) || 0) || 0);
-  const fail = Math.max(stats.fail, Number((batch && batch.error) || 0) || 0);
-  const cancelled = Math.max(
-    sessions.filter((s) => {
-      const st = regStatusOf(s);
-      return st === "cancelled" || st === "stopped";
-    }).length,
-    Number((batch && batch.cancelled) || 0) || 0
-  );
-  const running = Math.max(
-    stats.running + stats.probing,
-    Number((batch && batch.running) || 0) || 0
-  );
-  const total = Math.max(
-    stats.total,
-    Number((batch && (batch.total || batch.count || batch.spawned)) || 0) || 0,
-    Array.isArray(batch && batch.session_ids) ? batch.session_ids.length : 0,
-    regSessionIds.length || 0
-  );
+  const progress = normalizeRegProgress(Object.assign({}, batch || {}, {
+    total: Math.max(
+      stats.total,
+      Number((batch && (batch.total || batch.count || batch.spawned)) || 0) || 0,
+      Array.isArray(batch && batch.session_ids) ? batch.session_ids.length : 0,
+      regSessionIds.length || 0
+    ),
+    success: Math.max(stats.success, Number((batch && (batch.imported ?? batch.success)) || 0) || 0),
+    fail: Math.max(stats.fail, Number((batch && (batch.error ?? batch.failed)) || 0) || 0),
+    running: Math.max(stats.running, Number((batch && batch.running) || 0) || 0),
+    probing: Math.max(stats.probing, Number((batch && (batch.probing ?? batch.probe_pending_count)) || 0) || 0),
+    cancelled: Math.max(stats.cancelled, Number((batch && (batch.cancelled ?? batch.cancelled_count)) || 0) || 0),
+  }));
+  const { total, success, fail, running, probing, cancelled, unattempted } = progress;
   setRegEmailText(
     `${total || stats.total} 个注册会话` + (regBatchId ? ` · ${regBatchId}` : "")
   );
@@ -7411,19 +7690,26 @@ function showRegSessionGroup(sessions, opts = {}) {
     success,
     fail,
     running,
+    probing,
     cancelled,
+    unattempted,
+    status: (batch && (batch.batch_status || batch.status)) || "",
   });
   // Prefer stable stop status while stop is in flight and work remains.
   if (regStopping && running > 0) {
     setRegStatusText(
       `停止中 · 成功 ${success} · 失败 ${fail}` +
         (cancelled ? ` · 已停 ${cancelled}` : "") +
+        (unattempted ? ` · 未尝试 ${unattempted}` : "") +
+        (probing ? ` · 测活中 ${probing}` : "") +
         (total ? ` / ${total}` : "")
     );
   } else {
     setRegStatusText(
       `成功 ${success} · 失败 ${fail}` +
         (cancelled ? ` · 停止 ${cancelled}` : "") +
+        (unattempted ? ` · 未尝试 ${unattempted}` : "") +
+        (probing ? ` · 测活中 ${probing}` : "") +
         (running ? ` · 运行 ${running}` : "") +
         (total ? ` / ${total}` : "")
     );
@@ -7718,9 +8004,14 @@ async function pollRegSession() {
     const batchStatus = String(
       (batch && (batch.batch_status || batch.status)) || ""
     ).toLowerCase();
+    const batchTerminal = ["done", "partial", "error", "cancelled", "stopped", "failed", "completed"].includes(batchStatus);
     const batchRunningNow = Number((batch && batch.running) || 0) > 0;
+    const batchProgress = normalizeRegProgress(batch || {});
+    const batchProbeRunning = batchProgress.probing > 0;
+    const batchResolved = batchProgress.success + batchProgress.fail + batchProgress.cancelled + (batchTerminal ? batchProgress.unattempted : 0);
     const batchDone =
       batch &&
+      !batchProbeRunning &&
       (batchStatus === "done" ||
         batchStatus === "partial" ||
         batchStatus === "error" ||
@@ -7732,9 +8023,8 @@ async function pollRegSession() {
           Number(batch.done || 0) >= Number(batch.total || batch.count || 0) &&
           !batchRunningNow) ||
         // Spawner counters already match target with no live workers (status lag).
-        (Number((batch.imported || 0) + (batch.error || 0) + (batch.cancelled || 0)) > 0 &&
-          Number((batch.imported || 0) + (batch.error || 0) + (batch.cancelled || 0)) >=
-            Number(batch.total || batch.count || 0) &&
+        (batchResolved > 0 &&
+          batchResolved >= batchProgress.total &&
           !batchRunningNow));
     const batchStopping =
       !!regStopping ||
@@ -7751,6 +8041,7 @@ async function pollRegSession() {
       !!batchDone ||
       (allTerminal &&
         !batchRunningNow &&
+        !batchProbeRunning &&
         (targetTotal <= 0 ||
           sessions.length >= targetTotal ||
           !regBatchId ||
@@ -7798,27 +8089,22 @@ async function pollRegSession() {
     regStopping = false;
     // Keep track after finish so refresh can still reopen the final card.
     saveRegTrack();
-    const success = Math.max(
-      stats.success,
-      Number((batch && batch.imported) || 0) || 0
-    );
-    const fail = Math.max(
-      stats.fail,
-      Number((batch && batch.error) || 0) || 0
-    );
-    const cancelled = Math.max(
-      sessions.filter((s) => {
-        const st = regStatusOf(s);
-        return st === "cancelled" || st === "stopped";
-      }).length,
-      Number((batch && batch.cancelled) || 0) || 0
-    );
+    const finalProgress = normalizeRegProgress(Object.assign({}, batch || {}, {
+      total: targetTotal,
+      success: Math.max(stats.success, batchProgress.success),
+      fail: Math.max(stats.fail, batchProgress.fail),
+      running: 0,
+      probing: 0,
+      cancelled: Math.max(stats.cancelled, batchProgress.cancelled),
+    }));
+    const { success, fail, cancelled, unattempted } = finalProgress;
     const summary =
       (cancelled > 0 && success === 0 && fail === 0
         ? `注册已停止`
         : `注册完成：成功 ${success} · 失败 ${fail}`) +
       (cancelled ? ` · 已停止 ${cancelled}` : "") +
-      (targetTotal ? ` / 共 ${Math.max(targetTotal, success + fail + cancelled)}` : "");
+      (unattempted ? ` · 未尝试 ${unattempted}` : "") +
+      (targetTotal ? ` / 共 ${Math.max(targetTotal, success + fail + cancelled + unattempted)}` : "");
 
     // Ensure final log includes summary line.
     setLogPanel(
@@ -7840,7 +8126,8 @@ async function pollRegSession() {
         ? "stopped"
         : `成功 ${success} · 失败 ${fail}` +
             (cancelled ? ` · 停止 ${cancelled}` : "") +
-            (targetTotal ? ` / ${Math.max(targetTotal, success + fail + cancelled)}` : "")
+            (unattempted ? ` · 未尝试 ${unattempted}` : "") +
+            (targetTotal ? ` / ${Math.max(targetTotal, success + fail + cancelled + unattempted)}` : "")
     );
 
     if (success > 0 && fail === 0 && cancelled === 0) toast(summary);
@@ -7953,6 +8240,7 @@ document.querySelectorAll("[data-jump]").forEach(btn => {
   btn.onclick = () => switchTab(btn.dataset.jump);
 });
 buildMobileNav();
+try { bindNavDrawer(); } catch (_) {}
 
 on("auth-submit", "onclick", async () => {  const password = $("password").value;
   if (!password) return toast("请输入密码", false);
@@ -8100,7 +8388,7 @@ on("accounts-tbody", "onclick", async (e) => {  // checkbox selection
           return;
         }
     if (btn.dataset.act === "rm-acc") {
-      if (!confirm("确定移除此账号？将从数据库与本地镜像同步删除。")) return;
+      if (!(await g2aConfirm("确定移除此账号？将从数据库与本地镜像同步删除。", { danger: true, title: "危险操作", okText: "确认删除" }))) return;
       setRowBusy(id, true, "移除中");
       try {
         await api("/accounts/" + encodeURIComponent(id), { method: "DELETE" });
@@ -9238,9 +9526,9 @@ on("import-file", "onchange", () => {
     label.textContent = `已选择 ${files.length} 个文件（共 ${totalKb.toFixed(1)} KB）`;
   }
 });
-on("btn-import", "onclick", () => importJsonFiles());
-on("btn-import-sso", "onclick", () => importSsoCookies());
-on("btn-export-sso", "onclick", () => exportRegistrationSso());
+on("btn-import", "onclick", async () => importJsonFiles());
+on("btn-import-sso", "onclick", async () => importSsoCookies());
+on("btn-export-sso", "onclick", async () => exportRegistrationSso());
 on("sso-file", "onchange", () => {
   const f = $("sso-file") && $("sso-file").files && $("sso-file").files[0];
   const label = $("sso-file-name");
@@ -9248,7 +9536,7 @@ on("sso-file", "onchange", () => {
   label.textContent = f ? `已选择：${f.name}（${(f.size / 1024).toFixed(1)} KB）` : "未选择文件";
 });
 if ($("btn-export")) {
-  on("btn-export", "onclick", () => exportAllAccounts());
+  on("btn-export", "onclick", async () => exportAllAccounts());
 }
 
 // Module-level fallback; soft-nav rebind overwrites via rebindPageControls → refreshAccountsListUI.
@@ -9263,7 +9551,7 @@ on("btn-refresh-acc", "onclick", async () => {
     if (loginSessionId) await pollDeviceSession();
   } catch (e) { toast(e.message, false); }
 });
-on("btn-logout-cli", "onclick", async () => {  if (!confirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）")) return;
+on("btn-logout-cli", "onclick", async () => {  if (!(await g2aConfirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）", { danger: true, title: "危险操作", okText: "确认删除" }))) return;
   try {
     const r = await api("/accounts/logout", { method: "POST" });
     toast(r.message || "完成", !!r.ok);
@@ -9446,7 +9734,7 @@ async function testCliproxyapiConnection() {
 async function pushAccountsToCliproxyapi({ all = false } = {}) {
   let body;
   if (all) {
-    if (!confirm("确认将【全部账号】同步导入到 CLIProxyAPI？")) return;
+    if (!(await g2aConfirm("确认将【全部账号】同步导入到 CLIProxyAPI？", { title: "请确认" }))) return;
     body = { all: true };
   } else {
     const ids = Array.from(selectedAccountIds || []);
@@ -9454,7 +9742,7 @@ async function pushAccountsToCliproxyapi({ all = false } = {}) {
       toast("请先勾选要导入的账号", false);
       return;
     }
-    if (!confirm(`确认将选中的 ${ids.length} 个账号同步导入到 CLIProxyAPI？`)) return;
+    if (!(await g2aConfirm(`确认将选中的 ${ids.length} 个账号同步导入到 CLIProxyAPI？`, { title: "请确认" }))) return;
     body = { account_ids: ids };
   }
   toast(all ? "正在同步全部账号到 CLIProxyAPI…" : "正在同步选中账号到 CLIProxyAPI…");
@@ -9617,7 +9905,7 @@ async function createSub2apiGroup() {
 async function pushAccountsToSub2api({ all = false } = {}) {
   let body;
   if (all) {
-    if (!confirm("确认将【全部账号】导入到 sub2api？")) return;
+    if (!(await g2aConfirm("确认将【全部账号】导入到 sub2api？", { title: "请确认" }))) return;
     body = { all: true };
   } else {
     const ids = Array.from(selectedAccountIds || []);
@@ -9625,7 +9913,7 @@ async function pushAccountsToSub2api({ all = false } = {}) {
       toast("请先勾选要导入的账号", false);
       return;
     }
-    if (!confirm(`确认将选中的 ${ids.length} 个账号导入到 sub2api？`)) return;
+    if (!(await g2aConfirm(`确认将选中的 ${ids.length} 个账号导入到 sub2api？`, { title: "请确认" }))) return;
     body = { account_ids: ids };
   }
   // optional override from settings form if present
@@ -9655,7 +9943,7 @@ async function pushAccountsToSub2api({ all = false } = {}) {
 async function exportSub2apiFormat() {
   const ids = Array.from(selectedAccountIds || []);
   const body = ids.length ? { account_ids: ids } : { all: true };
-  if (!ids.length && !confirm("未选择账号，将导出全部账号为 sub2api 数据备份 JSON（type=sub2api-data）。继续？")) return;
+  if (!ids.length && !(await g2aConfirm("未选择账号，将导出全部账号为 sub2api 数据备份 JSON（type=sub2api-data）。继续？", { title: "导出确认" }))) return;
   try {
     const r = await api("/accounts/export-sub2api-format", {
       method: "POST",
@@ -9711,9 +9999,10 @@ async function exportCliproxyapiFormat() {
   const body = ids.length ? { account_ids: ids } : { all: true };
   if (
     !ids.length &&
-    !confirm(
-      "未选择账号，将导出全部账号为 CLIProxyAPI auth 包（type=cliproxyapi-auth-bundle）。继续？"
-    )
+    !(await g2aConfirm(
+      "未选择账号，将导出全部账号为 CLIProxyAPI auth 包（type=cliproxyapi-auth-bundle）。继续？",
+      { title: "导出确认" }
+    ))
   ) {
     return;
   }
@@ -10346,7 +10635,7 @@ function applySettingsGroupDefaults(group) {
 
 async function resetSettingsCard(group, btnId, label) {
   const name = label || group;
-  if (!confirm(`将「${name}」恢复为系统默认值并保存？\n仅影响本卡片，其它设置不变。`)) {
+  if (!(await g2aConfirm(`将「${name}」恢复为系统默认值并保存？\n仅影响本卡片，其它设置不变。`, { warn: true, title: "请确认" }))) {
     return;
   }
   applySettingsGroupDefaults(group);
@@ -10602,7 +10891,12 @@ if ($("btn-test-reg-proxy") && !$("btn-test-reg-proxy").onclick) {
   });
 }
 if ($("btn-save-reg") && !$("btn-save-reg").onclick) {
-  on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
+  on("btn-save-reg", "onclick", async () => {
+    try {
+      await saveRegConfig();
+      closeRegSettingsDialog();
+    } catch (_) {}
+  });
 }
 if ($("btn-refresh-reg") && !$("btn-refresh-reg").onclick) {
   on("btn-refresh-reg", "onclick", () => {
@@ -10639,6 +10933,7 @@ try { bindRegMailFormControls(); } catch (_) {
     try { syncRegMailProviderUI(); } catch (_) {}
   }
 }
+try { bindRegSettingsDialog(); } catch (_) {}
 if ($("reg-proxy")) {
   on("reg-proxy", "oninput", () => { try { updateRegProxyHint(); } catch (_) {} });
 }
@@ -10658,7 +10953,7 @@ try { updateRegProxyHint(); } catch (_) {}
   [["btn-probe-all","btn-probe-all-2"],["btn-refresh-quota","btn-refresh-quota-2"]].forEach(([main,alt]) => {
     if (!$(main) && $(alt)) { try { $(alt).id = main; } catch(_){ } }
   });
-  
+
 /* ── Usage / token stats ───────────────────────────── */
 let usageDays = 7;
 let usageLoading = false;
@@ -11153,13 +11448,14 @@ let logsLastDetailText = "";
 
 function taskStatusTag(status, ok) {
   const st = String(status || "").toLowerCase();
+  // Status pill uses CSS ::before dot for every tone (aligned gutter, no char icons).
   if (st === "error" || st === "failed" || ok === false) {
-    return '<span class="g2a-tag bad">失败</span>';
+    return '<span class="g2a-tag bad g2a-result-tag">失败</span>';
   }
-  if (st === "partial") return '<span class="g2a-tag warn">部分</span>';
-  if (st === "cancelled" || st === "stopped") return '<span class="g2a-tag">取消</span>';
-  if (st === "running" || st === "queued") return '<span class="g2a-tag">进行中</span>';
-  return '<span class="g2a-tag ok">成功</span>';
+  if (st === "partial") return '<span class="g2a-tag warn g2a-result-tag">部分</span>';
+  if (st === "cancelled" || st === "stopped") return '<span class="g2a-tag g2a-result-tag">取消</span>';
+  if (st === "running" || st === "queued") return '<span class="g2a-tag blue g2a-result-tag">进行中</span>';
+  return '<span class="g2a-tag ok g2a-result-tag">成功</span>';
 }
 
 function taskProgressText(it) {
@@ -11413,9 +11709,9 @@ function paintLogsTable(items, { soft = false } = {}) {
     return `<tr data-log-id="${esc(rowId)}" style="cursor:pointer${cells.selected ? ";outline:1px solid var(--g2a-primary, #4f8cff)" : ""}">
       <td class="g2a-muted" title="${esc(cells.title)}">${esc(cells.when)}</td>
       <td class="mono">${esc(cells.kind)}</td>
-      <td class="mono g2a-muted">${esc(cells.st)}</td>
+      <td class="mono g2a-muted g2a-logs-status">${esc(cells.st)}</td>
       <td>${esc(cells.summary)}</td>
-      <td class="mono g2a-muted">${esc(cells.progress)}</td>
+      <td class="mono g2a-muted g2a-logs-progress">${esc(cells.progress)}</td>
       <td>${cells.statusHtml}</td>
     </tr>`;
   }).join("");
@@ -11692,7 +11988,7 @@ async function requestVersionUpdate({ tag, restartOnly = false } = {}) {
   const tip = restartOnly
     ? "确认在容器内重启服务？（force-recreate，不强制换版本）服务会短暂中断。"
     : "确认在容器内热更新并自动重启？\n\n容器将：docker pull 镜像 + compose force-recreate\n无需宿主机 watcher。";
-  if (!confirm(tip)) return;
+  if (!(await g2aConfirm(tip, { title: "请确认" }))) return;
   try {
     const body = {};
     if (tag) body.tag = String(tag).replace(/^v/, "");

@@ -27,10 +27,13 @@ import threading
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
 from typing import Optional
 
 _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
+
+from xconsole_client.secure_files import secure_write_text
 
 # Load local .env if present (optional dependency).
 try:
@@ -97,7 +100,9 @@ def _save_account_bundle(result: dict, output_dir: Path) -> Path:
     safe = "".join(ch if ch.isalnum() or ch in "._-@" else "_" for ch in email) or "unknown"
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     path = output_dir / f"account_{safe}_{ts}.json"
-    path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    secure_write_text(
+        path, json.dumps(result, ensure_ascii=False, indent=2), secure_parent=True
+    )
     return path
 
 

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from grok2api.config import AUTH_FILE, STORE_BACKEND
+from grok2api.secure_files import secure_write_text
 
 _thread_lock = threading.RLock()
 
@@ -271,26 +272,8 @@ def _write_auth_file(data: dict[str, Any], path: Path) -> None:
 
     Not used as a runtime mirror when PostgreSQL is enabled.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     payload = _dump_json(data if isinstance(data, dict) else {})
-    tmp.write_text(payload, encoding="utf-8")
-    last_err: Exception | None = None
-    for _ in range(8):
-        try:
-            os.replace(str(tmp), str(path))
-            last_err = None
-            break
-        except OSError as e:
-            last_err = e
-            time.sleep(0.03)
-    if last_err is not None:
-        try:
-            tmp.unlink(missing_ok=True)  # type: ignore[call-arg]
-        except TypeError:
-            if tmp.exists():
-                tmp.unlink()
-        raise last_err
+    secure_write_text(path, payload)
     _set_cache(path, data if isinstance(data, dict) else {}, _path_mtime_ns(path))
 
 

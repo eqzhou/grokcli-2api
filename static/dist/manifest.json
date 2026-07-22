@@ -1,8 +1,8 @@
 {
-  "utils.js": "/static/dist/utils.ac10ff3b58.js",
+  "utils.js": "/static/dist/utils.e0a95cf6ed.js",
   "api.js": "/static/dist/api.1bf56e45fe.js",
   "state.js": "/static/dist/state.da9974e23b.js",
   "auth.js": "/static/dist/auth.4eb51a7835.js",
-  "core.js": "/static/dist/core.0631f67707.js",
-  "admin-antd.css": "/static/dist/admin-antd.6e5bba711f.css"
+  "core.js": "/static/dist/core.38bf64722f.js",
+  "admin-antd.css": "/static/dist/admin-antd.679920262e.css"
 }

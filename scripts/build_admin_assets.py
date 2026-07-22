@@ -25,17 +25,17 @@ ASSETS = {
 
 def main() -> None:
     manifest: dict[str, str] = {}
+    prepared_assets: list[tuple[str, Path, bytes]] = []
     for name, src in ASSETS.items():
         data = src.read_bytes()
         h = hashlib.sha1(data).hexdigest()[:10]
         out = DIST / (
             f"{name[:-3]}.{h}.js" if name.endswith(".js") else f"{name[:-4]}.{h}.css"
         )
-        out.write_bytes(data)
+        prepared_assets.append((name, out, data))
         manifest[name] = f"/static/dist/{out.name}"
-        print("built", name, "->", manifest[name])
-    (DIST / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
+    prepared_html: list[tuple[Path, str]] = []
     for path in sorted(ADMIN.glob("*.html")):
         html = path.read_text()
         html = re.sub(
@@ -62,7 +62,46 @@ def main() -> None:
                 f'src="{hashed}"',
                 html,
             )
-        path.write_text(html)
+        prepared_html.append((path, html))
+
+    # Stage every output first. Old manifest assets remain available until all
+    # replacements succeed, so an interrupted build cannot create 404s.
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for _name, out, data in prepared_assets:
+            temp = out.with_name(f".{out.name}.tmp")
+            temp.write_bytes(data)
+            staged.append((temp, out))
+        manifest_path = DIST / "manifest.json"
+        manifest_temp = manifest_path.with_name(".manifest.json.tmp")
+        manifest_temp.write_text(json.dumps(manifest, indent=2) + "\n")
+        staged.append((manifest_temp, manifest_path))
+        for path, html in prepared_html:
+            temp = path.with_name(f".{path.name}.tmp")
+            temp.write_text(html)
+            staged.append((temp, path))
+
+        # Assets first, then references. Stale assets are removed only after
+        # the new manifest and HTML are committed.
+        asset_count = len(prepared_assets)
+        for temp, target in staged[:asset_count]:
+            temp.replace(target)
+        for temp, target in staged[asset_count + 1:]:
+            temp.replace(target)
+        staged[asset_count][0].replace(staged[asset_count][1])
+    finally:
+        for temp, _target in staged:
+            temp.unlink(missing_ok=True)
+
+    active = {out for _name, out, _data in prepared_assets}
+    for name, out, _data in prepared_assets:
+        stem = name.rsplit(".", 1)[0]
+        for stale in DIST.glob(f"{stem}.*{out.suffix}"):
+            if stale not in active:
+                stale.unlink()
+                print("removed", stale.name)
+        print("built", name, "->", manifest[name])
+    for path, _html in prepared_html:
         print("html", path.name)
     print("OK")
 

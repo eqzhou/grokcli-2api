@@ -72,7 +72,7 @@
         }
         document.documentElement.setAttribute("data-theme", t);
         document.documentElement.style.colorScheme = t;
-        document.documentElement.style.background = t === "light" ? "#f3f6fb" : "#07090f";
+        document.documentElement.style.background = t === "light" ? "#eef3f8" : "#070a10";
         var tok = localStorage.getItem("g2a_admin_token") || "";
         var ts = Number(localStorage.getItem("g2a_admin_token_ts") || 0) || 0;
         var grace = tok && ts && (Date.now() - ts) < 7 * 24 * 3600 * 1000;
@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.6e5bba711f.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.679920262e.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -137,7 +137,7 @@
         </div>
         <div class="g2a-header-actions">
           <span id="status-pill" class="g2a-tag">—</span>
-          <button type="button" class="g2a-theme-toggle" data-theme-toggle aria-label="切换主题"><span class="ico">☀️</span><span class="label">白天</span></button>
+          <button type="button" class="g2a-theme-toggle has-svg" data-theme-toggle aria-label="切换主题"><svg class="ico-svg is-active" data-theme-icon="sun" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="3.2" stroke="currentColor" stroke-width="1.6"/><path d="M10 2.8v1.6M10 15.6v1.6M2.8 10h1.6M15.6 10h1.6M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9l-1.1 1.1M6 14l-1.1 1.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><svg class="ico-svg" data-theme-icon="moon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M12.6 3.4A6.8 6.8 0 1 0 16.6 13a5.6 5.6 0 0 1-4-9.6Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg><span class="ico">☀️</span><span class="label">白天</span></button>
           <button type="button" class="g2a-btn g2a-btn-default" id="btn-refresh">刷新</button>
         </div>
       </header>
@@ -147,11 +147,12 @@
 <section class="g2a-card g2a-card-compact">
   <div class="g2a-card-head g2a-card-head-inline">
     <div>
+      <div class="g2a-section-kicker">POOL · STRATEGY</div>
       <h3>轮询策略</h3>
-      <p>所有账号对等，无主账号。支持 round_robin / least_used / random。</p>
+      <p>账号对等 · round_robin / least_used / random</p>
     </div>
-    <div class="g2a-actions g2a-card-actions">
-      <div class="g2a-field g2a-field-inline">
+    <div class="g2a-actions g2a-card-actions g2a-card-actions-inline">
+      <div class="g2a-field g2a-field-inline g2a-field-control">
         <label for="account-mode" class="g2a-sr-only">模式</label>
         <select id="account-mode" class="g2a-input g2a-input-inline" title="轮询模式">
           <option value="round_robin">round_robin（顺序轮流）</option>
@@ -164,24 +165,14 @@
   </div>
 </section>
 
-<section class="g2a-card">
-  <div class="g2a-card-head g2a-card-head-stack">
+<section class="g2a-card g2a-device-card">
+  <div class="g2a-card-head g2a-card-head-inline">
     <div>
-      <h3>Grok 账号</h3>
-      <p>设备码登录、额度、模型探测、批量运维。</p>
-    </div>
-    <div class="g2a-actions g2a-card-actions">
-      <button class="g2a-btn g2a-btn-default" id="btn-refresh-acc" type="button">刷新</button>
-      <button class="g2a-btn g2a-btn-default" id="btn-refresh-quota-2" type="button">查全部额度</button>
-      <button class="g2a-btn g2a-btn-default" id="btn-probe-all-2" type="button">全部模型探测</button>
-      <label class="g2a-check g2a-check-chip" title="本页缺失额度优先补齐；已有缓存的约 15 分钟才重查。每 3 分钟一轮、每批最多 2 个，避免上游连接过多。额度与类型已落库，刷新页面会先读库。">
-        <input type="checkbox" id="chk-quota-live" checked /> 额度自动刷新
-      </label>
-      <span class="g2a-reg-actions-sep" aria-hidden="true"></span>
-      <button class="g2a-btn g2a-btn-danger" id="btn-logout-cli" type="button">登出全部会话</button>
+      <div class="g2a-section-kicker">AUTH · DEVICE FLOW</div>
+      <h3>设备码登录</h3>
+      <p>生成设备码 → 浏览器验证 → 自动入库账号池。</p>
     </div>
   </div>
-
   <div class="g2a-subcard g2a-device-panel" id="device-session" data-device-idle="1">
     <div class="g2a-reg-progress-head g2a-device-head">
       <div class="g2a-reg-progress-title">
@@ -217,72 +208,107 @@
     </div>
     <div id="device-idle-hint" class="g2a-muted g2a-device-idle-hint">尚未开始。点击右上角「开始登录」获取设备码并在浏览器完成验证。</div>
   </div>
+</section>
+
+<section class="g2a-card g2a-acc-inventory">
+  <div class="g2a-card-head g2a-card-head-stack">
+    <div>
+      <div class="g2a-section-kicker">ACCOUNTS · INVENTORY</div>
+      <h3>账号池</h3>
+      <p>额度、模型探测、批量运维与导出同步。</p>
+    </div>
+    <div class="g2a-actions g2a-card-actions">
+      <button class="g2a-btn g2a-btn-default" id="btn-refresh-acc" type="button">刷新</button>
+      <button class="g2a-btn g2a-btn-default" id="btn-refresh-quota-2" type="button">查全部额度</button>
+      <button class="g2a-btn g2a-btn-default" id="btn-probe-all-2" type="button">全部探测</button>
+      <label class="g2a-check g2a-check-chip" title="本页缺失额度优先补齐；已有缓存约 15 分钟才重查。">
+        <input type="checkbox" id="chk-quota-live" checked /> 额度自动刷新
+      </label>
+      <span class="g2a-reg-actions-sep" aria-hidden="true"></span>
+      <button class="g2a-btn g2a-btn-danger" id="btn-logout-cli" type="button">登出全部</button>
+    </div>
+  </div>
 
   <div class="g2a-reg-section g2a-acc-section">
     <div class="g2a-reg-section-label">账号列表</div>
   </div>
   <div class="g2a-toolbar g2a-acc-toolbar">
-    <input id="acc-search" class="g2a-input" placeholder="搜索邮箱 / 账号 ID / 状态" />
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-search">搜索</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-search-clear">清除</button>
-    <span class="g2a-spacer"></span>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-select-page">本页全选</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-select-all-filtered">筛选全选</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-select-none">取消选择</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-renew-selected">批量续期</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-probe-selected">批量模型测试</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-selected">导出选中</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-sso-selected" title="仅导出选中账号的 SSO cookie">导出选中 SSO</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-sso-all" title="导出所有带 SSO 的账号">导出全部 SSO</button>
-    <button class="g2a-btn g2a-btn-primary" id="btn-acc-push-sub2api-selected" title="将选中账号导入到已配置的 sub2api">导入 sub2api（选中）</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-push-sub2api-all" title="将全部账号导入到已配置的 sub2api">导入 sub2api（全部）</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-sub2api-format" title="下载 sub2api 官方数据备份（type=sub2api-data，可在 sub2api「导入数据」使用）">导出 sub2api 数据</button>
-    <button class="g2a-btn g2a-btn-primary" id="btn-acc-push-cliproxyapi-selected" title="将选中账号同步到已配置的 CLIProxyAPI auth 目录">导入 CLIProxyAPI（选中）</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-push-cliproxyapi-all" title="将全部账号同步到已配置的 CLIProxyAPI">导入 CLIProxyAPI（全部）</button>
-    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-cliproxyapi-format" title="下载 CLIProxyAPI auth 包（type=cliproxyapi-auth-bundle）">导出 CLIProxyAPI</button>
-    <button class="g2a-btn g2a-btn-danger" id="btn-acc-delete-selected">删除选中</button>
-    <label class="g2a-sort-wrap" for="acc-filter-sso" title="按是否保存 SSO 筛选">
-      <span class="g2a-sort-label">SSO</span>
-      <select id="acc-filter-sso" class="g2a-sort-select" aria-label="SSO 筛选">
-        <option value="" selected>全部</option>
-        <option value="1">有 SSO</option>
-        <option value="0">无 SSO</option>
-      </select>
-    </label>
-    <label class="g2a-sort-wrap" id="acc-sort-wrap" for="acc-sort" title="仅在「全部」列表可用；状态筛选时固定按新加入排序">
-      <span class="g2a-sort-label">排序</span>
-      <select id="acc-sort" class="g2a-sort-select" aria-label="账号排序">
-        <option value="newest" selected>最新加入</option>
-        <option value="oldest">最早加入</option>
-        <option value="expires_desc">过期↓</option>
-        <option value="expires_asc">过期↑</option>
-        <option value="last_used_desc">最近用</option>
-        <option value="last_used_asc">最久未用</option>
-        <option value="requests_desc">请求↓</option>
-        <option value="email_asc">邮箱A-Z</option>
-        <option value="email_desc">邮箱Z-A</option>
-      </select>
-    </label>
+    <div class="g2a-toolbar-cluster is-search">
+      <input id="acc-search" class="g2a-input" placeholder="搜索邮箱 / 账号 ID / 状态" />
+      <button class="g2a-btn g2a-btn-default" id="btn-acc-search" type="button">搜索</button>
+      <button class="g2a-btn g2a-btn-default" id="btn-acc-search-clear" type="button">清除</button>
+    </div>
+    <span class="g2a-toolbar-sep" aria-hidden="true"></span>
+    <div class="g2a-toolbar-cluster" title="选择">
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-select-page" type="button">本页全选</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-select-all-filtered" type="button">筛选全选</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-select-none" type="button">取消选择</button>
+    </div>
+    <span class="g2a-toolbar-sep" aria-hidden="true"></span>
+    <div class="g2a-toolbar-cluster" title="运维">
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-renew-selected" type="button">批量续期</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-probe-selected" type="button">批量探测</button>
+    </div>
+    <span class="g2a-toolbar-sep" aria-hidden="true"></span>
+    <div class="g2a-toolbar-cluster" title="导出 / 同步">
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-export-selected" type="button">导出选中</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-export-sso-selected" type="button" title="仅导出选中账号的 SSO cookie">导出 SSO</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-export-sso-all" type="button" title="导出所有带 SSO 的账号">全部 SSO</button>
+      <button class="g2a-btn g2a-btn-primary g2a-btn-sm" id="btn-acc-push-sub2api-selected" type="button" title="将选中账号导入到已配置的 sub2api">→ sub2api</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-push-sub2api-all" type="button" title="将全部账号导入到已配置的 sub2api">全部 sub2api</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-export-sub2api-format" type="button" title="下载 sub2api 官方数据备份">sub2api 包</button>
+      <button class="g2a-btn g2a-btn-primary g2a-btn-sm" id="btn-acc-push-cliproxyapi-selected" type="button" title="同步到 CLIProxyAPI">→ CLIProxy</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-push-cliproxyapi-all" type="button" title="全部同步到 CLIProxyAPI">全部 CLIProxy</button>
+      <button class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-acc-export-cliproxyapi-format" type="button" title="下载 CLIProxyAPI auth 包">CLIProxy 包</button>
+    </div>
+    <div class="g2a-toolbar-cluster is-danger">
+      <button class="g2a-btn g2a-btn-danger g2a-btn-sm" id="btn-acc-delete-selected" type="button">删除选中</button>
+    </div>
+    <span class="g2a-toolbar-sep" aria-hidden="true"></span>
+    <div class="g2a-toolbar-cluster">
+      <label class="g2a-sort-wrap" for="acc-filter-sso" title="按是否保存 SSO 筛选">
+        <span class="g2a-sort-label">SSO</span>
+        <select id="acc-filter-sso" class="g2a-sort-select" aria-label="SSO 筛选">
+          <option value="" selected>全部</option>
+          <option value="1">有 SSO</option>
+          <option value="0">无 SSO</option>
+        </select>
+      </label>
+      <label class="g2a-sort-wrap" id="acc-sort-wrap" for="acc-sort" title="仅在「全部」列表可用；状态筛选时固定按新加入排序">
+        <span class="g2a-sort-label">排序</span>
+        <select id="acc-sort" class="g2a-sort-select" aria-label="账号排序">
+          <option value="newest" selected>最新加入</option>
+          <option value="oldest">最早加入</option>
+          <option value="expires_desc">过期↓</option>
+          <option value="expires_asc">过期↑</option>
+          <option value="last_used_desc">最近用</option>
+          <option value="last_used_asc">最久未用</option>
+          <option value="requests_desc">请求↓</option>
+          <option value="email_asc">邮箱A-Z</option>
+          <option value="email_desc">邮箱Z-A</option>
+        </select>
+      </label>
+    </div>
   </div>
-  <div class="g2a-muted" style="margin:6px 0 2px">状态筛选</div>
-  <div id="acc-status-chips" class="g2a-toolbar" style="gap:6px;margin:0 0 0;flex-wrap:wrap"></div>
-  <div id="acc-selection-info" class="g2a-muted" style="margin:8px 0 10px">—</div>
-  <div id="accounts-empty" class="g2a-empty hidden" style="display:none">暂无账号，请设备码登录或导入 Token。</div>
-  <div id="quota-summary" class="g2a-muted" style="margin-bottom:8px"></div>
+  <div class="g2a-filter-label">状态筛选</div>
+  <div id="acc-status-chips" class="g2a-status-chip-row"></div>
+  <div id="acc-selection-info" class="g2a-selection-bar is-empty" aria-live="polite"></div>
+  <div id="accounts-empty" class="g2a-empty hidden">暂无账号，请设备码登录或导入 Token。</div>
+  <div id="quota-summary" class="g2a-meta-line"></div>
   <div class="g2a-table-wrap">
     <table class="g2a-table">
       <thead>
         <tr>
-          <th><input type="checkbox" id="acc-check-page" /></th>
-          <th>邮箱 / ID</th>
+          <th class="g2a-acc-check"><input type="checkbox" id="acc-check-page" title="本页全选" /></th>
+          <th class="g2a-acc-idcol">邮箱 / ID</th>
           <th>Token</th>
           <th>类型</th>
-          <th>轮询状态</th>
+          <th>轮询</th>
           <th>用量</th>
-          <th>额度使用</th>
+          <th>额度</th>
           <th>探测</th>
-          <th>过期</th>
-          <th>操作</th>
+          <th>过期 / 元数据</th>
+          <th class="g2a-acc-actions-col">操作</th>
         </tr>
       </thead>
       <tbody id="accounts-tbody"></tbody>
@@ -307,6 +333,7 @@
 <section class="g2a-card">
   <div class="g2a-card-head g2a-reg-card-head">
     <div class="g2a-reg-card-title">
+      <div class="g2a-section-kicker">REGISTRATION · PROTOCOL</div>
       <div class="g2a-reg-title-row">
         <h3>协议注册</h3>
         <span class="g2a-tag blue g2a-reg-chip" id="reg-mode-chip" title="当前配置摘要">单次 · 本地过盾</span>
@@ -317,6 +344,7 @@
   <dialog id="reg-settings-dialog" class="g2a-dialog g2a-reg-settings-dialog" aria-labelledby="reg-settings-title">
     <div class="g2a-dialog-head">
       <div>
+        <div class="g2a-dialog-kicker">REGISTRATION · SETTINGS</div>
         <h3 id="reg-settings-title">协议注册设置</h3>
         <p>配置邮箱服务、过盾并发、测活等待和代理池。</p>
       </div>
@@ -324,7 +352,7 @@
     </div>
     <div class="g2a-dialog-body">
       <div class="g2a-form-grid g2a-reg-form">
-    <div class="g2a-reg-section" style="grid-column:1/-1">
+    <div class="g2a-reg-section g2a-field-span2">
       <div class="g2a-reg-section-label">邮箱服务</div>
     </div>
     <div class="g2a-field">
@@ -337,12 +365,12 @@
         <option value="tempmail">TempMail.lol（免费无需 Key）</option>
       </select>
     </div>
-    <div class="g2a-field" style="grid-column:1/-1">
-      <div id="reg-mail-help" class="g2a-alert hidden" style="display:none;margin:0;padding:10px 12px;font-size:12.5px;line-height:1.55"></div>
+    <div class="g2a-field g2a-field-span2">
+      <div id="reg-mail-help" class="g2a-alert g2a-reg-mail-help hidden"></div>
     </div>
 
     <!-- MoeMail: Base URL + API Key + domains (self-hosted) -->
-    <div class="g2a-field reg-mail-panel" data-mail="moemail" id="reg-panel-moemail-base" style="grid-column:1/-1">
+    <div class="g2a-field reg-mail-panel g2a-field-span2" data-mail="moemail" id="reg-panel-moemail-base">
       <label for="reg-moemail-base-url">MoeMail Base URL</label>
       <input id="reg-moemail-base-url" placeholder="https://moemail.example.com" autocomplete="off" name="reg-moemail-base-url" />
     </div>
@@ -350,10 +378,10 @@
       <label for="reg-moemail-api-key">MoeMail API Key</label>
       <input id="reg-moemail-api-key" placeholder="mk_..." autocomplete="off" name="reg-moemail-api-key" />
     </div>
-    <div class="g2a-field reg-mail-panel" data-mail="moemail" id="reg-panel-moemail-domain" style="grid-column:1/-1">
+    <div class="g2a-field reg-mail-panel g2a-field-span2" data-mail="moemail" id="reg-panel-moemail-domain">
       <label for="reg-moemail-domain">MoeMail 邮箱域名（可多个）</label>
       <textarea id="reg-moemail-domain" class="g2a-input" rows="3" placeholder="一行一个域名&#10;example.com&#10;mail.example.com" autocomplete="off" name="reg-moemail-domain" spellcheck="false"></textarea>
-      <div class="g2a-muted" style="margin-top:4px;font-size:12px">必填你的 MoeMail 域名；多个域名时批量注册按 1→2→3… 轮询。</div>
+      <div class="g2a-field-hint">必填你的 MoeMail 域名；多个域名时批量注册按 1→2→3… 轮询。</div>
     </div>
 
     <!-- YYDS Mail: key + optional domains (fixed host) -->
@@ -361,10 +389,10 @@
       <label for="reg-yyds-api-key">YYDS API Key</label>
       <input id="reg-yyds-api-key" placeholder="AC-..." autocomplete="off" name="reg-yyds-api-key" />
     </div>
-    <div class="g2a-field reg-mail-panel" data-mail="yyds" id="reg-panel-yyds-domain" style="grid-column:1/-1;display:none">
+    <div class="g2a-field reg-mail-panel g2a-field-span2" data-mail="yyds" id="reg-panel-yyds-domain" style="display:none">
       <label for="reg-yyds-domain">YYDS 邮箱域名（可多个）</label>
       <textarea id="reg-yyds-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=自动随机公开域名" autocomplete="off" name="reg-yyds-domain" spellcheck="false"></textarea>
-      <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：maliapi.215.im（文档 <a href="https://vip.215.im/docs" target="_blank" rel="noopener">vip.215.im/docs</a>）。Key 填 <code>AC-…</code>；域名留空则从公开目录随机，多行则批量轮询。收信走 <code>/v1/messages/next</code> 取验证码。</div>
+      <div class="g2a-field-hint">API：maliapi.215.im（文档 <a href="https://vip.215.im/docs" target="_blank" rel="noopener">vip.215.im/docs</a>）。Key 填 <code>AC-…</code>；域名留空则从公开目录随机，多行则批量轮询。收信走 <code>/v1/messages/next</code> 取验证码。</div>
     </div>
 
     <!-- GPTMail: optional key + optional domains (fixed host) -->
@@ -372,14 +400,14 @@
       <label for="reg-gptmail-api-key">GPTMail API Key</label>
       <input id="reg-gptmail-api-key" placeholder="sk-…（文档页公共测试 Key 或商店 Key）" autocomplete="off" name="reg-gptmail-api-key" />
     </div>
-    <div class="g2a-field reg-mail-panel" data-mail="gptmail" id="reg-panel-gptmail-domain" style="grid-column:1/-1;display:none">
+    <div class="g2a-field reg-mail-panel g2a-field-span2" data-mail="gptmail" id="reg-panel-gptmail-domain" style="display:none">
       <label for="reg-gptmail-domain">GPTMail 邮箱域名（可多个）</label>
       <textarea id="reg-gptmail-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=GPTMail 随机分配" autocomplete="off" name="reg-gptmail-domain" spellcheck="false"></textarea>
-      <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：https://mail.chatgpt.org.uk · 文档 <a href="https://mail.chatgpt.org.uk/zh/api/" target="_blank" rel="noopener">/zh/api/</a>。Header <code>X-API-Key: sk-…</code>；域名留空则 generate 随机，或填多行轮询。勿再用 gpt-test。</div>
+      <div class="g2a-field-hint">API：https://mail.chatgpt.org.uk · 文档 <a href="https://mail.chatgpt.org.uk/zh/api/" target="_blank" rel="noopener">/zh/api/</a>。Header <code>X-API-Key: sk-…</code>；域名留空则 generate 随机，或填多行轮询。勿再用 gpt-test。</div>
     </div>
 
     <!-- Cloudflare Temp Email: Base URL + admin password + domains -->
-    <div class="g2a-field reg-mail-panel" data-mail="cfmail" id="reg-panel-cfmail-base" style="grid-column:1/-1;display:none">
+    <div class="g2a-field reg-mail-panel g2a-field-span2" data-mail="cfmail" id="reg-panel-cfmail-base" style="display:none">
       <label for="reg-cfmail-base-url">CF Temp Email Base URL</label>
       <input id="reg-cfmail-base-url" placeholder="https://temp-email-api.your-domain.com 或 *.workers.dev" autocomplete="off" name="reg-cfmail-base-url" />
     </div>
@@ -387,10 +415,10 @@
       <label for="reg-cfmail-api-key">CF Temp Email Admin 密码</label>
       <input id="reg-cfmail-api-key" placeholder="ADMIN_PASSWORDS（请求头 x-admin-auth）" autocomplete="off" name="reg-cfmail-api-key" />
     </div>
-    <div class="g2a-field reg-mail-panel" data-mail="cfmail" id="reg-panel-cfmail-domain" style="grid-column:1/-1;display:none">
+    <div class="g2a-field reg-mail-panel g2a-field-span2" data-mail="cfmail" id="reg-panel-cfmail-domain" style="display:none">
       <label for="reg-cfmail-domain">CF Temp Email 域名（可多个）</label>
       <textarea id="reg-cfmail-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=GET /open_api/settings 自动选；Base 填 Worker API 源（非 Pages 前端）" autocomplete="off" name="reg-cfmail-domain" spellcheck="false"></textarea>
-      <div class="g2a-muted" style="margin-top:4px;font-size:12px">与 MoeMail 的 Base URL / Key / 域名完全独立，切换不会互相覆盖。</div>
+      <div class="g2a-field-hint">与 MoeMail 的 Base URL / Key / 域名完全独立，切换不会互相覆盖。</div>
     </div>
 
     <!-- TempMail.lol: free no key; optional Plus/Ultra Bearer key -->
@@ -398,12 +426,12 @@
       <label for="reg-tempmail-api-key">TempMail.lol API Key（可选）</label>
       <input id="reg-tempmail-api-key" placeholder="免费层级留空；Plus/Ultra 填 Bearer Key" autocomplete="off" name="reg-tempmail-api-key" />
     </div>
-    <div class="g2a-field reg-mail-panel" data-mail="tempmail" id="reg-panel-tempmail-domain" style="grid-column:1/-1;display:none">
+    <div class="g2a-field reg-mail-panel g2a-field-span2" data-mail="tempmail" id="reg-panel-tempmail-domain" style="display:none">
       <label for="reg-tempmail-domain">TempMail.lol 自定义域名（可选，付费）</label>
       <textarea id="reg-tempmail-domain" class="g2a-input" rows="2" placeholder="免费层级请留空（系统随机域名）；自定义域名需 Plus/Ultra" autocomplete="off" name="reg-tempmail-domain" spellcheck="false"></textarea>
-      <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：api.tempmail.lol · 文档 <a href="https://tempmail.lol/zh/api" target="_blank" rel="noopener">tempmail.lol/zh/api</a>。免费：POST /v2/inbox/create（无需 Key），收信 GET /v2/inbox?token=…</div>
+      <div class="g2a-field-hint">API：api.tempmail.lol · 文档 <a href="https://tempmail.lol/zh/api" target="_blank" rel="noopener">tempmail.lol/zh/api</a>。免费：POST /v2/inbox/create（无需 Key），收信 GET /v2/inbox?token=…</div>
     </div>
-    <div class="g2a-reg-section" style="grid-column:1/-1">
+    <div class="g2a-reg-section g2a-field-span2">
       <div class="g2a-reg-section-label">过盾与批量</div>
     </div>
     <div class="g2a-field">
@@ -433,13 +461,13 @@
         <option value="0">永久</option>
       </select>
     </div>
-    <div class="g2a-reg-section" style="grid-column:1/-1">
+    <div class="g2a-reg-section g2a-field-span2">
       <div class="g2a-reg-section-label">代理（可选）</div>
     </div>
     <div class="g2a-field g2a-field-span2">
       <label for="reg-proxy" title="支持代理池：每行一个；也可用逗号/分号分隔。格式：http://host:port 或 host:port:user:pass 或 socks5://...">代理池</label>
       <textarea id="reg-proxy" rows="3" placeholder="可选，每行一个代理&#10;http://host:port&#10;host:port:user:pass&#10;socks5://user:pass@host:port" spellcheck="false"></textarea>
-      <p class="g2a-muted" style="margin:4px 0 0" id="reg-proxy-hint">支持多行代理池；批量注册时按策略轮换。共享账号可填下方用户名/密码。</p>
+      <p class="g2a-field-hint" id="reg-proxy-hint">支持多行代理池；批量注册时按策略轮换。共享账号可填下方用户名/密码。</p>
     </div>
     <div class="g2a-field"><label>代理用户名</label><input id="reg-proxy-username" placeholder="可选，共享认证" /></div>
     <div class="g2a-field"><label>代理密码</label><input id="reg-proxy-password" type="password" placeholder="可选，共享认证" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-form-type="other" /></div>
@@ -503,6 +531,7 @@
 <section class="g2a-card">
   <div class="g2a-card-head">
     <div>
+      <div class="g2a-section-kicker">IMPORT · SSO</div>
       <h3>SSO Cookie 导入</h3>
       <p>粘贴或上传 SSO cookie，Device Flow 换 token 后入库。支持实时进度条。</p>
     </div>
@@ -530,7 +559,7 @@
       <button type="button" class="g2a-btn g2a-btn-primary" id="btn-import-sso">导入 SSO</button>
     </div>
   </div>
-  <div class="g2a-form-row g2a-import-controls" style="margin-top:10px">
+  <div class="g2a-form-row g2a-import-controls g2a-import-controls-export">
     <div class="g2a-field g2a-field-sm">
       <label>导出格式</label>
       <select id="sso-export-format">
@@ -555,7 +584,7 @@
       <button type="button" class="g2a-btn g2a-btn-default" id="btn-export-sso">导出 SSO</button>
     </div>
   </div>
-  <p class="g2a-muted" style="margin-top:6px">从<strong>账号数据库</strong>导出已入库 SSO cookie；导出前会先同步已保存的注册会话 SSO，并按 SSO 去重。</p>
+  <p class="g2a-field-hint">从<strong>账号数据库</strong>导出已入库 SSO cookie；导出前会先同步已保存的注册会话 SSO，并按 SSO 去重。</p>
   <div id="sso-progress-wrap" class="g2a-sso-progress hidden" hidden>
     <div class="g2a-sso-progress-meta">
       <span id="sso-progress-label" class="g2a-muted">准备中…</span>
@@ -564,7 +593,7 @@
     <div class="g2a-sso-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="sso-progress-bar">
       <div id="sso-progress-fill" class="g2a-sso-progress-fill" style="width:0%"></div>
     </div>
-    <div id="sso-progress-detail" class="g2a-muted" style="margin-top:6px">—</div>
+    <div id="sso-progress-detail" class="g2a-field-hint">—</div>
   </div>
   <pre id="sso-result" class="g2a-log is-empty hidden" hidden>—</pre>
 </section>
@@ -572,6 +601,7 @@
 <section class="g2a-card">
   <div class="g2a-card-head">
     <div>
+      <div class="g2a-section-kicker">IMPORT · JSON</div>
       <h3>JSON 导入 / 导出</h3>
       <p>上传 auth.json、CLIProxyAPI 的 <code>xai-*.json</code> / <code>type=xai|codex</code> 文件、或本系统导出的完整凭证。支持多文件与实时进度。</p>
     </div>
@@ -609,10 +639,10 @@
       </div>
     </div>
   </div>
-  <script src="/static/dist/utils.ac10ff3b58.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/utils.e0a95cf6ed.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/api.1bf56e45fe.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4eb51a7835.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.0631f67707.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.38bf64722f.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

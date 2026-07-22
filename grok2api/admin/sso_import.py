@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from grok2api.secure_files import secure_write_text
+
 import grok2api.config as _config
 from grok2api.pool import accounts
 
@@ -186,7 +188,9 @@ def _persist_import_sso_backup(*, email: str = "", sso: str = "", source: str = 
             "source": source,
             "created_at": ts,
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        secure_write_text(
+            path, json.dumps(payload, ensure_ascii=False, indent=2), secure_parent=True
+        )
         return str(path)
     except Exception as e:  # noqa: BLE001
         print(f"[sso-import] WARN: save SSO backup failed: {e}")
@@ -649,4 +653,3 @@ def _run_sso_import_job(
             )
         except Exception:
             pass
-

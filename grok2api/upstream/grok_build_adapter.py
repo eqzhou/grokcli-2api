@@ -17,6 +17,7 @@ Legacy browser (DrissionPage) and grpc-session registration engines were removed
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import secrets
 import sys
@@ -26,6 +27,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+from grok2api.secure_files import secure_write_text
 
 # This file lives at grok2api/upstream/; repo root is two levels up.
 ROOT = Path(__file__).resolve().parents[2]
@@ -804,7 +807,9 @@ def _persist_registration_sso(
         "source": "register-email",
     }
     try:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        secure_write_text(
+            path, json.dumps(payload, ensure_ascii=False, indent=2), secure_parent=True
+        )
         return str(path)
     except Exception as e:  # noqa: BLE001
         print(f"[grok-build-auth] WARN: write SSO backup failed: {e}")
@@ -3767,8 +3772,9 @@ def _run_registration(
 
         update("registering", "visiting signup page")
         _check_cancel()
+        sensitive_debug = os.environ.get("GROK2API_REG_DEBUG_SENSITIVE", "") == "1"
         client = XConsoleAuthClient(
-            debug=True,
+            debug=sensitive_debug,
             proxy=proxy or "",
             signup_url="https://accounts.x.ai/sign-up?redirect=grok-com",
         )
@@ -3854,7 +3860,7 @@ def _run_registration(
             # Keep captcha wait bounded; cancel still interrupts via on_progress.
             timeout=float(os.environ.get("GROK2API_YESCAPTCHA_TIMEOUT", "180") or 180),
             poll_interval=float(os.environ.get("GROK2API_YESCAPTCHA_POLL", "2") or 2),
-            debug=True,
+            debug=sensitive_debug,
             on_progress=_turnstile_progress,
             # Local: no cloud fallback. YesCaptcha: allow cn/global peer fallback.
             auto_fallback_endpoint=auto_fallback,
@@ -4205,7 +4211,10 @@ def _run_registration(
             )
             sc = list(getattr(res, "set_cookies", None) or [])
             rsc_body = getattr(res, "rsc_body", "") or ""
-            rsc_preview = rsc_body[:800]
+            rsc_preview = (
+                f"<redacted len={len(rsc_body)} "
+                f"sha256={hashlib.sha256(rsc_body.encode('utf-8')).hexdigest()[:12]}>"
+            )
             http_status = int(getattr(res, "http_status", 0) or 0)
             try:
                 signup_err = client.extract_signup_error(rsc_body)
@@ -4215,7 +4224,7 @@ def _run_registration(
             print(f"[grok-build-auth] create_account set-cookies count={len(sc)}")
             print(f"[grok-build-auth] create_account ok={bool(getattr(res, 'ok', False))}")
             print(f"[grok-build-auth] create_account error={signup_err!r}")
-            print(f"[grok-build-auth] create_account rsc_body preview: {rsc_preview}")
+            print(f"[grok-build-auth] create_account rsc_body: {rsc_preview}")
             print(f"[grok-build-auth] adapter_build={ADAPTER_BUILD}")
             sess["create_account_http"] = http_status
             sess["create_account_ok_flag"] = bool(getattr(res, "ok", False))
@@ -4223,15 +4232,17 @@ def _run_registration(
             sess["create_account_error"] = signup_err
             sess["create_account_attempt"] = ca
 
-            # Persist full body for offline diagnosis (truncated).
-            try:
-                debug_path = (
-                    ROOT / "data" / "register_sso" / f"{sid}.create_account.rsc.txt"
-                )
-                debug_path.parent.mkdir(parents=True, exist_ok=True)
-                debug_path.write_text(rsc_body[:200_000], encoding="utf-8")
-            except Exception:
-                pass
+            # Sensitive upstream bodies are opt-in and remain private on disk.
+            if os.environ.get("GROK2API_REG_DEBUG_SENSITIVE", "") == "1":
+                try:
+                    debug_path = (
+                        ROOT / "data" / "register_sso" / f"{sid}.create_account.rsc.txt"
+                    )
+                    secure_write_text(
+                        debug_path, rsc_body[:200_000], secure_parent=True
+                    )
+                except Exception:
+                    pass
 
             if http_status != 200:
                 # Non-200: retry on 403/408/429/5xx (CF hold / rate / upstream flake).
@@ -4298,8 +4309,9 @@ def _run_registration(
             if sso:
                 sso_attempts.append("fetch_sso_token")
         except Exception as sso_fetch_err:  # noqa: BLE001
-            print(f"[grok-build-auth] fetch_sso_token error: {sso_fetch_err}")
-            sso_attempts.append(f"fetch_sso_token_err:{sso_fetch_err}")
+            error_type = type(sso_fetch_err).__name__
+            print(f"[grok-build-auth] fetch_sso_token error_type={error_type}")
+            sso_attempts.append(f"fetch_sso_token_err:{error_type}")
 
         if not sso:
             try:
@@ -4317,19 +4329,16 @@ def _run_registration(
                 if sso:
                     sso_attempts.append("parse_set_cookie_or_rsc")
                 if not sso and rsc_body:
+                    candidates = parse_all_set_cookie_urls(rsc_body)
                     print(
                         f"[grok-build-auth] set-cookie candidates="
-                        f"{parse_all_set_cookie_urls(rsc_body)[:3]}"
-                    )
-                    print(
-                        f"[grok-build-auth] primary set-cookie url="
-                        f"{parse_sso_jwt_url(rsc_body)}"
+                        f"{len(candidates)} primary_present={bool(parse_sso_jwt_url(rsc_body))}"
                     )
                     extractor = SSOExtractor(
                         transport_request=client._request,
                         base_headers=client._base_headers,
                         cookie_jar=client._t.cookies,
-                        debug=True,
+                        debug=sensitive_debug,
                     )
                     sso = extractor.extract(
                         rsc_body, email=email, password=password, save=False
@@ -4337,8 +4346,9 @@ def _run_registration(
                     if sso:
                         sso_attempts.append("SSOExtractor")
             except Exception as recover_err:  # noqa: BLE001
-                print(f"[grok-build-auth] SSO recover failed: {recover_err}")
-                sso_attempts.append(f"rsc_recover_err:{recover_err}")
+                error_type = type(recover_err).__name__
+                print(f"[grok-build-auth] SSO recover error_type={error_type}")
+                sso_attempts.append(f"rsc_recover_err:{error_type}")
 
         # Current xAI create_account often returns only RSC chunks + CF cookies,
         # with no set-cookie JWT chain. Fall back to password CreateSession and
@@ -4449,12 +4459,21 @@ def _run_registration(
                         sso_attempts.append("cookie_jar_final")
                 except Exception:
                     pass
+            sso_fingerprint = (
+                hashlib.sha256(sso.encode("utf-8")).hexdigest()[:12] if sso else "none"
+            )
             print(
-                f"[grok-build-auth] CreateSession fallback sso="
-                f"{(sso[:60] if sso else None)} attempts={sso_attempts}"
+                f"[grok-build-auth] CreateSession fallback sso_sha256="
+                f"{sso_fingerprint} attempts={sso_attempts}"
             )
 
-        print(f"[grok-build-auth] fetch_sso_token result: {sso[:60] if sso else None}")
+        sso_fingerprint = (
+            hashlib.sha256(sso.encode("utf-8")).hexdigest()[:12] if sso else "none"
+        )
+        print(
+            "[grok-build-auth] fetch_sso_token result: "
+            f"present={bool(sso)} sha256={sso_fingerprint if sso else 'none'}"
+        )
         sess["sso"] = sso
         sess["sso_attempts"] = list(sso_attempts)
         session_cookies = extract_cookies_from_auth_client(client)
@@ -4502,7 +4521,7 @@ def _run_registration(
                 "SSO obtained but sso_to_auth_json conversion failed "
                 "(device verify/approve/token poll; often xAI device-flow "
                 "rate_limited/slow_down under concurrent registration). "
-                f"adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
+                f"adapter_build={ADAPTER_BUILD}; sso_sha256={sso_fingerprint}"
             )
         _key, entry = sso_import.token_to_auth_entry(token, email=email)
         # Keep the raw SSO cookie with the account so export/re-import works

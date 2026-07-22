@@ -55,7 +55,7 @@ from urllib.parse import quote
 from . import config as C
 from . import grpcweb
 from .models import GrpcResult, PasswordStrength, SignupResult
-from .sso import SSOExtractor
+from .sso import SSOExtractor, _is_trusted_sso_url
 
 
 # --------------------------------------------------------------------------- #
@@ -600,7 +600,7 @@ class XConsoleAuthClient:
             if status == 200 and not ok:
                 print(
                     "  [create_account] HTTP 200 classified as failure; "
-                    f"preview={rsc_body[:240]!r}"
+                    f"body_len={len(rsc_body)}"
                 )
         return SignupResult(
             ok=ok, http_status=status,
@@ -816,6 +816,10 @@ class XConsoleAuthClient:
 
     def _fetch_sso_via_url(self, url: str, *, label: str = "fallback") -> Optional[str]:
         """Visit *url* and try to harvest an ``sso`` cookie from headers/body/jar."""
+        if not _is_trusted_sso_url(url):
+            if self.debug:
+                print(f"  [sso] {label} rejected untrusted URL")
+            return None
         headers = self._base_headers()
         headers.update({
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -830,7 +834,7 @@ class XConsoleAuthClient:
             )
             if self.debug:
                 print(
-                    f"  [sso] {label} HTTP {status} {url[:64]}, "
+                    f"  [sso] {label} HTTP {status}, "
                     f"set-cookies={len(set_cookies or [])}"
                 )
             from .sso import parse_sso_from_set_cookies, parse_sso_token_from_text
@@ -845,7 +849,7 @@ class XConsoleAuthClient:
             loc = ""
             if isinstance(hdrs, dict):
                 loc = str(hdrs.get("location") or "")
-            if loc.startswith("http"):
+            if _is_trusted_sso_url(loc):
                 status2, _h2, sc2, raw2 = self._request("GET", loc, headers=headers)
                 if self.debug:
                     print(

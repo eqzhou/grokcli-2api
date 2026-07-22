@@ -41,6 +41,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from curl_cffi import requests
+from grok2api.secure_files import secure_write_text
 
 # Use project config when available, otherwise fall back to defaults
 try:
@@ -553,9 +554,7 @@ def token_to_auth_entry(token: dict, email: str = "") -> tuple[str, dict]:
 def write_auth_json(path: Path, auth_key: str, entry: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {auth_key: entry}
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    secure_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
 def merge_auth_json(path: Path, auth_key: str, entry: dict, unique: bool = True) -> None:
@@ -573,9 +572,7 @@ def merge_auth_json(path: Path, auth_key: str, entry: dict, unique: bool = True)
     if unique and entry.get("user_id"):
         key = f"{auth_key}::{entry['user_id']}"
     existing[key] = entry
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    secure_write_text(path, json.dumps(existing, indent=2, ensure_ascii=False) + "\n")
 
 
 def import_into_project_auth(entry: dict) -> str:

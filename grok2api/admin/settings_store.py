@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from grok2api.config import ACCOUNT_MODE, ADMIN_PASSWORD, DATA_DIR, SETTINGS_FILE
+from grok2api.secure_files import secure_write_text
 
 _lock = threading.RLock()
 
@@ -237,9 +238,7 @@ def _write_disk(data: dict[str, Any]) -> None:
             pass
     # File-mode fallback (explicit STORE_BACKEND=file / PG unavailable).
     _ensure()
-    tmp = SETTINGS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SETTINGS_FILE)
+    secure_write_text(SETTINGS_FILE, json.dumps(data, ensure_ascii=False, indent=2))
     _mem_mtime_ns = _file_mtime_ns()
 
 
