@@ -736,10 +736,14 @@ textarea {
 .g2a-table-wrap, .table-responsive {
   border: 1px solid var(--g2a-edge-strong, var(--ant-color-border));
   border-radius: var(--radius-md);
-  overflow: auto;
+  overflow-x: auto;
   max-width: 100%;
+  width: 100%;
+  min-width: 0;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior-x: contain;
+  /* Keep wide tables from expanding the page/card — scroll inside wrap only */
+  contain: inline-size;
   background: var(--table-bg);
   box-shadow:
     0 0 0 1px color-mix(in srgb, var(--g2a-signal) 6%, transparent),
@@ -747,6 +751,7 @@ textarea {
 }
 .g2a-table, table {
   width: 100%;
+  max-width: none;
   border-collapse: collapse;
   font-size: 13px;
 }
@@ -755,6 +760,9 @@ textarea {
   border-bottom: 1px solid color-mix(in srgb, var(--g2a-line-strong) 70%, var(--ant-color-border));
   text-align: left;
   vertical-align: top;
+  /* Default: allow wrap so cells don't force page overflow */
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .g2a-table th, table th {
   background: var(--table-head-bg);
@@ -3815,12 +3823,12 @@ body.g2a-nav-open .g2a-sider-backdrop { display: block; }
   .g2a-table-wrap {
     border-radius: 10px;
   }
-  /* allow horizontal scroll on dense tables */
-  .g2a-table {
+  /* Dense tables scroll inside .g2a-table-wrap — never expand the page */
+  .g2a-table-wrap .g2a-table {
     min-width: 720px;
   }
-  body[data-page="usage"] .g2a-table,
-  body[data-page="logs"] .g2a-table {
+  body[data-page="usage"] .g2a-table-wrap .g2a-table,
+  body[data-page="logs"] .g2a-table-wrap .g2a-table {
     min-width: 640px;
   }
   .g2a-header-actions .g2a-btn#btn-refresh {
@@ -3840,6 +3848,19 @@ body.g2a-nav-open .g2a-sider-backdrop { display: block; }
 .g2a-card,
 .g2a-table-wrap {
   min-width: 0;
+  max-width: 100%;
+}
+.g2a-layout {
+  min-width: 0;
+  width: 100%;
+  overflow-x: clip;
+}
+.g2a-content {
+  overflow-x: clip;
+}
+.g2a-card .g2a-table-wrap,
+.g2a-card .table-responsive {
+  max-width: 100%;
 }
 .g2a-header-actions {
   max-width: 100%;
@@ -4404,11 +4425,16 @@ html[data-theme="light"] body[data-page="accounts"] .g2a-table td {
 
 body[data-page="accounts"] .g2a-table-wrap {
   overflow-x: auto;
+  max-width: 100%;
+  width: 100%;
+  min-width: 0;
+  contain: inline-size;
 }
 body[data-page="accounts"] .g2a-table {
   table-layout: auto;
-  width: 100%;
-  min-width: 960px;
+  width: max-content; /* allow horizontal scroll inside wrap when dense */
+  min-width: 100%;
+  max-width: none;
   font-size: 12.5px;
 }
 body[data-page="accounts"] .g2a-table th,
@@ -4425,11 +4451,12 @@ body[data-page="accounts"] .g2a-acc-check {
   padding-right: 6px;
 }
 
-/* Email / ID — column width follows longest email (content only) */
+/* Email / ID — hug content, but hard-cap so table stays inside card */
 body[data-page="accounts"] .g2a-acc-idcol,
 body[data-page="accounts"] .g2a-table th.g2a-acc-idcol,
 body[data-page="accounts"] .g2a-table thead th:nth-child(2) {
   width: 1%;
+  max-width: 240px;
   white-space: nowrap;
   padding-right: 14px;
 }
@@ -4438,23 +4465,24 @@ body[data-page="accounts"] .g2a-acc-idcell {
   flex-direction: column;
   align-items: flex-start;
   gap: 2px;
-  width: max-content; /* hug email/id text */
-  max-width: none;
+  width: max-content;
+  max-width: 240px;
+  min-width: 0;
 }
 body[data-page="accounts"] .g2a-acc-email {
   font-weight: 550;
   letter-spacing: -0.01em;
   color: var(--ant-color-text);
   white-space: nowrap;
-  overflow: visible;
-  text-overflow: clip;
-  max-width: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
 }
 body[data-page="accounts"] .g2a-acc-idcell .g2a-cell-sub {
   white-space: nowrap;
-  overflow: visible;
-  text-overflow: clip;
-  max-width: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
   font-size: 0.7rem;
 }
 
@@ -4532,7 +4560,8 @@ body[data-page="accounts"] td.g2a-acc-actions {
   display: table-cell !important;
   vertical-align: middle;
   width: 1%;
-  max-width: 168px;
+  min-width: 148px;
+  max-width: 200px;
   overflow: hidden;
   border-bottom: 1px solid color-mix(in srgb, var(--g2a-line-strong) 70%, var(--ant-color-border));
   border-left: 0;
@@ -4548,11 +4577,12 @@ body[data-page="accounts"] .g2a-acc-actions-inner {
   align-items: flex-start;
   gap: 4px;
   max-width: 100%;
+  min-width: 0;
   overflow: hidden;
 }
 body[data-page="accounts"] .g2a-acc-actions-row {
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap; /* keep buttons inside cell border */
   align-items: center;
   gap: 4px;
   max-width: 100%;
@@ -4793,4 +4823,52 @@ body[data-page="logs"] .g2a-table td:nth-child(5) {
 body[data-page="logs"] .g2a-table td.g2a-logs-progress,
 body[data-page="logs"] .g2a-table td:nth-child(5) {
   font-family: var(--mono);
+}
+
+
+/* ═══════════════════════════════════════════════════════════
+   TABLE ROW CONTAINMENT — never spill past card border
+   ═══════════════════════════════════════════════════════════ */
+
+/* All list pages: wrap owns the scrollbar */
+body[data-page="accounts"] .g2a-table-wrap,
+body[data-page="keys"] .g2a-table-wrap,
+body[data-page="logs"] .g2a-table-wrap,
+body[data-page="usage"] .g2a-table-wrap,
+body[data-page="models"] .g2a-table-wrap {
+  max-width: 100%;
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  contain: inline-size;
+}
+
+/* Tags / pills in table cells must not force unbounded width */
+.g2a-table .g2a-tag,
+.g2a-table .g2a-status-pill,
+.g2a-table .pill {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Quota / probe cells: constrain nested text */
+body[data-page="accounts"] .g2a-acc-quota,
+body[data-page="accounts"] .g2a-acc-probe {
+  max-width: 200px;
+  overflow: hidden;
+}
+body[data-page="accounts"] .g2a-acc-quota .g2a-muted,
+body[data-page="accounts"] .g2a-acc-probe .g2a-muted {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Logs / keys tables scroll in wrap */
+body[data-page="logs"] .g2a-table,
+body[data-page="keys"] .g2a-table {
+  width: max-content;
+  min-width: 100%;
 }
