@@ -468,6 +468,52 @@ func TestPrepareChainCapsFailover(t *testing.T) {
 	}
 }
 
+func TestPrepareChainRandomDoesNotRepinFirstWithoutAffinity(t *testing.T) {
+	candidates := make([]pool.Candidate, 0, 8)
+	for _, id := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		candidates = append(candidates, pool.Candidate{ID: id, Token: "t", Enabled: true})
+	}
+	svc := &ChatService{Now: func() time.Time { return time.Unix(1000, 0) }}
+	seen := map[string]bool{}
+	for i := 0; i < 80; i++ {
+		_, chain, _, err := svc.prepareChain(
+			t.Context(),
+			ChatRequest{Model: "grok", Raw: map[string]any{"model": "grok"}},
+			candidates,
+			"random",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen[chain[0].ID] = true
+	}
+	if len(seen) < 3 {
+		t.Fatalf("random mode kept re-pinning the first candidate: %v", seen)
+	}
+}
+
+func TestPrepareChainRandomKeepsAffinityFirst(t *testing.T) {
+	request := ChatRequest{Model: "grok", Raw: map[string]any{"conversation_id": "random-sticky"}}
+	store := &fakeAffinityStore{bound: map[string]string{
+		"chat:grok:conversation_id:random-sticky": "sticky",
+	}}
+	svc := &ChatService{AffinityStore: store, Now: func() time.Time { return time.Unix(1000, 0) }}
+	candidates := []pool.Candidate{
+		{ID: "a", Token: "t", Enabled: true},
+		{ID: "sticky", Token: "t", Enabled: true},
+		{ID: "c", Token: "t", Enabled: true},
+	}
+	for i := 0; i < 20; i++ {
+		_, chain, _, err := svc.prepareChain(t.Context(), request, candidates, "random")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chain[0].ID != "sticky" {
+			t.Fatalf("affinity account lost in random mode: chain=%v", chain)
+		}
+	}
+}
+
 func TestGuardStreamAgainstEmptySlowFirstTokenPasses(t *testing.T) {
 	// Slow TTFT: no frames within the peek budget must NOT be treated as empty.
 	// After budget, the guarded reader must still deliver the late content

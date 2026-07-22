@@ -615,15 +615,20 @@ func (s *ChatService) prepare(ctx context.Context, request ChatRequest, candidat
 	}
 	candidates = append([]pool.Candidate(nil), candidates...)
 	fingerprint := ChatFingerprint(request)
+	preferredID := ""
 	if s.AffinityStore != nil && fingerprint != "" {
-		preferAffinity(ctxOrBackground(ctx), candidates, s.AffinityStore, fingerprint)
+		preferredID = preferAffinity(ctxOrBackground(ctx), candidates, s.AffinityStore, fingerprint)
 	}
 	if s.PickObserver != nil {
 		adjustCandidatesForObserver(ctxOrBackground(ctx), candidates, s.PickObserver)
 	}
-	picked, err := pool.Pick(candidates, model, mode, now)
-	if err != nil {
-		return "", pool.Candidate{}, nil, err
+	picked, preferred := preferredEligibleCandidate(candidates, preferredID, model, now)
+	if !preferred {
+		var err error
+		picked, err = pool.Pick(candidates, model, mode, now)
+		if err != nil {
+			return "", pool.Candidate{}, nil, err
+		}
 	}
 	s.bindAffinity(ctx, request, picked.ID)
 	if s.PickObserver != nil {
@@ -649,32 +654,33 @@ func (s *ChatService) prepareChain(ctx context.Context, request ChatRequest, can
 	fingerprint := ChatFingerprint(request)
 	// Skip second Redis affinity GET when server already pinned sticky to candidates[0]
 	// (RequestCount heavily boosted by listCandidatesForRequest).
-	alreadyPinned := len(candidates) > 0 && candidates[0].RequestCount <= -1_000_000_000
+	alreadyPinned := len(candidates) > 0 && candidates[0].RequestCount <= -500_000_000
+	preferredID := ""
+	if alreadyPinned {
+		preferredID = candidates[0].ID
+	}
 	if !alreadyPinned && s.AffinityStore != nil && fingerprint != "" {
-		preferAffinity(ctxOrBackground(ctx), candidates, s.AffinityStore, fingerprint)
+		preferredID = preferAffinity(ctxOrBackground(ctx), candidates, s.AffinityStore, fingerprint)
 	}
 	if s.PickObserver != nil {
 		adjustCandidatesForObserver(ctxOrBackground(ctx), candidates, s.PickObserver)
 	}
 	// Never build a full-pool chain: Python caps failover attempts (default 4).
-	chain := pool.Chain(candidates, model, mode, now, defaultFailoverChain)
-	if len(chain) == 0 {
-		return "", nil, nil, pool.ErrNoEligibleAccounts
-	}
-	// Re-pin sticky account to front of failover chain without extra Redis GET.
-	// preferAffinity / server sticky inject already moved sticky candidate to candidates[0] when known.
-	if len(candidates) > 0 {
-		prefer := candidates[0].ID
-		for i := range chain {
-			if chain[i].ID == prefer {
-				if i > 0 {
-					cand := chain[i]
-					copy(chain[1:i+1], chain[0:i])
-					chain[0] = cand
-				}
-				break
+	chain := make([]pool.Candidate, 0, defaultFailoverChain)
+	if preferred, ok := preferredEligibleCandidate(candidates, preferredID, model, now); ok {
+		rest := make([]pool.Candidate, 0, len(candidates)-1)
+		for _, candidate := range candidates {
+			if candidate.ID != preferred.ID {
+				rest = append(rest, candidate)
 			}
 		}
+		chain = append(chain, preferred)
+		chain = append(chain, pool.Chain(rest, model, mode, now, defaultFailoverChain-1)...)
+	} else {
+		chain = pool.Chain(candidates, model, mode, now, defaultFailoverChain)
+	}
+	if len(chain) == 0 {
+		return "", nil, nil, pool.ErrNoEligibleAccounts
 	}
 	// Account picks are marked when an attempt actually starts.
 	client := s.Client
@@ -2038,10 +2044,10 @@ func ChatFingerprintFromHeaders(headers http.Header, model string) string {
 	return ""
 }
 
-func preferAffinity(ctx context.Context, candidates []pool.Candidate, store AffinityStore, fingerprint string) {
+func preferAffinity(ctx context.Context, candidates []pool.Candidate, store AffinityStore, fingerprint string) string {
 	accountID, err := store.GetAffinity(ctx, fingerprint)
 	if err != nil || accountID == "" {
-		return
+		return ""
 	}
 	idx := -1
 	for i := range candidates {
@@ -2051,7 +2057,7 @@ func preferAffinity(ctx context.Context, candidates []pool.Candidate, store Affi
 		}
 	}
 	if idx < 0 {
-		return
+		return ""
 	}
 	// Strong sticky pin: move to front and massively prefer in least_used ordering.
 	candidates[idx].RequestCount -= 1_000_000_000
@@ -2060,6 +2066,20 @@ func preferAffinity(ctx context.Context, candidates []pool.Candidate, store Affi
 		copy(candidates[1:idx+1], candidates[0:idx])
 		candidates[0] = cand
 	}
+	return accountID
+}
+
+func preferredEligibleCandidate(candidates []pool.Candidate, id, model string, now time.Time) (pool.Candidate, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return pool.Candidate{}, false
+	}
+	for _, candidate := range candidates {
+		if candidate.ID == id && candidate.Eligible(model, now) {
+			return candidate, true
+		}
+	}
+	return pool.Candidate{}, false
 }
 
 func adjustCandidatesForObserver(ctx context.Context, candidates []pool.Candidate, observer PickObserver) {

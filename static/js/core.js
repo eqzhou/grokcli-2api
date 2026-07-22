@@ -3459,49 +3459,66 @@ function upsertAccountInList(partial) {
 function renderOneAccountRow(account) {
   if (!account || !account.id) return "";
   const a = account;
-  const p = a._pool || { id: a.id };
+  const p = { ...(a._pool || { id: a.id }) };
+  const liveQ = quotaCache[accountIdKey(a.id)] || quotaCache[a.id];
+  if ((!p.last_quota || (typeof hasQuotaInfo === "function" && !hasQuotaInfo(p.last_quota)))
+    && liveQ && typeof liveQ === "object" && hasQuotaInfo(liveQ)) {
+    p.last_quota = liveQ;
+  }
   const enabled = p.enabled !== false;
   const poolLabel = poolStatusLabel(a, p);
-  const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
+  const usage = `<span class="g2a-usage-ok">${p.success_count || 0}</span><span class="g2a-usage-sep">✓</span> <span class="g2a-usage-bad">${p.fail_count || 0}</span><span class="g2a-usage-sep">✗</span> <span class="g2a-muted">共 ${p.request_count || 0}</span>`;
   const refreshPill = a.has_refresh_token
-    ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
-    : '<span class="g2a-tag warn">无 refresh</span>';
+    ? '<span class="g2a-tag ok g2a-status-pill" title="可自动 refresh">可续期</span>'
+    : '<span class="g2a-tag warn g2a-status-pill">无 refresh</span>';
   const ssoPill = a.has_sso
-    ? '<span class="g2a-tag ok" title="账号库已保存 SSO cookie">SSO</span>'
-    : '<span class="g2a-tag" title="未保存 SSO cookie">无SSO</span>';
-  const liveQ = quotaCache[accountIdKey(a.id)] || quotaCache[a.id];
+    ? '<span class="g2a-tag ok g2a-status-pill" title="账号库已保存 SSO cookie">有SSO</span>'
+    : '<span class="g2a-tag g2a-status-pill" title="未保存 SSO cookie">无SSO</span>';
   const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
   const checked = selectedAccountIds.has(accountIdKey(a.id)) ? "checked" : "";
   const expiryCell = fmtExpiry(a.expires_at);
   const typeCell = fmtAccountTypeCell({ ...p, id: a.id, account_type: a.account_type || p.account_type, plan: a.plan || p.plan, plan_label: a.plan_label || p.plan_label, last_quota: p.last_quota }, liveQ);
+  const tokenPill = a.expired
+    ? '<span class="g2a-tag bad g2a-status-pill">已过期</span>'
+    : '<span class="g2a-tag ok g2a-status-pill">有效</span>';
+  const renewDisabled = a.has_refresh_token ? "" : 'disabled title="无 refresh_token，无法续期"';
   return `
     <tr data-acc-id="${esc(a.id)}">
-      <td><input type="checkbox" class="acc-check-one" data-id="${esc(a.id)}" ${checked} /></td>
-      <td>${esc(a.email || "—")}<div class="muted mono" style="font-size:0.72rem">${esc(a.id)}</div></td>
-      <td>${a.expired ? '<span class="g2a-tag bad">已过期</span>' : '<span class="g2a-tag ok">有效</span>'}</td>
-      <td style="min-width:88px">${typeCell}</td>
-      <td>${poolLabel}</td>
-      <td class="g2a-muted" style="font-size:0.8rem">${usage}</td>
-      <td style="font-size:0.82rem;min-width:150px">${fmtQuotaCell({ ...p, id: a.id }, liveQ)}</td>
-      <td style="font-size:0.78rem;min-width:160px">${probeCell}</td>
-      <td style="font-size:0.8rem;min-width:150px">
-        ${expiryCell}
-        <div style="margin-top:6px">${refreshPill} ${ssoPill}</div>
+      <td class="g2a-acc-check"><input type="checkbox" class="acc-check-one" data-id="${esc(a.id)}" ${checked} /></td>
+      <td class="g2a-acc-idcol">
+        <div class="g2a-acc-idcell" title="${esc((a.email || "") + " · " + (a.id || ""))}">
+          <span class="g2a-acc-email">${esc(a.email || "—")}</span>
+          <span class="g2a-cell-sub">${esc(a.id)}</span>
+        </div>
       </td>
-      <td class="g2a-actions">
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="renew-one" data-id="${esc(a.id)}" ${a.has_refresh_token ? "" : "disabled title=\"无 refresh_token，无法续期\""}>续期</button>
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="probe-one" data-id="${esc(a.id)}">模型测试</button>
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
-        <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
-        <button class="g2a-btn g2a-btn-danger g2a-btn-sm" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
+      <td class="g2a-acc-token">${tokenPill}</td>
+      <td class="g2a-acc-type">${typeCell}</td>
+      <td class="g2a-acc-pool">${poolLabel}</td>
+      <td class="g2a-acc-usage mono">${usage}</td>
+      <td class="g2a-acc-quota">${fmtQuotaCell({ ...p, id: a.id }, liveQ)}</td>
+      <td class="g2a-acc-probe">${probeCell}</td>
+      <td class="g2a-acc-expiry">
+        <div class="g2a-acc-expiry-stack">
+          ${expiryCell}
+          <div class="g2a-acc-meta-pills">${refreshPill}${ssoPill}</div>
+        </div>
+      </td>
+      <td class="g2a-acc-actions">
+        <div class="g2a-acc-actions-inner">
+          <div class="g2a-acc-actions-row">
+            <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="renew-one" data-id="${esc(a.id)}" ${renewDisabled}>续期</button>
+            <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="probe-one" data-id="${esc(a.id)}">探测</button>
+            <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="quota-one" data-id="${esc(a.id)}">额度</button>
+          </div>
+          <div class="g2a-acc-actions-row">
+            <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="toggle-acc" data-id="${esc(a.id)}" data-on="${enabled ? 0 : 1}">${enabled ? "禁用" : "启用"}</button>
+            <button class="g2a-btn g2a-btn-danger g2a-btn-sm" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
+          </div>
+        </div>
       </td>
     </tr>`;
 }
 
-
-// Keep window + table wrap scroll when we rewrite a single account row.
-// Model test / quota / renew used to call loadAccountsPage and re-render the
-// whole tbody, which jumped the page under the click.
 function captureAccountsScroll() {
   const wrap = document.querySelector("#accounts-tbody")
     ? (document.querySelector("#accounts-tbody").closest(".g2a-table-wrap")
@@ -3625,11 +3642,11 @@ function setRowBusy(id, busy, label) {
   });
   // Live status cell hint while busy (temporary overlay on 状态 column).
   if (row) {
-    const statusCell = row.children && row.children[3];
+    const statusCell = row.querySelector(".g2a-acc-pool") || (row.children && row.children[4]) || null;
     if (statusCell) {
       if (busy && label) {
         if (!statusCell.dataset.prevHtml) statusCell.dataset.prevHtml = statusCell.innerHTML;
-        statusCell.innerHTML = `<span class="g2a-tag warn">${esc(label)}</span>`;
+        statusCell.innerHTML = `<span class="g2a-tag warn g2a-status-pill">${esc(label)}</span>`;
       } else if (!busy) {
         // Drop busy overlay only. Caller (probe/quota/renew) already live-patches
         // the row with the real status — re-painting here double-jumps the page.

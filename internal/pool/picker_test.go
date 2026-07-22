@@ -71,3 +71,35 @@ func TestModelBlockedObjectUntil(t *testing.T) {
 		t.Fatal("unrelated model should not block")
 	}
 }
+
+func TestRandomModeIsNotWeightOrder(t *testing.T) {
+	now := time.Unix(1000, 0)
+	// Equal weights: old "random" sort was stable by ID (always a first).
+	// New random must be able to pick something other than the ID-min first.
+	candidates := []Candidate{
+		{ID: "a", Token: "t", Enabled: true, Weight: 1},
+		{ID: "b", Token: "t", Enabled: true, Weight: 1},
+		{ID: "c", Token: "t", Enabled: true, Weight: 1},
+		{ID: "d", Token: "t", Enabled: true, Weight: 1},
+		{ID: "e", Token: "t", Enabled: true, Weight: 1},
+		{ID: "f", Token: "t", Enabled: true, Weight: 1},
+		{ID: "g", Token: "t", Enabled: true, Weight: 1},
+		{ID: "h", Token: "t", Enabled: true, Weight: 1},
+	}
+	seen := map[string]int{}
+	for i := 0; i < 80; i++ {
+		picked, err := Pick(candidates, "grok", "random", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen[picked.ID]++
+	}
+	if len(seen) < 3 {
+		t.Fatalf("random mode too sticky; distribution=%v", seen)
+	}
+	// round_robin must remain deterministic for this equal-weight fixture (ID order).
+	rr, err := Pick(candidates, "grok", "round_robin", now)
+	if err != nil || rr.ID != "a" {
+		t.Fatalf("round_robin want a, got %#v err=%v", rr, err)
+	}
+}

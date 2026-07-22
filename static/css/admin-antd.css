@@ -3220,9 +3220,6 @@ body.g2a-dialog-open { overflow: hidden; }
 }
 
 /* Table action cell denser */
-.g2a-table .g2a-actions {
-  /* Prefer inner wrapper; if class is on td, keep table-cell box model */
-}
 .g2a-table td.g2a-actions {
   display: table-cell;
 }

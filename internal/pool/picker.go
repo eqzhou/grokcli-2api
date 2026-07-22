@@ -2,6 +2,7 @@ package pool
 
 import (
 	"errors"
+	"math/rand"
 	"sort"
 	"strings"
 	"time"
@@ -64,7 +65,16 @@ func Chain(candidates []Candidate, model, mode string, now time.Time, max int) [
 	if len(eligible) == 0 {
 		return nil
 	}
-	sortCandidates(eligible, strings.ToLower(strings.TrimSpace(mode)))
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "random" {
+		// True uniform shuffle among eligible accounts (admin UI "random" mode).
+		// Weight-only sort previously made random identical to weighted ordering.
+		rand.Shuffle(len(eligible), func(i, j int) {
+			eligible[i], eligible[j] = eligible[j], eligible[i]
+		})
+	} else {
+		sortCandidates(eligible, mode)
+	}
 	if max <= 0 || max > len(eligible) {
 		max = len(eligible)
 	}
@@ -78,11 +88,6 @@ func sortCandidates(candidates []Candidate, mode string) {
 		case "least_used":
 			if a.RequestCount != b.RequestCount {
 				return a.RequestCount < b.RequestCount
-			}
-		case "random":
-			// Keep Go migration deterministic until parity fixtures cover random mode.
-			if a.Weight != b.Weight {
-				return a.Weight > b.Weight
 			}
 		default: // round_robin: higher weight, then least used, then stable id.
 			// Sticky is force-pinned first by callers; this only ranks the rest.
