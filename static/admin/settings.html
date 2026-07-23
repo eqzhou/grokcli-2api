@@ -315,6 +315,16 @@
       <div class="g2a-muted" style="margin-top:4px">同时探测的账号数。大号池建议 8–16。默认 12</div>
     </div>
     <div class="g2a-field">
+      <label for="set-model-health-recovery-batch">禁用账号恢复批量</label>
+      <input id="set-model-health-recovery-batch" type="number" class="g2a-input" min="1" max="100" step="1" />
+      <div class="g2a-muted" style="margin-top:4px">每轮最多验证的 disabled 账号数。默认 10</div>
+    </div>
+    <div class="g2a-field">
+      <label for="set-model-health-recovery-workers">禁用账号恢复并发</label>
+      <input id="set-model-health-recovery-workers" type="number" class="g2a-input" min="1" max="8" step="1" />
+      <div class="g2a-muted" style="margin-top:4px">真实模型＋额度联合验证并发。默认 2</div>
+    </div>
+    <div class="g2a-field">
       <label for="set-affinity-ttl">会话粘性 TTL（秒）</label>
       <input id="set-affinity-ttl" type="number" class="g2a-input" min="60" max="86400" step="1" />
       <div class="g2a-muted" style="margin-top:4px">多轮对话绑定同一账号的缓存时长；默认 7200（2h）</div>
@@ -323,6 +333,7 @@
       <label class="g2a-check"><input type="checkbox" id="set-token-maintain" /> Token 自动续期</label>
       <label class="g2a-check"><input type="checkbox" id="set-model-health" /> 模型健康探测</label>
       <label class="g2a-check"><input type="checkbox" id="set-model-health-auto-disable" /> 探测失败自动踢出/封禁</label>
+      <label class="g2a-check"><input type="checkbox" id="set-model-health-auto-recover" /> 自动恢复已验证可用的禁用账号</label>
       <label class="g2a-check"><input type="checkbox" id="set-affinity" /> 会话粘性（同对话绑同一账号）</label>
     </div>
   </div>
@@ -649,6 +660,6 @@
   <script src="/static/dist/api.1bf56e45fe.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4eb51a7835.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.616ccd2587.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.82dd5e5617.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

@@ -95,35 +95,8 @@ func (o Options) applySettingsToRuntime(settings map[string]any) {
 	if o.RuntimeConfig != nil {
 		o.RuntimeConfig.ApplyStoreSettings(settings)
 	}
-	// Hot-apply model health knobs (interval/batch/workers) without restart.
-	if o.ModelHealth != nil && settings != nil {
-		var intervalSec float64
-		var batch, workers int
-		switch v := settings["model_health_interval_sec"].(type) {
-		case float64:
-			intervalSec = v
-		case int:
-			intervalSec = float64(v)
-		case int64:
-			intervalSec = float64(v)
-		}
-		switch v := settings["model_health_probe_batch"].(type) {
-		case float64:
-			batch = int(v)
-		case int:
-			batch = v
-		case int64:
-			batch = int(v)
-		}
-		switch v := settings["model_health_probe_workers"].(type) {
-		case float64:
-			workers = int(v)
-		case int:
-			workers = v
-		case int64:
-			workers = int(v)
-		}
-		o.ModelHealth.Configure(intervalSec, batch, workers)
+	if o.ModelHealth != nil {
+		o.ModelHealth.ConfigureFromSettings(settings)
 	}
 	// History compact knobs live in historycompact package (not Config struct).
 	applyHistoryCompactSettings(settings)
@@ -7944,39 +7917,12 @@ func serveAdminAccountQuota(w http.ResponseWriter, r *http.Request, options Opti
 	if item == nil {
 		item = map[string]any{"ok": false, "account_id": aid, "error": "empty quota result"}
 	}
-	// Prefer the synthetic pool from FetchOne (live billing result) so the admin
-	// UI paints immediately. DB SaveQuotaSnapshot is already async; if a durable
-	// pool view is available and not lagging, merge cooldown flags from it.
+	// FetchOne persists synchronously. A durable view is the only authority for
+	// scheduler fields; quota synthesis must never override disabled/admin state.
 	if poolView, perr := options.Store.GetAccountPoolView(r.Context(), aid); perr == nil && poolView != nil {
-		// Keep synthetic last_quota / quota_disabled from FetchOne; only enrich
-		// non-quota fields (cooldown / blocked models) from DB.
-		synth, _ := item["pool"].(map[string]any)
-		if synth == nil {
-			synth = map[string]any{}
-			item["pool"] = synth
-		}
-		for _, k := range []string{"in_cooldown", "cooldown_until", "cooldown_code", "cooldown_model", "cooldown_reason", "blocked_models", "blocked_model_ids", "last_probe", "last_probe_status"} {
-			if v, ok := poolView[k]; ok && v != nil {
-				synth[k] = v
-				item[k] = v
-			}
-		}
-		// Prefer cooldown (new) over legacy permanent quota_disabled from DB.
-		if v, ok := poolView["pool_status"].(string); ok && (v == "cooldown" || v == "quota_disabled") {
-			if v == "quota_disabled" {
-				// Legacy rows: present as cooldown until next healthy snapshot clears them.
-				v = "cooldown"
-			}
-			synth["pool_status"] = v
-			synth["disabled_for_quota"] = false
-			synth["enabled"] = true
-			synth["in_cooldown"] = true
-			item["pool_status"] = v
-			item["disabled_for_quota"] = false
-			item["auto_disabled"] = true
-			item["pool_disabled"] = false
-			item["in_cooldown"] = true
-		}
+		poolView["last_quota"] = quotaSnapshotForPool(item)
+		item["pool"] = poolView
+		item["pool_authoritative"] = true
 	}
 	// Surface top-level fields used by frontend even when only synth pool exists.
 	if pool, _ := item["pool"].(map[string]any); pool != nil {
@@ -7998,6 +7944,20 @@ func serveAdminAccountQuota(w http.ResponseWriter, r *http.Request, options Opti
 		}
 	}
 	writeJSON(w, http.StatusOK, item)
+}
+
+func quotaSnapshotForPool(item map[string]any) map[string]any {
+	if item == nil {
+		return nil
+	}
+	out := make(map[string]any, len(item))
+	for key, value := range item {
+		if key == "pool" || key == "pool_authoritative" {
+			continue
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func serveIntegrationSettingsGet(w http.ResponseWriter, r *http.Request, options Options, key string) {
@@ -8748,7 +8708,7 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 		// Prefer live probe flags for immediate UI; enrich with DB pool if present.
 		poolView := map[string]any{
 			"id": aid, "account_id": aid, "last_probe": result,
-			"last_probe_status": probeStatus,
+			"last_probe_status": probeStatus, "pool_authoritative": false,
 		}
 		if ok {
 			poolView["probe_succeeded"] = true

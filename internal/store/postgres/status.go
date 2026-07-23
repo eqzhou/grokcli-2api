@@ -132,6 +132,7 @@ func (c *Connector) PoolSummary(ctx context.Context) (PoolSummary, error) {
 		        OR COALESCE(ap.pool_status, '') = 'quota_disabled'
 		        THEN 'quota_disabled'
 		      WHEN COALESCE(ap.enabled, true) = false
+		        OR COALESCE(ap.admin_locked, false) = true
 		        OR COALESCE(ap.pool_status, '') = 'disabled'
 		        THEN 'disabled'
 		      WHEN `+activeModelBlockSQL+`
@@ -141,7 +142,7 @@ func (c *Connector) PoolSummary(ctx context.Context) (PoolSummary, error) {
 		        THEN 'cooldown'
 		      ELSE 'live'
 		    END AS bucket,
-		    COALESCE(ap.enabled, true) AS is_enabled,
+		    (COALESCE(ap.enabled, true) AND NOT COALESCE(ap.admin_locked, false)) AS is_enabled,
 		    -- Stack depth for cool rows only (叠加×N). Floor at 1 while cooling.
 		    CASE
 		      WHEN COALESCE(ap.pool_status, '') = 'cooldown'

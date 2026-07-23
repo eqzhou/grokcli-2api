@@ -21,6 +21,7 @@ type Candidate struct {
 	ExpiresAt        *time.Time
 	Enabled          bool
 	DisabledForQuota bool
+	AdminLocked      bool
 	CooldownUntil    *time.Time
 	BlockedModels    map[string]any
 	RequestCount     int64
@@ -31,7 +32,7 @@ func (c Candidate) Eligible(model string, now time.Time) bool {
 	if strings.TrimSpace(c.ID) == "" || strings.TrimSpace(c.Token) == "" {
 		return false
 	}
-	if !c.Enabled || c.DisabledForQuota {
+	if !c.Enabled || c.DisabledForQuota || c.AdminLocked {
 		return false
 	}
 	if c.ExpiresAt != nil && !c.ExpiresAt.After(now) {

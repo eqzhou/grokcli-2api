@@ -97,7 +97,10 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 		       COALESCE(ap.pool_status, 'normal'), COALESCE(ap.cooldown_count, 0),
 		       ap.cooldown_reason, ap.cooldown_code, ap.cooldown_model,
 		       ap.cooldown_tokens_actual, ap.cooldown_tokens_limit,
-		       ap.last_probe_status, COALESCE(ap.extra, '{}'::jsonb)
+		       ap.last_probe_status, COALESCE(ap.extra, '{}'::jsonb),
+		       COALESCE(ap.admin_locked, false), ap.recovery_next_probe_at,
+		       COALESCE(ap.recovery_fail_count, 0), ap.last_recovery_probe_at,
+		       ap.last_recovery_outcome
 		FROM accounts a
 		LEFT JOIN account_pool ap ON ap.account_id = a.id ` + where + ` ORDER BY ` + orderBy + limitClause
 	rows, err := c.Pool.Query(ctx, sql, args...)
@@ -122,6 +125,10 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 		var cooldownCount *int64
 		var cooldownReason, cooldownCode, cooldownModel, lastProbeStatus *string
 		var cooldownTokensActual, cooldownTokensLimit *int64
+		var adminLocked bool
+		var recoveryNextProbeAt, lastRecoveryProbeAt *time.Time
+		var recoveryFailCount int64
+		var lastRecoveryOutcome *string
 		if err := rows.Scan(
 			&id, &email, &userID, &teamID, &payloadBytes, &expiresAt, &updatedAt,
 			&enabled, &weight, &requestCount, &successCount, &failCount,
@@ -132,6 +139,8 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 			&cooldownReason, &cooldownCode, &cooldownModel,
 			&cooldownTokensActual, &cooldownTokensLimit,
 			&lastProbeStatus, &extraBytes,
+			&adminLocked, &recoveryNextProbeAt, &recoveryFailCount,
+			&lastRecoveryProbeAt, &lastRecoveryOutcome,
 		); err != nil {
 			return AccountList{}, err
 		}
@@ -183,6 +192,8 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 		pool := map[string]any{
 			"id":                     id,
 			"enabled":                poolEnabled,
+			"admin_locked":           adminLocked,
+			"pool_authoritative":     true,
 			"weight":                 poolWeight,
 			"request_count":          int64OrZero(requestCount),
 			"success_count":          int64OrZero(successCount),
@@ -217,6 +228,10 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 			"last_renew_error":       stringFromMap(extra, "last_renew_error"),
 			"last_renew_status":      stringFromMap(extra, "last_renew_status"),
 			"last_renew_source":      stringFromMap(extra, "last_renew_source"),
+			"recovery_next_at":       unixOrNil(recoveryNextProbeAt),
+			"recovery_attempts":      recoveryFailCount,
+			"recovery_last_at":       unixOrNil(lastRecoveryProbeAt),
+			"recovery_last_outcome":  stringPtr(lastRecoveryOutcome),
 		}
 		// Promote durable plan/type from last_quota so UI/API consumers see it
 		// even without digging into _pool (survives refresh from DB).
@@ -360,7 +375,7 @@ func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
 	if status != "" {
 		expiredExpr := `((a.expires_at IS NOT NULL AND a.expires_at <= now()) OR COALESCE(ap.pool_status,'') = 'expired')`
 		quotaExpr := `(COALESCE(ap.disabled_for_quota, false) = true OR COALESCE(ap.pool_status,'') = 'quota_disabled')`
-		disabledExpr := `(COALESCE(ap.enabled, true) = false OR COALESCE(ap.pool_status,'') = 'disabled')`
+		disabledExpr := `(COALESCE(ap.enabled, true) = false OR COALESCE(ap.admin_locked, false) = true OR COALESCE(ap.pool_status,'') = 'disabled')`
 		// Sticky cool filter: pool_status='cooldown' OR wall-clock until still active.
 		// cooldown_count / status_stack are stack depth (叠加×N) for UI tip only —
 		// they must NOT put recovered accounts back into the cooldown bucket.
@@ -395,6 +410,7 @@ func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
 			OR COALESCE(ap.pool_status,'') = 'model_blocked'
 		)`
 		liveExpr := `(COALESCE(ap.enabled, true) = true
+			AND COALESCE(ap.admin_locked, false) = false
 			AND COALESCE(ap.disabled_for_quota, false) = false
 			AND NOT ` + expiredExpr + `
 			AND NOT ` + cooldownExpr + `
@@ -405,6 +421,7 @@ func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
 			clauses = append(clauses, liveExpr)
 		case "normal":
 			clauses = append(clauses, `(COALESCE(ap.enabled, true) = true
+				AND COALESCE(ap.admin_locked, false) = false
 				AND COALESCE(ap.disabled_for_quota, false) = false
 				AND NOT `+cooldownExpr+`
 				AND NOT `+expiredExpr+`
@@ -1670,7 +1687,9 @@ func (c *Connector) ListAccountAuths(ctx context.Context, limit int, onlyEnabled
 		LEFT JOIN account_pool ap ON ap.account_id = a.id
 	`
 	if onlyEnabled {
-		sql += ` WHERE COALESCE(ap.enabled, true) = true AND COALESCE(ap.disabled_for_quota, false) = false `
+		sql += ` WHERE COALESCE(ap.enabled, true) = true
+		  AND COALESCE(ap.disabled_for_quota, false) = false
+		  AND COALESCE(ap.admin_locked, false) = false `
 	}
 	sql += ` ORDER BY a.updated_at DESC LIMIT $1`
 	rows, err := c.Pool.Query(ctx, sql, limit)
@@ -1710,6 +1729,7 @@ func (c *Connector) ListAccountAuths(ctx context.Context, limit int, onlyEnabled
 // model success does not clear the account-level cooldown.
 const probeableAccountSQL = `
 		COALESCE(ap.enabled, true) = true
+		  AND COALESCE(ap.admin_locked, false) = false
 		  AND COALESCE(ap.disabled_for_quota, false) = false
 		  AND (ap.cooldown_until IS NULL OR ap.cooldown_until <= now())
 		  AND COALESCE(ap.pool_status, 'normal') NOT IN ('expired', 'disabled', 'quota_disabled')

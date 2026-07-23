@@ -44,6 +44,7 @@ func main() {
 	var leader *redis.Leader
 	var maintSvc *maintainer.Service
 	var healthSvc *modelhealth.Service
+	var quotaSvc *quota.Service
 
 	if cfg.GoAdminRead || cfg.GoAdminWrite || cfg.GoChat || cfg.GoMessages || cfg.GoResponses || cfg.GoMaintainer {
 		redisClient = redis.New(cfg.RedisURL, cfg.RedisPrefix)
@@ -81,7 +82,9 @@ func main() {
 	if store != nil {
 		oidcClient := &oidc.Client{}
 		maintSvc = maintainer.New(store, redisClient, oidcClient)
+		quotaSvc = quota.New(store, cfg.UpstreamBase)
 		healthSvc = modelhealth.New(store, redisClient, cfg.UpstreamBase, []string{cfg.DefaultModel})
+		healthSvc.Quota = quotaSvc
 		if leader != nil {
 			maintSvc.IsLeader = leader.IsLeader
 			healthSvc.IsLeader = leader.IsLeader
@@ -134,35 +137,8 @@ func main() {
 	if store != nil {
 		if settings, err := store.PublicSettings(context.Background()); err == nil {
 			runtimeCfg.ApplyStoreSettings(settings)
-			// Hot knobs for model health (interval/batch/workers) from durable settings.
 			if healthSvc != nil {
-				var intervalSec float64
-				var batch, workers int
-				switch v := settings["model_health_interval_sec"].(type) {
-				case float64:
-					intervalSec = v
-				case int:
-					intervalSec = float64(v)
-				case int64:
-					intervalSec = float64(v)
-				}
-				switch v := settings["model_health_probe_batch"].(type) {
-				case float64:
-					batch = int(v)
-				case int:
-					batch = v
-				case int64:
-					batch = int(v)
-				}
-				switch v := settings["model_health_probe_workers"].(type) {
-				case float64:
-					workers = int(v)
-				case int:
-					workers = v
-				case int64:
-					workers = int(v)
-				}
-				healthSvc.Configure(intervalSec, batch, workers)
+				healthSvc.ConfigureFromSettings(settings)
 			}
 			// History compact: admin DB settings must override env defaults for Codex long sessions.
 			{
@@ -238,7 +214,7 @@ func main() {
 		Leader:            leader,
 		Maintainer:        maintSvc,
 		ModelHealth:       healthSvc,
-		Quota:             quota.New(store, cfg.UpstreamBase),
+		Quota:             quotaSvc,
 		Config:            cfg,
 		RuntimeConfig:     &runtimeCfg,
 		RegistrationURL:   cfg.RegistrationServiceURL,

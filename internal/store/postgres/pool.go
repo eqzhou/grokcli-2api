@@ -41,7 +41,7 @@ func (c *Connector) GetPoolCandidate(ctx context.Context, accountID string) (*po
 	}
 	row := c.Pool.QueryRow(ctx, `
 		SELECT a.id, a.payload, a.email, a.user_id, a.team_id, a.expires_at,
-		       COALESCE(ap.enabled, true), COALESCE(ap.disabled_for_quota, false),
+		       COALESCE(ap.enabled, true), COALESCE(ap.disabled_for_quota, false), COALESCE(ap.admin_locked, false),
 		       ap.cooldown_until, COALESCE(ap.blocked_models, '{}'::jsonb),
 		       COALESCE(ap.request_count, 0), COALESCE(ap.weight, 1)
 		FROM accounts a
@@ -52,7 +52,7 @@ func (c *Connector) GetPoolCandidate(ctx context.Context, accountID string) (*po
 	var payloadBytes, blockedBytes []byte
 	var email, userID, teamID *string
 	var expiresAt, cooldownUntil *time.Time
-	if err := row.Scan(&candidate.ID, &payloadBytes, &email, &userID, &teamID, &expiresAt, &candidate.Enabled, &candidate.DisabledForQuota, &cooldownUntil, &blockedBytes, &candidate.RequestCount, &candidate.Weight); err != nil {
+	if err := row.Scan(&candidate.ID, &payloadBytes, &email, &userID, &teamID, &expiresAt, &candidate.Enabled, &candidate.DisabledForQuota, &candidate.AdminLocked, &cooldownUntil, &blockedBytes, &candidate.RequestCount, &candidate.Weight); err != nil {
 		return nil, err
 	}
 	payload := decodeMap(payloadBytes)
@@ -93,13 +93,14 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 
 		rows, err := c.Pool.Query(ctx, `
 			SELECT a.id, a.payload, a.email, a.user_id, a.team_id, a.expires_at,
-			       COALESCE(ap.enabled, true), COALESCE(ap.disabled_for_quota, false),
+			       COALESCE(ap.enabled, true), COALESCE(ap.disabled_for_quota, false), COALESCE(ap.admin_locked, false),
 			       ap.cooldown_until, COALESCE(ap.blocked_models, '{}'::jsonb),
 			       COALESCE(ap.request_count, 0), COALESCE(ap.weight, 1)
 			FROM accounts a
 			LEFT JOIN account_pool ap ON ap.account_id = a.id
 			WHERE COALESCE(ap.enabled, true) = true
 			  AND COALESCE(ap.disabled_for_quota, false) = false
+			  AND COALESCE(ap.admin_locked, false) = false
 			  AND (ap.cooldown_until IS NULL OR ap.cooldown_until <= now())
 			  AND (a.expires_at IS NULL OR a.expires_at > now())
 			  AND (
@@ -119,7 +120,7 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 			var payloadBytes, blockedBytes []byte
 			var email, userID, teamID *string
 			var expiresAt, cooldownUntil *time.Time
-			if err := rows.Scan(&candidate.ID, &payloadBytes, &email, &userID, &teamID, &expiresAt, &candidate.Enabled, &candidate.DisabledForQuota, &cooldownUntil, &blockedBytes, &candidate.RequestCount, &candidate.Weight); err != nil {
+			if err := rows.Scan(&candidate.ID, &payloadBytes, &email, &userID, &teamID, &expiresAt, &candidate.Enabled, &candidate.DisabledForQuota, &candidate.AdminLocked, &cooldownUntil, &blockedBytes, &candidate.RequestCount, &candidate.Weight); err != nil {
 				return nil, err
 			}
 			payload := decodeMap(payloadBytes)
@@ -479,10 +480,11 @@ func (c *Connector) SetAccountEnabled(ctx context.Context, accountID string, ena
 	}
 	if enabled {
 		_, err := c.Pool.Exec(ctx, `
-			INSERT INTO account_pool (account_id, enabled, pool_status, cooldown_count, extra, updated_at)
-			VALUES ($1, true, 'normal', 0, '{}'::jsonb, now())
+			INSERT INTO account_pool (account_id, enabled, admin_locked, pool_status, cooldown_count, extra, updated_at)
+			VALUES ($1, true, false, 'normal', 0, '{}'::jsonb, now())
 			ON CONFLICT (account_id) DO UPDATE SET
 				enabled = true,
+				admin_locked = false,
 				disabled_for_quota = false,
 				disabled_reason = NULL,
 				quota_disabled_at = NULL,
@@ -495,6 +497,9 @@ func (c *Connector) SetAccountEnabled(ctx context.Context, accountID string, ena
 				cooldown_tokens_actual = NULL,
 				cooldown_tokens_limit = NULL,
 				cooldown_count = 0,
+				recovery_next_probe_at = NULL,
+				recovery_fail_count = 0,
+				recovery_lease_until = NULL,
 				last_error = NULL,
 				pool_status = 'normal',
 				extra = (COALESCE(account_pool.extra, '{}'::jsonb) - 'status_stack' - 'cooldown_count')
@@ -506,11 +511,15 @@ func (c *Connector) SetAccountEnabled(ctx context.Context, accountID string, ena
 		}
 	} else {
 		_, err := c.Pool.Exec(ctx, `
-			INSERT INTO account_pool (account_id, enabled, pool_status, extra, updated_at)
-			VALUES ($1, false, 'disabled', '{}'::jsonb, now())
+			INSERT INTO account_pool (account_id, enabled, admin_locked, disabled_reason, pool_status, extra, updated_at)
+			VALUES ($1, false, true, '管理员停用', 'disabled', jsonb_build_object('manual_status', 'disabled'), now())
 			ON CONFLICT (account_id) DO UPDATE SET
 				enabled = false,
+				admin_locked = true,
+				disabled_reason = COALESCE(account_pool.disabled_reason, '管理员停用'),
 				pool_status = 'disabled',
+				recovery_lease_until = NULL,
+				extra = COALESCE(account_pool.extra, '{}'::jsonb) || jsonb_build_object('manual_status', 'disabled'),
 				updated_at = now()
 		`, accountID)
 		if err != nil {
@@ -701,10 +710,11 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 	switch status {
 	case "live":
 		_, err = c.Pool.Exec(ctx, `
-			INSERT INTO account_pool (account_id, enabled, pool_status, cooldown_count, extra, updated_at)
-			VALUES ($1, true, 'normal', 0, '{}'::jsonb, now())
+			INSERT INTO account_pool (account_id, enabled, admin_locked, pool_status, cooldown_count, extra, updated_at)
+			VALUES ($1, true, false, 'normal', 0, '{}'::jsonb, now())
 			ON CONFLICT (account_id) DO UPDATE SET
 				enabled = true,
+				admin_locked = false,
 				disabled_for_quota = false,
 				disabled_reason = NULL,
 				quota_disabled_at = NULL,
@@ -717,6 +727,9 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 				cooldown_tokens_actual = NULL,
 				cooldown_tokens_limit = NULL,
 				cooldown_count = 0,
+				recovery_next_probe_at = NULL,
+				recovery_fail_count = 0,
+				recovery_lease_until = NULL,
 				last_error = NULL,
 				pool_status = 'normal',
 				extra = (COALESCE(account_pool.extra, '{}'::jsonb) - 'status_stack' - 'cooldown_count' - 'token_expired_at' - 'token_expired_reason')
@@ -726,16 +739,17 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 	case "cooldown":
 		_, err = c.Pool.Exec(ctx, `
 			INSERT INTO account_pool (
-				account_id, enabled, pool_status, cooldown_until, cooldown_reason, cooldown_code,
+				account_id, enabled, admin_locked, pool_status, cooldown_until, cooldown_reason, cooldown_code,
 				cooldown_count, last_error, blocked_models, extra, updated_at
 			) VALUES (
-				$1, true, 'cooldown', $2, $3, 'manual',
+				$1, true, false, 'cooldown', $2, $3, 'manual',
 				1, $3, '{}'::jsonb,
 				jsonb_build_object('cooldown_count', 1, 'manual_status', 'cooldown', 'manual_status_reason', $3::text),
 				now()
 			)
 			ON CONFLICT (account_id) DO UPDATE SET
 				enabled = true,
+				admin_locked = false,
 				disabled_for_quota = false,
 				disabled_reason = NULL,
 				quota_disabled_at = NULL,
@@ -749,6 +763,9 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 				cooldown_tokens_actual = NULL,
 				cooldown_tokens_limit = NULL,
 				cooldown_count = COALESCE(account_pool.cooldown_count, 0) + 1,
+				recovery_next_probe_at = NULL,
+				recovery_fail_count = 0,
+				recovery_lease_until = NULL,
 				last_error = EXCLUDED.last_error,
 				extra = COALESCE(account_pool.extra, '{}'::jsonb)
 					|| jsonb_build_object('manual_status', 'cooldown', 'manual_status_reason', $3::text),
@@ -769,19 +786,23 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 		}
 		_, err = c.Pool.Exec(ctx, `
 			INSERT INTO account_pool (
-				account_id, enabled, pool_status, blocked_models, last_error, extra, updated_at
+				account_id, enabled, admin_locked, pool_status, blocked_models, last_error, extra, updated_at
 			) VALUES (
-				$1, true, 'model_blocked', $2::jsonb, $3,
+				$1, true, false, 'model_blocked', $2::jsonb, $3,
 				jsonb_build_object('manual_status', 'model_blocked', 'manual_status_reason', $3::text),
 				now()
 			)
 			ON CONFLICT (account_id) DO UPDATE SET
 				enabled = true,
+				admin_locked = false,
 				disabled_for_quota = false,
 				disabled_reason = NULL,
 				cooldown_until = NULL,
 				cooldown_reason = NULL,
 				cooldown_code = NULL,
+				recovery_next_probe_at = NULL,
+				recovery_fail_count = 0,
+				recovery_lease_until = NULL,
 				pool_status = 'model_blocked',
 				blocked_models = COALESCE(account_pool.blocked_models, '{}'::jsonb) || $2::jsonb,
 				last_error = COALESCE($3, account_pool.last_error),
@@ -792,16 +813,17 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 	case "quota_disabled":
 		_, err = c.Pool.Exec(ctx, `
 			INSERT INTO account_pool (
-				account_id, enabled, disabled_for_quota, disabled_reason, quota_disabled_at, quota_source,
+				account_id, enabled, admin_locked, disabled_for_quota, disabled_reason, quota_disabled_at, quota_source,
 				pool_status, blocked_models, cooldown_until, last_error, extra, updated_at
 			) VALUES (
-				$1, false, true, $2, now(), 'manual',
+				$1, false, true, true, $2, now(), 'manual',
 				'quota_disabled', '{}'::jsonb, NULL, $2,
 				jsonb_build_object('manual_status', 'quota_disabled', 'manual_status_reason', $2::text),
 				now()
 			)
 			ON CONFLICT (account_id) DO UPDATE SET
 				enabled = false,
+				admin_locked = true,
 				disabled_for_quota = true,
 				disabled_reason = $2,
 				quota_disabled_at = now(),
@@ -810,6 +832,7 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 				cooldown_until = NULL,
 				cooldown_reason = NULL,
 				cooldown_code = NULL,
+				recovery_lease_until = NULL,
 				pool_status = 'quota_disabled',
 				last_error = $2,
 				extra = COALESCE(account_pool.extra, '{}'::jsonb)
@@ -819,16 +842,17 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 	case "disabled":
 		_, err = c.Pool.Exec(ctx, `
 			INSERT INTO account_pool (
-				account_id, enabled, disabled_for_quota, disabled_reason, pool_status,
+				account_id, enabled, admin_locked, disabled_for_quota, disabled_reason, pool_status,
 				blocked_models, cooldown_until, last_error, extra, updated_at
 			) VALUES (
-				$1, false, false, $2, 'disabled',
+				$1, false, true, false, $2, 'disabled',
 				'{}'::jsonb, NULL, $2,
 				jsonb_build_object('manual_status', 'disabled', 'manual_status_reason', $2::text),
 				now()
 			)
 			ON CONFLICT (account_id) DO UPDATE SET
 				enabled = false,
+				admin_locked = true,
 				disabled_for_quota = false,
 				disabled_reason = $2,
 				quota_disabled_at = NULL,
@@ -837,6 +861,7 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 				cooldown_until = NULL,
 				cooldown_reason = NULL,
 				cooldown_code = NULL,
+				recovery_lease_until = NULL,
 				pool_status = 'disabled',
 				last_error = $2,
 				extra = COALESCE(account_pool.extra, '{}'::jsonb)
@@ -846,9 +871,9 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 	case "expired":
 		_, err = c.Pool.Exec(ctx, `
 			INSERT INTO account_pool (
-				account_id, enabled, pool_status, blocked_models, cooldown_until, last_error, extra, updated_at
+				account_id, enabled, admin_locked, pool_status, blocked_models, cooldown_until, last_error, extra, updated_at
 			) VALUES (
-				$1, true, 'expired', '{}'::jsonb, NULL, $2,
+				$1, true, true, 'expired', '{}'::jsonb, NULL, $2,
 				jsonb_build_object(
 					'manual_status', 'expired',
 					'manual_status_reason', $2::text,
@@ -859,11 +884,13 @@ func (c *Connector) SetAccountPoolStatus(ctx context.Context, accountID, status,
 			)
 			ON CONFLICT (account_id) DO UPDATE SET
 				enabled = true,
+				admin_locked = true,
 				disabled_for_quota = false,
 				blocked_models = '{}'::jsonb,
 				cooldown_until = NULL,
 				cooldown_reason = NULL,
 				cooldown_code = NULL,
+				recovery_lease_until = NULL,
 				pool_status = 'expired',
 				last_error = $2,
 				extra = COALESCE(account_pool.extra, '{}'::jsonb)
@@ -947,17 +974,20 @@ func (c *Connector) GetAccountPoolView(ctx context.Context, accountID string) (m
 		       ap.cooldown_tokens_actual, ap.cooldown_tokens_limit,
 		       COALESCE(ap.blocked_models, '{}'::jsonb),
 		       ap.last_quota, ap.last_probe, ap.last_probe_status,
-		       COALESCE(ap.extra, '{}'::jsonb)
+		       COALESCE(ap.extra, '{}'::jsonb), COALESCE(ap.admin_locked, false),
+		       ap.recovery_next_probe_at, COALESCE(ap.recovery_fail_count, 0),
+		       ap.recovery_lease_until, ap.last_recovery_probe_at, ap.last_recovery_outcome
 		FROM accounts a
 		LEFT JOIN account_pool ap ON ap.account_id = a.id
 		WHERE a.id = $1
 	`, accountID)
 	var id string
 	var email, userID, teamID, lastError, disabledReason, quotaSource, poolStatus *string
-	var cooldownReason, cooldownCode, cooldownModel, lastProbeStatus *string
+	var cooldownReason, cooldownCode, cooldownModel, lastProbeStatus, lastRecoveryOutcome *string
 	var expiresAt, updatedAt, lastUsedAt, cooldownUntil, quotaDisabledAt *time.Time
-	var enabled, disabledForQuota bool
-	var weight, requestCount, successCount, failCount, cooldownCount int64
+	var recoveryNextProbeAt, recoveryLeaseUntil, lastRecoveryProbeAt *time.Time
+	var enabled, disabledForQuota, adminLocked bool
+	var weight, requestCount, successCount, failCount, cooldownCount, recoveryFailCount int64
 	var cooldownTokensActual, cooldownTokensLimit *int64
 	var blockedBytes, lastQuotaBytes, lastProbeBytes, extraBytes []byte
 	if err := row.Scan(
@@ -968,6 +998,8 @@ func (c *Connector) GetAccountPoolView(ctx context.Context, accountID string) (m
 		&cooldownReason, &cooldownCode, &cooldownModel,
 		&cooldownTokensActual, &cooldownTokensLimit,
 		&blockedBytes, &lastQuotaBytes, &lastProbeBytes, &lastProbeStatus, &extraBytes,
+		&adminLocked, &recoveryNextProbeAt, &recoveryFailCount,
+		&recoveryLeaseUntil, &lastRecoveryProbeAt, &lastRecoveryOutcome,
 	); err != nil {
 		return nil, err
 	}
@@ -1000,6 +1032,8 @@ func (c *Connector) GetAccountPoolView(ctx context.Context, accountID string) (m
 		"user_id":                stringPtr(userID),
 		"team_id":                stringPtr(teamID),
 		"enabled":                enabled,
+		"admin_locked":           adminLocked,
+		"pool_authoritative":     true,
 		"weight":                 weight,
 		"request_count":          requestCount,
 		"success_count":          successCount,
@@ -1032,6 +1066,11 @@ func (c *Connector) GetAccountPoolView(ctx context.Context, accountID string) (m
 		"token_expired_reason":   stringFromMap(extra, "token_expired_reason"),
 		"expires_at":             unixOrNil(expiresAt),
 		"updated_at":             unixOrNil(updatedAt),
+		"recovery_next_at":       unixOrNil(recoveryNextProbeAt),
+		"recovery_attempts":      recoveryFailCount,
+		"recovery_lease_until":   unixOrNil(recoveryLeaseUntil),
+		"recovery_last_at":       unixOrNil(lastRecoveryProbeAt),
+		"recovery_last_outcome":  stringPtr(lastRecoveryOutcome),
 	}
 	return out, nil
 }
@@ -1051,6 +1090,7 @@ func (c *Connector) CountEnabledAccounts(ctx context.Context) (int64, error) {
 		LEFT JOIN account_pool ap ON ap.account_id = a.id
 		WHERE COALESCE(ap.enabled, true) = true
 		  AND COALESCE(ap.disabled_for_quota, false) = false
+		  AND COALESCE(ap.admin_locked, false) = false
 	`).Scan(&n)
 	return n, err
 }

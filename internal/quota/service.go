@@ -473,15 +473,17 @@ func (s *Service) persistQuotaSnapshots(snaps []quotaSnap) {
 func syntheticPoolFromQuota(accountID string, item map[string]any) map[string]any {
 	if item == nil {
 		return map[string]any{
-			"id":         accountID,
-			"account_id": accountID,
+			"id":                 accountID,
+			"account_id":         accountID,
+			"pool_authoritative": false,
 		}
 	}
 	exhausted := item["exhausted"] == true || item["auto_disabled"] == true
 	ok := item["ok"] == true && !exhausted
 	pool := map[string]any{
-		"id":         accountID,
-		"account_id": accountID,
+		"id":                 accountID,
+		"account_id":         accountID,
+		"pool_authoritative": false,
 	}
 	if exhausted {
 		// Cool into rotation-out pool; keep enabled=true so recovery paths stay simple.

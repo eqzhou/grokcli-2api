@@ -19,6 +19,7 @@ func TestCandidateEligibility(t *testing.T) {
 		{"missing token", Candidate{ID: "a", Enabled: true}, false},
 		{"disabled", Candidate{ID: "a", Token: "tok", Enabled: false}, false},
 		{"quota", Candidate{ID: "a", Token: "tok", Enabled: true, DisabledForQuota: true}, false},
+		{"admin locked", Candidate{ID: "a", Token: "tok", Enabled: true, AdminLocked: true}, false},
 		{"expired", Candidate{ID: "a", Token: "tok", Enabled: true, ExpiresAt: &past}, false},
 		{"cooldown", Candidate{ID: "a", Token: "tok", Enabled: true, CooldownUntil: &future}, false},
 		{"model blocked", Candidate{ID: "a", Token: "tok", Enabled: true, BlockedModels: map[string]any{"grok-4.5": true}}, false},

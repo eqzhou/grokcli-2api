@@ -1355,39 +1355,8 @@ function rebindPageControls() {
             if (q.auto_disabled || q.exhausted || q.disabled_for_quota) toast("该账号额度已耗尽，已进入冷却池", false);
             else if (q.ok) toast((q.display && q.display.summary) || "额度已更新");
             else toast(q.error || "额度查询失败", false);
-            // Prefer DB pool view returned after SaveQuotaSnapshot; fallback to local patch.
-            let qPatch = {};
-            if (q.pool && typeof q.pool === "object") {
-              qPatch = (typeof poolPatchFromStatusAccount === "function")
-                ? poolPatchFromStatusAccount({ pool: q.pool, _pool: q.pool })
-                : { ...(q.pool || {}) };
-              qPatch.last_quota = q;
-            } else if (typeof poolPatchFromQuotaResult === "function") {
-              qPatch = poolPatchFromQuotaResult(q) || {};
-            } else {
-              const dead = !!(q.auto_disabled || q.exhausted);
-              qPatch = {
-                last_quota: q,
-                disabled_for_quota: false,
-                enabled: true,
-                disabled_reason: null,
-                pool_status: dead ? "cooldown" : "normal",
-                in_cooldown: !!dead,
-                cooldown_reason: dead ? (q.exhaust_reason || q.error || "额度耗尽") : null,
-                cooldown_code: dead
-                  ? ((q.free_tokens || q.account_type === "free" || q.source === "free_tokens")
-                      ? "subscription:free-usage-exhausted"
-                      : "billing_quota")
-                  : null,
-              };
-              if (dead) {
-                const free = q.free_tokens || q.account_type === "free" || q.source === "free_tokens";
-                qPatch.cooldown_until = Math.floor(Date.now() / 1000) + (free ? 2 * 3600 : 6 * 3600);
-                if (q.tokens_used != null) qPatch.cooldown_tokens_actual = q.tokens_used;
-                if (q.tokens_actual != null) qPatch.cooldown_tokens_actual = q.tokens_actual;
-                if (q.tokens_limit != null) qPatch.cooldown_tokens_limit = q.tokens_limit;
-              }
-            }
+            // Pool state is accepted only when the server marks it authoritative.
+            const qPatch = poolPatchFromQuotaResult(q, currentPoolForQuotaPatch(id)) || { last_quota: q };
             if (!qPatch.last_quota) qPatch.last_quota = q;
             applyAccountLivePatch(id, { _pool: qPatch });
             // Hot-update this row only — no full accounts reload (prevents scroll jump).
@@ -1413,10 +1382,12 @@ function rebindPageControls() {
                   disabled_for_quota: false,
                   disabled_reason: null,
                   quota_disabled_at: null,
-                  quota_source: null,
-                  pool_status: "normal",
-                }
-              : { enabled: false, pool_status: "disabled" };
+				  quota_source: null,
+				  pool_status: "normal",
+				  admin_locked: false,
+				  pool_authoritative: true,
+				}
+			  : { enabled: false, pool_status: "disabled", admin_locked: true, pool_authoritative: true };
             applyAccountLivePatch(id, { _pool: enPool });
             Promise.resolve().then(() => softRefreshPoolChips({ stats: true }));
           } catch (err) {
@@ -3671,8 +3642,9 @@ function poolPatchFromProbeResponse(r) {
   const nowSec = Math.floor(Date.now() / 1000);
   // Prefer full DB pool view (after SaveLastProbe / Kick / ClearCooldown).
   let patch = {};
-  if (pool && typeof pool === "object" && Object.keys(pool).length) {
-    patch = poolPatchFromStatusAccount({ pool });
+  const poolAuthoritative = !!(pool && pool.pool_authoritative === true);
+  if (poolAuthoritative) {
+	patch = poolPatchFromStatusAccount({ pool });
   }
   // Probe handlers now also fetch quota (type + usage) for new accounts.
   // Prefer response.quota / pool.last_quota so 类型/额度 cells paint without extra click.
@@ -3757,7 +3729,7 @@ function poolPatchFromProbeResponse(r) {
       }
     }
   }
-  if (ok && (res.recovered || (pool.pool_status === "normal" && !pool.in_cooldown) || !kicked)) {
+	if (poolAuthoritative && ok && (res.recovered || (pool.pool_status === "normal" && !pool.in_cooldown) || !kicked)) {
     // Successful probe: leave cooldown only when kick did not re-apply.
     if (res.recovered || !kicked) {
       patch.in_cooldown = false;
@@ -3765,20 +3737,13 @@ function poolPatchFromProbeResponse(r) {
     }
   }
   // Fallback when backend older / no pool payload.
-  if (!r || !r.pool || !Object.keys(pool).length) {
-    if (ok) {
-      patch.in_cooldown = false;
-      patch.cooldown_count = 0;
-      patch.cooldown_until = null;
-      patch.cooldown_remaining_sec = 0;
-      patch.pool_status = patch.pool_status || "normal";
-      patch.consecutive_fails = 0;
-    } else if (
+	if (!poolAuthoritative) {
+		if (!ok && (
       res.kicked_cooldown
       || /free-usage-exhausted|free usage|subscription:free-usage|rate.?limit|429/i.test(
         String(res.error || (r && r.error) || "")
       )
-    ) {
+		)) {
       patch.in_cooldown = true;
       patch.pool_status = "cooldown";
       patch.cooldown_count = Math.max(1, Number(patch.cooldown_count || 0) || 1);
@@ -4090,7 +4055,7 @@ function currentPoolStatusKey(a, p) {
   );
   if (quotaOff) return "quota_disabled";
   if (expired) return "expired";
-  if (p.enabled === false || p.pool_status === "disabled") return "disabled";
+  if (p.admin_locked === true || p.enabled === false || p.pool_status === "disabled") return "disabled";
   if (cooling) return "cooldown";
   if (modelBlocked) return "model_blocked";
   return "live";
@@ -4106,7 +4071,9 @@ function poolPatchFromStatusAccount(acc) {
     ? p.blocked_model_ids
     : Object.keys(blocked);
   const out = {
-    enabled: p.enabled !== false && p.enabled !== 0,
+	enabled: p.enabled !== false && p.enabled !== 0,
+	admin_locked: !!p.admin_locked,
+	pool_authoritative: p.pool_authoritative === true,
     disabled_for_quota: !!p.disabled_for_quota,
     disabled_reason: p.disabled_reason ?? null,
     quota_disabled_at: p.quota_disabled_at ?? null,
@@ -4141,7 +4108,7 @@ function poolPatchFromStatusAccount(acc) {
 
 
 function poolStatusLabel(a, p) {
-  const enabled = p.enabled !== false;
+  const enabled = p.enabled !== false && p.admin_locked !== true;
   // Sticky cool only — stack depth (cooldown_count / 叠加×N) is no longer shown.
   const remain = Number(p.cooldown_remaining_sec || 0) || 0;
   const cooling = !!(
@@ -4237,51 +4204,64 @@ function fmtProbeCell(lastProbe, lastError, blockedIds) {
   return `${pill} ${model}<div class="g2a-muted">${when}</div>${err}${blocked}`;
 }
 
-function poolPatchFromQuotaResult(q) {
+function poolPatchFromQuotaResult(q, currentPool) {
   if (!q || typeof q !== "object") return null;
   const exhausted = !!(q.exhausted || q.auto_disabled);
-  const ok = !!q.ok && !exhausted;
-  const fromDB = {};
-  fromDB.last_quota = q;
-  if (exhausted) {
+  const quotaSnap = { ...q };
+  delete quotaSnap.pool;
+  delete quotaSnap.pool_authoritative;
+  const patch = { last_quota: quotaSnap };
+  const responsePool = (q.pool && typeof q.pool === "object") ? q.pool : null;
+  const authoritative = q.pool_authoritative === true || !!(
+    responsePool && (responsePool.pool_authoritative === true || responsePool.authoritative === true)
+  );
+
+  // enabled / pool_status are scheduler state, not quota-derived display fields.
+  // Accept them only when the server explicitly marks the pool snapshot authoritative.
+  if (authoritative && responsePool) {
+    const durable = { ...responsePool };
+    delete durable.pool_authoritative;
+    delete durable.authoritative;
+    delete durable.last_quota;
+    return { ...durable, last_quota: quotaSnap };
+  }
+
+  const current = (currentPool && typeof currentPool === "object") ? currentPool : {};
+  const currentStatus = String(current.pool_status || "").toLowerCase();
+  const manualStatus = String(current.manual_status || "").toLowerCase();
+  const durableDisabled = current.admin_locked === true || current.enabled === false ||
+    currentStatus === "disabled" || currentStatus === "quota_disabled" || currentStatus === "expired" ||
+    manualStatus === "disabled" || manualStatus === "quota_disabled" || manualStatus === "expired";
+
+  if (exhausted && !durableDisabled) {
     // Free/paid quota exhaust → cooldown pool (not permanent 额度禁用).
-    fromDB.disabled_for_quota = false;
-    fromDB.enabled = true;
-    fromDB.pool_status = "cooldown";
-    fromDB.in_cooldown = true;
-    fromDB.cooldown_reason = q.exhaust_reason || (q.display && q.display.summary) || q.summary || "额度已耗尽";
+    // This is a display-only fallback until an authoritative pool arrives: never
+    // invent enabled=true or clear durable quota/admin disable fields here.
+    patch.pool_status = "cooldown";
+    patch.in_cooldown = true;
+    patch.cooldown_reason = q.exhaust_reason || (q.display && q.display.summary) || q.summary || "额度已耗尽";
     const src = String(q.source || "");
     const free = q.free_tokens || q.account_type === "free" || src === "free_tokens" || src === "free";
-    fromDB.cooldown_code = free ? "subscription:free-usage-exhausted" : "billing_quota";
+    patch.cooldown_code = free ? "subscription:free-usage-exhausted" : "billing_quota";
     const coolSec = free ? 2 * 3600 : 6 * 3600;
-    fromDB.cooldown_until = Math.floor(Date.now() / 1000) + coolSec;
-    if (q.tokens_used != null) fromDB.cooldown_tokens_actual = q.tokens_used;
-    else if (q.tokens_actual != null) fromDB.cooldown_tokens_actual = q.tokens_actual;
-    if (q.tokens_limit != null) fromDB.cooldown_tokens_limit = q.tokens_limit;
-    fromDB.disabled_reason = null;
-    fromDB.quota_source = null;
-    fromDB.quota_disabled_at = null;
-  } else if (ok) {
-    fromDB.disabled_for_quota = false;
-    fromDB.enabled = true;
-    if (q.in_cooldown) {
-      fromDB.in_cooldown = true;
-      fromDB.pool_status = q.pool_status || "cooldown";
-    } else {
-      fromDB.in_cooldown = false;
-      fromDB.pool_status = q.pool_status || "normal";
-      // Clear free-usage cool when healthy.
-      if (String(q.pool_status || "") !== "cooldown") {
-        fromDB.cooldown_until = null;
-        fromDB.cooldown_code = null;
-        fromDB.cooldown_reason = null;
-      }
-    }
-    fromDB.disabled_reason = null;
-    fromDB.quota_disabled_at = null;
-    fromDB.quota_source = null;
+    patch.cooldown_until = Math.floor(Date.now() / 1000) + coolSec;
+    if (q.tokens_used != null) patch.cooldown_tokens_actual = q.tokens_used;
+    else if (q.tokens_actual != null) patch.cooldown_tokens_actual = q.tokens_actual;
+    if (q.tokens_limit != null) patch.cooldown_tokens_limit = q.tokens_limit;
   }
-  return fromDB;
+  return patch;
+}
+
+function currentPoolForQuotaPatch(accountId) {
+  const id = accountIdKey(accountId);
+  if (!id) return null;
+  const row = (accountsList || []).find((account) => account && accountIdKey(account.id) === id);
+  if (!row) return null;
+  const pool = (row._pool && typeof row._pool === "object") ? row._pool : {};
+  if (row.admin_locked === true && pool.admin_locked !== true) {
+    return { ...pool, admin_locked: true };
+  }
+  return pool;
 }
 
 
@@ -4382,6 +4362,16 @@ function mergeQuotaSnapClient(prev, next) {
     }
   }
   if (!out.account_id) out.account_id = next.account_id || prev.account_id;
+  // Pool authority is observation-scoped. Never inherit an old authoritative
+  // pool through quota-cache merging when the newest response only has quota.
+  const nextPool = (next.pool && typeof next.pool === "object") ? next.pool : null;
+  const nextPoolAuthoritative = next.pool_authoritative === true || !!(
+    nextPool && (nextPool.pool_authoritative === true || nextPool.authoritative === true)
+  );
+  if (!nextPoolAuthoritative) {
+    delete out.pool;
+    delete out.pool_authoritative;
+  }
   return out;
 }
 
@@ -4429,7 +4419,7 @@ function applyQuotaResultsToUI(rows) {
     // Drop legacy raw-key duplicate if any.
     try { if (q.id != null && accountIdKey(q.id) === id && quotaCache[q.id] && q.id !== id) delete quotaCache[q.id]; } catch (_) {}
     const patch = (typeof poolPatchFromQuotaResult === "function")
-      ? (poolPatchFromQuotaResult(merged) || {})
+      ? (poolPatchFromQuotaResult(merged, currentPoolForQuotaPatch(id)) || {})
       : { last_quota: merged };
     if (!patch.last_quota) patch.last_quota = merged;
     // Promote type to row for type column after hard refresh paths.
@@ -4705,7 +4695,7 @@ async function refreshAllQuota(force = true) {
             quotaCache[id] = q;
             if (visible.has(id)) {
               const patch = (typeof poolPatchFromQuotaResult === "function")
-                ? (poolPatchFromQuotaResult(q) || {})
+                ? (poolPatchFromQuotaResult(q, currentPoolForQuotaPatch(id)) || {})
                 : { last_quota: q };
               if (!patch.last_quota) patch.last_quota = q;
               applyAccountLivePatch(id, { _pool: patch });
@@ -8352,25 +8342,7 @@ on("accounts-tbody", "onclick", async (e) => {  // checkbox selection
         if (q.auto_disabled || q.exhausted || q.disabled_for_quota) toast("该账号额度已耗尽，已进入冷却池", false);
         else if (q.ok) toast((q.display && q.display.summary) || "额度已更新");
         else toast(q.error || "额度查询失败", false);
-        let qPatch = {};
-        if (q.pool && typeof q.pool === "object" && typeof poolPatchFromStatusAccount === "function") {
-          qPatch = poolPatchFromStatusAccount({ pool: q.pool, _pool: q.pool }) || {};
-          qPatch.last_quota = q;
-        } else if (typeof poolPatchFromQuotaResult === "function") {
-          qPatch = poolPatchFromQuotaResult(q) || {};
-        } else {
-          const dead = !!(q.auto_disabled || q.exhausted || q.disabled_for_quota);
-          qPatch = {
-            last_quota: q,
-            disabled_for_quota: dead,
-            enabled: dead ? false : true,
-            pool_status: dead ? "quota_disabled" : "normal",
-            disabled_reason: null,
-                cooldown_reason: dead ? (q.exhaust_reason || q.error || "额度耗尽") : null,
-                pool_status: dead ? "cooldown" : (qPatch.pool_status || "normal"),
-                in_cooldown: !!dead,
-          };
-        }
+        const qPatch = poolPatchFromQuotaResult(q, currentPoolForQuotaPatch(id)) || { last_quota: q };
         if (!qPatch.last_quota) qPatch.last_quota = q;
         // Hot-update ONLY this account row — never rewrite the whole pool list.
         applyAccountLivePatch(id, { _pool: qPatch });
@@ -8395,10 +8367,12 @@ on("accounts-tbody", "onclick", async (e) => {  // checkbox selection
                   disabled_for_quota: false,
                   disabled_reason: null,
                   quota_disabled_at: null,
-                  quota_source: null,
-                  pool_status: "normal",
-                }
-              : { enabled: false, pool_status: "disabled" };
+				  quota_source: null,
+				  pool_status: "normal",
+				  admin_locked: false,
+				  pool_authoritative: true,
+				}
+			  : { enabled: false, pool_status: "disabled", admin_locked: true, pool_authoritative: true };
             applyAccountLivePatch(id, { _pool: enPool });
             Promise.resolve().then(() => softRefreshPoolChips({ stats: true }));
           } catch (err) {
@@ -10121,6 +10095,9 @@ function fillSystemSettingsForm(s) {
   if ($("set-model-health-auto-disable")) {
     $("set-model-health-auto-disable").checked = s.model_health_auto_disable !== false;
   }
+  if ($("set-model-health-auto-recover")) {
+    $("set-model-health-auto-recover").checked = s.model_health_auto_recover === true;
+  }
   if ($("set-affinity")) $("set-affinity").checked = s.conversation_affinity_enabled !== false;
   if ($("set-token-maintain-interval") && s.token_maintain_interval_sec != null) {
     $("set-token-maintain-interval").value = s.token_maintain_interval_sec;
@@ -10136,6 +10113,12 @@ function fillSystemSettingsForm(s) {
   }
   if ($("set-model-health-workers") && s.model_health_probe_workers != null) {
     $("set-model-health-workers").value = s.model_health_probe_workers;
+  }
+  if ($("set-model-health-recovery-batch") && s.model_health_recovery_batch != null) {
+    $("set-model-health-recovery-batch").value = s.model_health_recovery_batch;
+  }
+  if ($("set-model-health-recovery-workers") && s.model_health_recovery_workers != null) {
+    $("set-model-health-recovery-workers").value = s.model_health_recovery_workers;
   }
   if ($("set-affinity-ttl") && s.conversation_affinity_ttl_sec != null) {
     $("set-affinity-ttl").value = s.conversation_affinity_ttl_sec;
@@ -10270,6 +10253,9 @@ function collectSystemSettingsPatch(groups) {
     if ($("set-model-health-auto-disable")) {
       patch.model_health_auto_disable = !!$("set-model-health-auto-disable").checked;
     }
+    if ($("set-model-health-auto-recover")) {
+      patch.model_health_auto_recover = !!$("set-model-health-auto-recover").checked;
+    }
     if ($("set-affinity")) patch.conversation_affinity_enabled = !!$("set-affinity").checked;
     if ($("set-token-maintain-interval") && $("set-token-maintain-interval").value !== "") {
       patch.token_maintain_interval_sec = Number($("set-token-maintain-interval").value);
@@ -10285,6 +10271,12 @@ function collectSystemSettingsPatch(groups) {
     }
     if ($("set-model-health-workers") && $("set-model-health-workers").value !== "") {
       patch.model_health_probe_workers = Number($("set-model-health-workers").value);
+    }
+    if ($("set-model-health-recovery-batch") && $("set-model-health-recovery-batch").value !== "") {
+      patch.model_health_recovery_batch = Number($("set-model-health-recovery-batch").value);
+    }
+    if ($("set-model-health-recovery-workers") && $("set-model-health-recovery-workers").value !== "") {
+      patch.model_health_recovery_workers = Number($("set-model-health-recovery-workers").value);
     }
     if ($("set-affinity-ttl") && $("set-affinity-ttl").value !== "") {
       patch.conversation_affinity_ttl_sec = Number($("set-affinity-ttl").value);
@@ -10507,12 +10499,15 @@ function settingsGroupDefaults(group) {
         token_maintain_enabled: true,
         model_health_enabled: true,
         model_health_auto_disable: true,
+		model_health_auto_recover: false,
         conversation_affinity_enabled: true,
         token_maintain_interval_sec: 90,
         token_refresh_skew_sec: 120,
         model_health_interval_sec: 180,
         model_health_probe_batch: 120,
         model_health_probe_workers: 12,
+		model_health_recovery_batch: 10,
+		model_health_recovery_workers: 2,
         conversation_affinity_ttl_sec: 7200,
         probe_models: "grok-4.5",
       };
@@ -10581,12 +10576,15 @@ function applySettingsGroupDefaults(group) {
     if ($("set-token-maintain")) $("set-token-maintain").checked = d.token_maintain_enabled;
     if ($("set-model-health")) $("set-model-health").checked = d.model_health_enabled;
     if ($("set-model-health-auto-disable")) $("set-model-health-auto-disable").checked = d.model_health_auto_disable;
+	if ($("set-model-health-auto-recover")) $("set-model-health-auto-recover").checked = d.model_health_auto_recover;
     if ($("set-affinity")) $("set-affinity").checked = d.conversation_affinity_enabled;
     if ($("set-token-maintain-interval")) $("set-token-maintain-interval").value = d.token_maintain_interval_sec;
     if ($("set-token-refresh-skew")) $("set-token-refresh-skew").value = d.token_refresh_skew_sec;
     if ($("set-model-health-interval")) $("set-model-health-interval").value = d.model_health_interval_sec;
     if ($("set-model-health-batch")) $("set-model-health-batch").value = d.model_health_probe_batch;
     if ($("set-model-health-workers")) $("set-model-health-workers").value = d.model_health_probe_workers;
+	if ($("set-model-health-recovery-batch")) $("set-model-health-recovery-batch").value = d.model_health_recovery_batch;
+	if ($("set-model-health-recovery-workers")) $("set-model-health-recovery-workers").value = d.model_health_recovery_workers;
     if ($("set-affinity-ttl")) $("set-affinity-ttl").value = d.conversation_affinity_ttl_sec;
     if ($("set-probe-models")) $("set-probe-models").value = d.probe_models;
   } else if (group === "proxy") {

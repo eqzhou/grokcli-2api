@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/pool"
+	quotasvc "github.com/hm2899/grokcli-2api/internal/quota"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
@@ -41,6 +42,7 @@ const (
 
 type Service struct {
 	Store               *postgres.Connector
+	Quota               *quotasvc.Service
 	Redis               *redis.Client
 	Upstream            string
 	Models              []string
@@ -52,6 +54,9 @@ type Service struct {
 	ManualCycleBudget   time.Duration
 	ManualMaxWaves      int
 	AutoDisable         bool
+	AutoRecover         bool
+	RecoveryBatch       int
+	RecoveryWorkers     int
 	Enabled             func() bool
 	IsLeader            func() bool
 
@@ -100,6 +105,9 @@ func New(store *postgres.Connector, redisClient *redis.Client, upstream string, 
 		CycleBudget:         envDurationSec("GROK2API_MODEL_PROBE_CYCLE_BUDGET", defaultCycleBudget, 15*time.Second, 4*time.Minute),
 		ManualCycleBudget:   envDurationSec("GROK2API_MODEL_PROBE_MANUAL_BUDGET", defaultManualCycleBudget, 30*time.Second, 4*time.Minute),
 		AutoDisable:         true,
+		AutoRecover:         false,
+		RecoveryBatch:       10,
+		RecoveryWorkers:     2,
 		ManualMaxWaves:      envInt("GROK2API_MODEL_PROBE_MANUAL_MAX_WAVES", defaultManualMaxWaves, 1, 200),
 		Enabled:             func() bool { return true },
 		IsLeader:            func() bool { return true },
@@ -137,6 +145,138 @@ func (s *Service) Configure(intervalSec float64, batch, workers int) {
 			workers = 64
 		}
 		s.Workers = workers
+	}
+}
+
+// ConfigureRuntime hot-applies state-changing health policy. Pointer booleans
+// distinguish an omitted setting from an explicit false value.
+func (s *Service) ConfigureRuntime(autoDisable, autoRecover *bool, recoveryBatch, recoveryWorkers int, models []string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if autoDisable != nil {
+		s.AutoDisable = *autoDisable
+	}
+	if autoRecover != nil {
+		s.AutoRecover = *autoRecover
+	}
+	if recoveryBatch > 0 {
+		if recoveryBatch > 100 {
+			recoveryBatch = 100
+		}
+		s.RecoveryBatch = recoveryBatch
+	}
+	if recoveryWorkers > 0 {
+		if recoveryWorkers > 8 {
+			recoveryWorkers = 8
+		}
+		s.RecoveryWorkers = recoveryWorkers
+	}
+	if normalized := normalizeModels(models); len(normalized) > 0 {
+		s.Models = normalized
+		if s.modelRR >= len(normalized) {
+			s.modelRR = 0
+		}
+	}
+}
+
+func (s *Service) ConfigureFromSettings(settings map[string]any) {
+	if s == nil || settings == nil {
+		return
+	}
+	intervalSec, _ := settingFloat(settings["model_health_interval_sec"])
+	batch, _ := settingInt(settings["model_health_probe_batch"])
+	workers, _ := settingInt(settings["model_health_probe_workers"])
+	s.Configure(intervalSec, batch, workers)
+
+	var autoDisable, autoRecover *bool
+	if value, ok := settings["model_health_auto_disable"].(bool); ok {
+		autoDisable = &value
+	}
+	if value, ok := settings["model_health_auto_recover"].(bool); ok {
+		autoRecover = &value
+	}
+	recoveryBatch, _ := settingInt(settings["model_health_recovery_batch"])
+	recoveryWorkers, _ := settingInt(settings["model_health_recovery_workers"])
+	models := settingStrings(settings["probe_models"])
+	s.ConfigureRuntime(autoDisable, autoRecover, recoveryBatch, recoveryWorkers, models)
+}
+
+func (s *Service) autoDisableEnabled() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.AutoDisable
+}
+
+func (s *Service) configuredInterval() time.Duration {
+	if s == nil {
+		return 3 * time.Minute
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Interval
+}
+
+func (s *Service) firstConfiguredModel() string {
+	if s == nil {
+		return "grok-4.5"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Models) > 0 && strings.TrimSpace(s.Models[0]) != "" {
+		return s.Models[0]
+	}
+	return "grok-4.5"
+}
+
+func (s *Service) configuredModels() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string{}, s.Models...)
+}
+
+func settingFloat(value any) (float64, bool) {
+	switch number := value.(type) {
+	case float64:
+		return number, true
+	case int:
+		return float64(number), true
+	case int64:
+		return float64(number), true
+	default:
+		return 0, false
+	}
+}
+
+func settingInt(value any) (int, bool) {
+	number, ok := settingFloat(value)
+	return int(number), ok
+}
+
+func settingStrings(value any) []string {
+	switch list := value.(type) {
+	case []string:
+		return append([]string{}, list...)
+	case []any:
+		out := make([]string, 0, len(list))
+		for _, item := range list {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	case string:
+		return strings.Split(list, ",")
+	default:
+		return nil
 	}
 }
 
@@ -262,6 +402,10 @@ func (s *Service) Status() map[string]any {
 	batch := s.Batch
 	workers := s.Workers
 	models := append([]string{}, s.Models...)
+	autoDisable := s.AutoDisable
+	autoRecover := s.AutoRecover
+	recoveryBatch := s.RecoveryBatch
+	recoveryWorkers := s.RecoveryWorkers
 	s.mu.Unlock()
 
 	enabled := s.Enabled == nil || s.Enabled()
@@ -285,23 +429,27 @@ func (s *Service) Status() map[string]any {
 	}
 
 	out := map[string]any{
-		"enabled":         enabled,
-		"started":         started,
-		"running":         running,
-		"local_running":   running,
-		"cluster_running": running,
-		"leader_running":  running,
-		"implementation":  "go",
-		"interval_sec":    interval.Seconds(),
-		"probe_batch":     batch,
-		"batch":           batch,
-		"probe_workers":   workers,
-		"workers":         workers,
-		"models":          models,
-		"probe_models":    models,
-		"is_leader":       isLeader,
-		"last":            lastCopy,
-		"selection":       "strict_sweep",
+		"enabled":          enabled,
+		"started":          started,
+		"running":          running,
+		"local_running":    running,
+		"cluster_running":  running,
+		"leader_running":   running,
+		"implementation":   "go",
+		"interval_sec":     interval.Seconds(),
+		"probe_batch":      batch,
+		"batch":            batch,
+		"probe_workers":    workers,
+		"workers":          workers,
+		"models":           models,
+		"probe_models":     models,
+		"auto_disable":     autoDisable,
+		"auto_recover":     autoRecover,
+		"recovery_batch":   recoveryBatch,
+		"recovery_workers": recoveryWorkers,
+		"is_leader":        isLeader,
+		"last":             lastCopy,
+		"selection":        "strict_sweep",
 	}
 	s.jobMu.Lock()
 	jobCopy := map[string]any{}
@@ -353,7 +501,7 @@ func (s *Service) loop(ctx context.Context, stop <-chan struct{}, done chan stru
 			return
 		case <-timer.C:
 			s.maybeRun(ctx)
-			timer.Reset(s.Interval)
+			timer.Reset(s.configuredInterval())
 		case <-s.runSoon:
 			s.maybeRun(ctx)
 			if !timer.Stop() {
@@ -362,7 +510,7 @@ func (s *Service) loop(ctx context.Context, stop <-chan struct{}, done chan stru
 				default:
 				}
 			}
-			timer.Reset(s.Interval)
+			timer.Reset(s.configuredInterval())
 		}
 	}
 }
@@ -704,7 +852,7 @@ func (s *Service) runManualAll(ctx context.Context, source string) map[string]an
 	result["recovered"] = recovered
 	result["failed_sample"] = samples
 	result["models"] = lastModels
-	result["models_configured"] = append([]string{}, s.Models...)
+	result["models_configured"] = s.configuredModels()
 	if len(lastModels) > 0 {
 		result["model"] = lastModels[0]
 	}
@@ -842,11 +990,12 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool, s
 		}
 	}
 
-	batch := s.Batch
+	_, configuredBatch, configuredWorkers := s.Knobs()
+	batch := configuredBatch
 	if batch <= 0 {
 		batch = defaultBatch
 	}
-	workersHint := s.Workers
+	workersHint := configuredWorkers
 	if workersHint <= 0 {
 		workersHint = defaultWorkers
 	}
@@ -926,9 +1075,6 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool, s
 		auths, err = s.Store.ListAccountAuthsForProbe(ctx, fetchLimit)
 	}
 	if err != nil {
-		auths, err = s.Store.ListAccountAuths(ctx, fetchLimit, true)
-	}
-	if err != nil {
 		result["ok"] = false
 		result["error"] = err.Error()
 		return result
@@ -947,7 +1093,7 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool, s
 		cycleModels = []string{"grok-4.5"}
 	}
 
-	workers := s.Workers
+	workers := configuredWorkers
 	if workers <= 0 {
 		workers = defaultWorkers
 	}
@@ -1081,7 +1227,7 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool, s
 	result["failed_sample"] = samples
 	result["model"] = cycleModels[0]
 	result["models"] = append([]string{}, cycleModels...)
-	result["models_configured"] = append([]string{}, s.Models...)
+	result["models_configured"] = s.configuredModels()
 	result["models_per_account"] = len(cycleModels)
 	result["workers"] = workers
 	result["budget_sec"] = budget.Seconds()
@@ -1098,9 +1244,22 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool, s
 	if rem, ok := sweepInfo["sweep_remaining"].(int); ok && rem > 0 {
 		result["deferred"] = rem
 	}
+	if !manualWave && source == "background" {
+		recovery := s.runRecoveryLane(ctx, cycleModels[0])
+		result["recovery"] = recovery
+		result["recovery_checked"] = recovery.Checked
+		result["recovered"] = recovered + recovery.Recovered
+		result["account_recovered"] = recovery.Recovered
+		result["recovery_exhausted"] = recovery.Exhausted
+		result["recovery_inconclusive"] = recovery.Inconclusive
+		result["recovery_cas_conflicts"] = recovery.Conflicts
+		result["recovery_protected"] = recovery.Protected
+	}
 	slog.Info("model health wave",
 		"probed", len(auths), "probes", len(probes),
 		"available", available, "failed", failed, "inconclusive", inconclusive,
+		"recovery_checked", result["recovery_checked"], "account_recovered", result["account_recovered"],
+		"recovery_exhausted", result["recovery_exhausted"], "recovery_conflicts", result["recovery_cas_conflicts"],
 		"models", cycleModels, "workers", workers, "budget_hit", budgetHit,
 		"source", source, "elapsed_ms", time.Since(startedAt).Milliseconds(),
 	)
@@ -1140,7 +1299,7 @@ func (s *Service) probeAccountsConcurrent(ctx context.Context, auths []postgres.
 			}
 			// Models for one account stay sequential so one bad model cannot
 			// multiply concurrent load for the same token (Python parity).
-			autoDisable := s.AutoDisable
+			autoDisable := s.autoDisableEnabled()
 			for _, model := range models {
 				if ctx.Err() != nil {
 					break
@@ -1218,12 +1377,20 @@ func (s *Service) probeAccountsConcurrent(ctx context.Context, auths []postgres.
 }
 
 func (s *Service) ProbeAccount(ctx context.Context, auth postgres.AccountAuth, model, source string) map[string]any {
-	return s.probeAccount(ctx, auth, model, source, s.AutoDisable, false)
+	return s.probeAccount(ctx, auth, model, source, s.autoDisableEnabled(), false)
 }
 
 func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, model, source string, autoDisable bool, deferSave bool) map[string]any {
-	if model == "" && len(s.Models) > 0 {
-		model = s.Models[0]
+	return s.probeAccountMode(ctx, auth, model, source, autoDisable, deferSave, false)
+}
+
+func (s *Service) observeRecoveryModel(ctx context.Context, auth postgres.AccountAuth, model string) map[string]any {
+	return s.probeAccountMode(ctx, auth, model, "auto_recovery", false, true, true)
+}
+
+func (s *Service) probeAccountMode(ctx context.Context, auth postgres.AccountAuth, model, source string, autoDisable bool, deferSave bool, observeOnly bool) map[string]any {
+	if model == "" {
+		model = s.firstConfiguredModel()
 	}
 	started := time.Now()
 	base := map[string]any{
@@ -1282,7 +1449,7 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 
 			switch {
 			case status == 401 || status == 403:
-				if _, e := s.Store.SetAccountEnabled(ctx, auth.ID, false); e == nil {
+				if _, e := s.Store.DisableAccountRecoverable(ctx, auth.ID, errText, "model_health"); e == nil {
 					base["auto_disabled"] = true
 				}
 			case isFreeUsageExhausted(errText) || status == 429:
@@ -1342,6 +1509,7 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 		}
 		return base
 	}
+	base["rate_limit_headers"] = recoveryRateHeaders(resp.Header)
 	streamResult := classifyProbeStream(resp.Body)
 	_ = resp.Body.Close()
 	base["outcome"] = string(streamResult.Outcome)
@@ -1349,6 +1517,7 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 		probeSuccess: "ok", probeFailure: "fail", probeInconclusive: "inconclusive",
 	}[streamResult.Outcome]
 	base["has_output_text"] = streamResult.Text != ""
+	base["output_text"] = truncateProbeText(streamResult.Text, 200)
 	base["terminal_event"] = truncateProbeText(streamResult.Terminal, 200)
 	base["status_code"] = resp.StatusCode
 	base["latency_ms"] = time.Since(started).Milliseconds()
@@ -1419,7 +1588,7 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 	}
 	base["ok"] = true
 	base["available"] = true
-	if s.Store != nil {
+	if s.Store != nil && !observeOnly {
 		// A model probe may only recover that model. Account-level quota/free-usage
 		// cooldown is independent and must remain authoritative.
 		if model != "" {
@@ -1452,7 +1621,7 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 		resolvedList = append(resolvedList, resolved{id: id, auth: auth, err: err})
 	}
 
-	workers := s.Workers
+	_, _, workers := s.Knobs()
 	if workers <= 0 {
 		workers = defaultWorkers
 	}
@@ -1464,7 +1633,7 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 	jobs := make(chan int, workers*2)
 	var wg sync.WaitGroup
 
-	probeModel := firstNonEmpty(model, firstModel(s.Models))
+	probeModel := firstNonEmpty(model, s.firstConfiguredModel())
 	workerFn := func() {
 		defer wg.Done()
 		for i := range jobs {
@@ -1729,7 +1898,7 @@ func (s *Service) sweepSnapshot(liveN int) (covered int, gen int64, mode string)
 
 func (s *Service) sweepTTLSec() int {
 	// Keep at least 6h, or ~3× full estimated coverage window (Python parity).
-	interval := s.Interval
+	interval := s.configuredInterval()
 	if interval <= 0 {
 		interval = 15 * time.Minute
 	}

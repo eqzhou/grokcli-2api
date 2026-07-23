@@ -293,3 +293,22 @@ func TestStartProbeAllAlreadyRunning(t *testing.T) {
 		t.Fatalf("expected already_running: %#v", out)
 	}
 }
+
+func TestConfigureRuntimeAppliesRecoveryAndProbeSettings(t *testing.T) {
+	s := New(nil, nil, "http://example.invalid", []string{"old-model"})
+	autoDisable := false
+	autoRecover := true
+	s.ConfigureRuntime(&autoDisable, &autoRecover, 10, 2, []string{"grok-4.5", "grok-4"})
+
+	status := s.Status()
+	if status["auto_disable"] != false || status["auto_recover"] != true {
+		t.Fatalf("runtime flags not applied: %#v", status)
+	}
+	if status["recovery_batch"] != 10 || status["recovery_workers"] != 2 {
+		t.Fatalf("recovery knobs not applied: %#v", status)
+	}
+	models, _ := status["models"].([]string)
+	if len(models) != 2 || models[0] != "grok-4.5" || models[1] != "grok-4" {
+		t.Fatalf("probe models not applied: %#v", status["models"])
+	}
+}
