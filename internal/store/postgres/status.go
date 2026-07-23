@@ -222,9 +222,9 @@ const freeUsageSignalSQL = `
 )
 `
 
-// RepairFreeUsageModelBlocks moves free-usage mis-tagged "模型封禁" rows back into
-// the cooldown pool, AND re-applies cooldown for recent free-usage probe/request
-// failures that only saved last_probe/last_error without cooldown_until.
+// RepairFreeUsageModelBlocks moves free-usage-signaled rows into the cooldown
+// pool without removing any model blocks, and re-applies cooldown for recent
+// free-usage failures that only saved last_probe/last_error.
 // Returns total account_pool rows updated across both repairs.
 func (c *Connector) RepairFreeUsageModelBlocks(ctx context.Context) (int64, error) {
 	if c == nil || c.Pool == nil {
@@ -232,11 +232,11 @@ func (c *Connector) RepairFreeUsageModelBlocks(ctx context.Context) (int64, erro
 	}
 	var total int64
 
-	// 1) Mis-tagged model_blocked free-usage → durable cooldown only.
+	// 1) Free-usage signal → durable cooldown. Preserve blocked_models:
+	// only a strong model probe may remove a model block.
 	tag, err := c.Pool.Exec(ctx, `
 		UPDATE account_pool ap
 		SET
-		  blocked_models = '{}'::jsonb,
 		  cooldown_until = CASE
 		    WHEN ap.cooldown_until IS NOT NULL AND ap.cooldown_until > now() THEN ap.cooldown_until
 		    ELSE now() + interval '2 hours'
@@ -275,7 +275,6 @@ func (c *Connector) RepairFreeUsageModelBlocks(ctx context.Context) (int64, erro
 	tag2, err := c.Pool.Exec(ctx, `
 		UPDATE account_pool ap
 		SET
-		  blocked_models = '{}'::jsonb,
 		  cooldown_until = now() + interval '2 hours',
 		  cooldown_reason = COALESCE(
 		    NULLIF(btrim(ap.cooldown_reason), ''),
@@ -368,7 +367,8 @@ func (c *Connector) RepairFreeUsageModelBlocks(ctx context.Context) (int64, erro
 		  AND (ap.cooldown_until IS NULL OR ap.cooldown_until <= now())
 	`)
 	// 5) Intentionally NOT auto-clearing pool_status='cooldown' when until expires.
-	// Sticky cool exits only via ClearAccountCooldown / successful probe or model call.
+	// Sticky cool exits only via an explicit cooldown recovery path; model probes
+	// are model-scoped and never clear account-level quota/free cooldown.
 
 	if total > 0 {
 		c.InvalidateCandidateCache()

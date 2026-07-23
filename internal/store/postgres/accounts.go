@@ -164,7 +164,7 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 			rawStatus = strings.TrimSpace(*poolStatus)
 		}
 		// Sticky cool: pool_status='cooldown' OR until still active.
-		// Expiry of until alone does NOT exit cool — needs successful probe/call.
+		// Expiry of until alone does NOT exit cool — needs explicit recovery or a real successful call.
 		untilActive := cdRemain > 0
 		inCooldown := rawStatus == "cooldown" || untilActive
 		if inCooldown {
@@ -1706,8 +1706,8 @@ func (c *Connector) ListAccountAuths(ctx context.Context, limit int, onlyEnabled
 
 // probeableAccountSQL is the shared WHERE for List/Count probe candidates.
 // Sticky cool with expired until remains probeable (recovery). Active until is skipped.
-// pool_status=cooldown alone (until elapsed) is intentionally included so "全部模型探测"
-// can clear sticky cool by a successful probe.
+// pool_status=cooldown alone (until elapsed) remains probeable for observability;
+// model success does not clear the account-level cooldown.
 const probeableAccountSQL = `
 		COALESCE(ap.enabled, true) = true
 		  AND COALESCE(ap.disabled_for_quota, false) = false
@@ -1866,10 +1866,7 @@ func (c *Connector) saveLastProbesChunk(ctx context.Context, probes []map[string
 		if err != nil {
 			continue
 		}
-		status := "ok"
-		if ok, _ := probe["available"].(bool); !ok {
-			status = "fail"
-		}
+		status := lastProbeStatus(probe)
 		ids = append(ids, aid)
 		payloads = append(payloads, raw)
 		statuses = append(statuses, status)
@@ -1910,10 +1907,7 @@ func (c *Connector) SaveLastProbe(ctx context.Context, accountID string, probe m
 	if err != nil {
 		return err
 	}
-	status := "ok"
-	if ok, _ := probe["available"].(bool); !ok {
-		status = "fail"
-	}
+	status := lastProbeStatus(probe)
 	_, err = c.Pool.Exec(ctx, `
 		INSERT INTO account_pool (account_id, last_probe, last_probe_status, extra, updated_at)
 		VALUES ($1, $2::jsonb, $3, '{}'::jsonb, now())
@@ -1923,6 +1917,36 @@ func (c *Connector) SaveLastProbe(ctx context.Context, accountID string, probe m
 			updated_at = now()
 	`, accountID, payload, status)
 	return err
+}
+
+func lastProbeStatus(probe map[string]any) string {
+	if probe == nil {
+		return "fail"
+	}
+	if status, _ := probe["probe_status"].(string); strings.TrimSpace(status) != "" {
+		switch strings.ToLower(strings.TrimSpace(status)) {
+		case "ok", "success":
+			return "ok"
+		case "fail", "failure":
+			return "fail"
+		case "inconclusive":
+			return "inconclusive"
+		}
+	}
+	if outcome, _ := probe["outcome"].(string); strings.TrimSpace(outcome) != "" {
+		switch strings.ToLower(strings.TrimSpace(outcome)) {
+		case "success":
+			return "ok"
+		case "failure":
+			return "fail"
+		case "inconclusive":
+			return "inconclusive"
+		}
+	}
+	if ok, _ := probe["available"].(bool); ok {
+		return "ok"
+	}
+	return "fail"
 }
 
 // ExpireDueCooldowns clears finished cooldowns so accounts re-enter rotation.
@@ -2138,6 +2162,9 @@ func (c *Connector) SaveQuotaSnapshot(ctx context.Context, accountID string, quo
 		return nil, nil
 	}
 	snap := compactQuotaSnapshot(accountID, quota)
+	// State transitions must use only this observation. The merged snapshot below
+	// is display/history data and may intentionally retain a previous ok=true.
+	observedExhausted, observedOK := quotaObservationState(snap)
 	// Merge with prior durable snapshot: a failed live probe must not wipe type/usage.
 	prev := c.loadLastQuota(ctx, accountID)
 	if len(prev) > 0 {
@@ -2155,8 +2182,8 @@ func (c *Connector) SaveQuotaSnapshot(ctx context.Context, accountID string, quo
 	if err != nil {
 		return nil, err
 	}
-	exhausted := truthyAny(snap["exhausted"]) || truthyAny(snap["auto_disabled"])
-	ok := truthyAny(snap["ok"]) && !exhausted
+	exhausted := observedExhausted
+	ok := observedOK
 	reason := firstNonEmptyString(
 		stringFromAny(snap["exhaust_reason"]),
 		stringFromAny(snap["summary"]),
@@ -2197,19 +2224,16 @@ func (c *Connector) SaveQuotaSnapshot(ctx context.Context, accountID string, quo
 			)
 			ON CONFLICT (account_id) DO UPDATE SET
 				last_quota = EXCLUDED.last_quota,
-				-- Leave permanent admin disables alone; only clear auto quota_disabled.
-				enabled = CASE
-					WHEN account_pool.disabled_for_quota = true THEN true
-					ELSE account_pool.enabled
+				enabled = account_pool.enabled,
+				disabled_for_quota = account_pool.disabled_for_quota,
+				disabled_reason = account_pool.disabled_reason,
+				quota_disabled_at = account_pool.quota_disabled_at,
+				quota_source = account_pool.quota_source,
+				pool_status = CASE
+					WHEN account_pool.disabled_for_quota = true THEN 'quota_disabled'
+					WHEN account_pool.enabled = false THEN 'disabled'
+					ELSE 'cooldown'
 				END,
-				disabled_for_quota = false,
-				disabled_reason = CASE
-					WHEN account_pool.disabled_for_quota = true THEN NULL
-					ELSE account_pool.disabled_reason
-				END,
-				quota_disabled_at = NULL,
-				quota_source = NULL,
-				pool_status = 'cooldown',
 				last_error = EXCLUDED.last_error,
 				cooldown_until = GREATEST(
 					COALESCE(account_pool.cooldown_until, now()),
@@ -2220,11 +2244,7 @@ func (c *Connector) SaveQuotaSnapshot(ctx context.Context, accountID string, quo
 				cooldown_code = EXCLUDED.cooldown_code,
 				cooldown_tokens_actual = COALESCE(EXCLUDED.cooldown_tokens_actual, account_pool.cooldown_tokens_actual),
 				cooldown_tokens_limit = COALESCE(EXCLUDED.cooldown_tokens_limit, account_pool.cooldown_tokens_limit),
-				-- free-usage cool is account-wide; drop model soft-blocks so UI shows 冷却中 not 模型封禁
-				blocked_models = CASE
-					WHEN $4::text LIKE '%free-usage%' OR $4::text LIKE '%free_usage%' OR $8::text IN ('free_tokens','free')
-					THEN '{}'::jsonb ELSE COALESCE(account_pool.blocked_models, '{}'::jsonb)
-				END,
+				blocked_models = COALESCE(account_pool.blocked_models, '{}'::jsonb),
 				extra = COALESCE(account_pool.extra, '{}'::jsonb) || jsonb_build_object('quota_cool_source', $8::text),
 				updated_at = now()
 		`, accountID, payload, reason, coolCode, fmt.Sprintf("%d", coolSec), tokActual, tokLimit, source)
@@ -2244,25 +2264,34 @@ func (c *Connector) SaveQuotaSnapshot(ctx context.Context, accountID string, quo
 				last_quota = EXCLUDED.last_quota,
 				enabled = CASE
 					WHEN account_pool.disabled_for_quota = true
-					  OR COALESCE(account_pool.quota_source, '') IN ('billing','upstream_error','model_health','quota','free_tokens','free')
-					  OR (account_pool.enabled = false AND COALESCE(account_pool.disabled_reason, '') LIKE '%额度%')
+					 AND COALESCE(account_pool.quota_source, '') IN ('','billing','quota','free_tokens','free')
 					THEN true ELSE account_pool.enabled
 				END,
-				disabled_for_quota = false,
+				disabled_for_quota = CASE
+					WHEN account_pool.disabled_for_quota = true
+					 AND COALESCE(account_pool.quota_source, '') IN ('','billing','quota','free_tokens','free')
+					THEN false ELSE account_pool.disabled_for_quota
+				END,
 				disabled_reason = CASE
 					WHEN account_pool.disabled_for_quota = true
-					  OR COALESCE(account_pool.quota_source, '') IN ('billing','upstream_error','model_health','quota','free_tokens','free')
-					  OR (account_pool.enabled = false AND COALESCE(account_pool.disabled_reason, '') LIKE '%额度%')
+					 AND COALESCE(account_pool.quota_source, '') IN ('','billing','quota','free_tokens','free')
 					THEN NULL ELSE account_pool.disabled_reason
 				END,
-				quota_disabled_at = NULL,
-				quota_source = NULL,
+				quota_disabled_at = CASE
+					WHEN account_pool.disabled_for_quota = true
+					 AND COALESCE(account_pool.quota_source, '') IN ('','billing','quota','free_tokens','free')
+					THEN NULL ELSE account_pool.quota_disabled_at
+				END,
+				quota_source = CASE
+					WHEN account_pool.disabled_for_quota = true
+					 AND COALESCE(account_pool.quota_source, '') IN ('','billing','quota','free_tokens','free')
+					THEN NULL ELSE account_pool.quota_source
+				END,
 				-- Clear free-usage / billing cool when live quota probe is healthy again.
 				cooldown_until = CASE
 					WHEN COALESCE(account_pool.cooldown_code, '') LIKE '%free-usage%'
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%billing%'
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%quota%'
-					  OR COALESCE(account_pool.extra->>'quota_cool_source', '') <> ''
 					THEN NULL
 					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now()
 					THEN account_pool.cooldown_until
@@ -2272,39 +2301,39 @@ func (c *Connector) SaveQuotaSnapshot(ctx context.Context, accountID string, quo
 					WHEN COALESCE(account_pool.cooldown_code, '') LIKE '%free-usage%'
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%billing%'
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%quota%'
-					  OR COALESCE(account_pool.extra->>'quota_cool_source', '') <> ''
 					THEN NULL ELSE account_pool.cooldown_reason
 				END,
 				cooldown_code = CASE
 					WHEN COALESCE(account_pool.cooldown_code, '') LIKE '%free-usage%'
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%billing%'
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%quota%'
-					  OR COALESCE(account_pool.extra->>'quota_cool_source', '') <> ''
 					THEN NULL ELSE account_pool.cooldown_code
 				END,
 				cooldown_count = CASE
 					WHEN COALESCE(account_pool.cooldown_code, '') LIKE '%free-usage%'
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%billing%'
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%quota%'
-					  OR COALESCE(account_pool.extra->>'quota_cool_source', '') <> ''
 					THEN 0 ELSE account_pool.cooldown_count
 				END,
 				pool_status = CASE
+					WHEN account_pool.pool_status = 'expired' THEN 'expired'
 					WHEN account_pool.disabled_for_quota = true
-					  OR COALESCE(account_pool.quota_source, '') IN ('billing','upstream_error','model_health','quota','free_tokens','free')
-					  OR COALESCE(account_pool.pool_status, '') = 'quota_disabled'
+					 AND COALESCE(account_pool.quota_source, '') NOT IN ('','billing','quota','free_tokens','free')
+					THEN 'quota_disabled'
+					WHEN account_pool.disabled_for_quota = true
+					 AND COALESCE(account_pool.quota_source, '') IN ('','billing','quota','free_tokens','free')
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%free-usage%'
 					  OR COALESCE(account_pool.cooldown_code, '') LIKE '%billing%'
-					  OR COALESCE(account_pool.extra->>'quota_cool_source', '') <> ''
 					THEN CASE
 						WHEN account_pool.cooldown_until IS NOT NULL
 						  AND account_pool.cooldown_until > now()
 						  AND NOT (
 						    COALESCE(account_pool.cooldown_code, '') LIKE '%free-usage%'
 						    OR COALESCE(account_pool.cooldown_code, '') LIKE '%billing%'
-						    OR COALESCE(account_pool.extra->>'quota_cool_source', '') <> ''
 						  )
 						THEN 'cooldown'
+						WHEN COALESCE(account_pool.blocked_models, '{}'::jsonb) <> '{}'::jsonb
+						THEN 'model_blocked'
 						ELSE 'normal'
 					END
 					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now()
@@ -2521,6 +2550,12 @@ func mergeQuotaSnapshots(prev, next map[string]any) map[string]any {
 		out["account_id"] = firstNonEmptyString(stringFromAny(next["account_id"]), stringFromAny(prev["account_id"]))
 	}
 	return out
+}
+
+func quotaObservationState(snap map[string]any) (exhausted bool, healthy bool) {
+	exhausted = truthyAny(snap["exhausted"]) || truthyAny(snap["auto_disabled"])
+	healthy = truthyAny(snap["ok"]) && !exhausted
+	return exhausted, healthy
 }
 
 func isEmptyQuotaField(v any) bool {
@@ -2747,10 +2782,12 @@ func (c *Connector) ApplyProbeOutcomesBatch(ctx context.Context, outcomes []Prob
 			}
 			err = c.BlockPoolModel(ctx, aid, o.Model, until)
 		case "recover":
-			_, err = c.ClearAccountCooldown(ctx, aid)
-			if err == nil && o.Model != "" {
-				_ = c.UnblockPoolModel(ctx, aid, o.Model)
+			// Model-health recovery is model-scoped. Account cooldown may come
+			// from quota/free-usage and must not be cleared by model output.
+			if o.Model == "" {
+				continue
 			}
+			err = c.UnblockPoolModel(ctx, aid, o.Model)
 		default:
 			continue
 		}

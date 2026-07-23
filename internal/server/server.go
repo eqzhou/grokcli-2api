@@ -6644,41 +6644,6 @@ func serveAdminProbeBatch(w http.ResponseWriter, r *http.Request, options Option
 	}
 	// 新账号批量测活：对尚无 last_quota 的账号补拉类型 + 额度（最多 25，落库）。
 	attachQuotasAfterProbeBatch(r.Context(), options, out)
-	// Quota fetch can race-mark free exhaust and cool; undo for probes that passed.
-	if options.Store != nil {
-		for _, item := range out {
-			if item == nil {
-				continue
-			}
-			ok := item["ok"] == true
-			if res, _ := item["result"].(map[string]any); res != nil {
-				if res["ok"] == true || res["available"] == true {
-					ok = true
-				}
-			}
-			if !ok {
-				continue
-			}
-			aid := strings.TrimSpace(stringValue(item["account_id"]))
-			if aid == "" {
-				continue
-			}
-			if _, err := options.Store.ClearAccountCooldown(r.Context(), aid); err == nil {
-				if pool, _ := item["pool"].(map[string]any); pool != nil {
-					pool["pool_status"] = "normal"
-					pool["in_cooldown"] = false
-					pool["cooldown_until"] = nil
-					pool["cooldown_code"] = nil
-					pool["cooldown_reason"] = nil
-				}
-				if q, _ := item["quota"].(map[string]any); q != nil {
-					q["exhausted"] = false
-					q["auto_disabled"] = false
-					q["in_cooldown"] = false
-				}
-			}
-		}
-	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": out, "count": len(out)})
 }
 
@@ -7679,36 +7644,6 @@ func attachQuotaAfterProbe(ctx context.Context, options Options, accountID strin
 	if err != nil || item == nil {
 		return nil
 	}
-	// Model probe already proved the account is live. A follow-up free-token probe
-	// can race-report exhausted=0 remaining and cool the account out of rotation.
-	// Undo that cool so freshly registered / just-probed accounts stay 轮询中.
-	probeOK := false
-	if poolView != nil {
-		if poolView["pool_status"] == "normal" || poolView["last_probe_status"] == "ok" {
-			probeOK = true
-		}
-		if lp, _ := poolView["last_probe"].(map[string]any); lp != nil {
-			if lp["ok"] == true || lp["available"] == true {
-				probeOK = true
-			}
-		}
-	}
-	if probeOK && options.Store != nil {
-		if item["exhausted"] == true || item["auto_disabled"] == true {
-			// Keep usage numbers for UI, but clear false exhaust cool.
-			item["exhausted"] = false
-			item["auto_disabled"] = false
-			delete(item, "exhaust_reason")
-			item["in_cooldown"] = false
-			if p, _ := item["pool"].(map[string]any); p != nil {
-				p["pool_status"] = "normal"
-				p["in_cooldown"] = false
-			}
-		}
-		if _, err := options.Store.ClearAccountCooldown(qctx, accountID); err == nil {
-			// re-enter rotation
-		}
-	}
 	// Strip nested pool from quota item before embedding (cycle risk / noise).
 	quotaSnap := make(map[string]any, len(item))
 	for k, v := range item {
@@ -7727,13 +7662,9 @@ func attachQuotaAfterProbe(ctx context.Context, options Options, accountID strin
 		if pl := strings.TrimSpace(fmt.Sprint(quotaSnap["plan_label"])); pl != "" && pl != "<nil>" {
 			poolView["plan_label"] = pl
 		}
-		// IMPORTANT: do NOT paint cooldown from a concurrent quota fetch when model
-		// probe just succeeded. Fresh free accounts often get a false "exhausted"
-		// from a secondary token probe / header race; kicking them out of rotation
-		// after a green 测活 is wrong. Only surface cool when probe already failed
-		// or pool was already cool and quota independently confirms exhaust.
-		probeOK := poolView["pool_status"] == "normal" || poolView["last_probe_status"] == "ok"
-		if !probeOK && (quotaSnap["exhausted"] == true || quotaSnap["auto_disabled"] == true) {
+		// Quota/free-usage state is independent from model output. Never hide a
+		// trusted exhausted result merely because the model probe succeeded.
+		if quotaSnap["exhausted"] == true || quotaSnap["auto_disabled"] == true {
 			if poolView["in_cooldown"] != true {
 				poolView["in_cooldown"] = true
 				if ps, _ := poolView["pool_status"].(string); ps == "" || ps == "normal" {
@@ -8807,19 +8738,20 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 		aid := firstNonEmptyStr(stringValue(row["account_id"]), stringValue(result["account_id"]), accountID)
 		email := firstNonEmptyStr(stringValue(row["email"]), stringValue(result["email"]))
 		// ProbeIDs already deferred last_probe batch save; do not block the admin
-		// response on another synchronous PG write. Kick/Clear already applied.
+		// response on another synchronous PG write. Any failure policy/model unblock
+		// has already been applied without clearing account-level cooldown.
 		ok := row["ok"] == true || result["available"] == true
+		probeStatus := strings.TrimSpace(stringValue(result["probe_status"]))
+		if probeStatus == "" {
+			probeStatus = map[bool]string{true: "ok", false: "fail"}[ok]
+		}
 		// Prefer live probe flags for immediate UI; enrich with DB pool if present.
 		poolView := map[string]any{
 			"id": aid, "account_id": aid, "last_probe": result,
-			"last_probe_status": map[bool]string{true: "ok", false: "fail"}[ok],
+			"last_probe_status": probeStatus,
 		}
 		if ok {
-			poolView["pool_status"] = "normal"
-			poolView["in_cooldown"] = false
-			if result["recovered"] == true {
-				poolView["recovered"] = true
-			}
+			poolView["probe_succeeded"] = true
 		} else {
 			if result["kicked_cooldown"] == true {
 				poolView["in_cooldown"] = true
@@ -8837,12 +8769,10 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 		if dbPool, perr := options.Store.GetAccountPoolView(r.Context(), aid); perr == nil && dbPool != nil {
 			// Merge durable fields without overwriting live last_probe snapshot.
 			for k, v := range dbPool {
-				if k == "last_probe" {
+				if k == "last_probe" || k == "last_probe_status" {
 					continue
 				}
-				if _, has := poolView[k]; !has || poolView[k] == nil {
-					poolView[k] = v
-				}
+				poolView[k] = v
 			}
 		}
 		statusCode := 0
@@ -8861,7 +8791,7 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 		errText := stringValue(result["error"])
 		if ok {
 			touchRedisPool(options, aid, true, "", nil, statusCode)
-		} else {
+		} else if probeStatus == "fail" {
 			touchRedisPool(options, aid, false, errText, nil, statusCode)
 		}
 		// 测活同时拉账号类型 + 额度使用，写入 last_quota 并回传给管理台。
@@ -8884,103 +8814,10 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	// Fallback when ModelHealth is not wired (tests / degraded): still persist last_probe.
-	auth, err := options.Store.GetAccountAuth(r.Context(), accountID)
-	if err != nil || auth == nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found or has no token"})
-		return
-	}
-	client := upstreamClient(options)
-	probeBody := map[string]any{
-		"model": model, "stream": true, "max_tokens": 1,
-		"messages": []any{map[string]any{"role": "user", "content": "ping"}},
-	}
-	started := time.Now()
-	resp, err := client.Open(r.Context(), grok.Account{ID: auth.ID, Token: auth.Token}, model, probeBody)
-	result := map[string]any{
-		"account_id": auth.ID, "email": auth.Email, "model": model,
-		"probed_at": time.Now().Unix(), "source": "manual",
-	}
-	if err != nil {
-		status := 0
-		errText := err.Error()
-		var ue *grok.UpstreamError
-		if errors.As(err, &ue) {
-			status = ue.Status
-			errText = ue.Body
-			if len(errText) > 400 {
-				errText = errText[:400]
-			}
-		}
-		if autoDisable {
-			decision := pool.ClassifyUpstreamFailure(status, errText, model)
-			if status == 401 || status == 403 {
-				_, _ = options.Store.SetAccountEnabled(r.Context(), auth.ID, false)
-				result["auto_disabled"] = true
-			} else if decision.BlockModel {
-				// empty model output etc.: soft-block model only (模型封禁), no account cool.
-				until := time.Now().Add(10 * time.Minute)
-				if decision.Until != nil {
-					until = *decision.Until
-				}
-				bm := model
-				if decision.Model != "" {
-					bm = decision.Model
-				}
-				_ = options.Store.BlockPoolModel(r.Context(), auth.ID, bm, &until)
-				result["model_blocked"] = true
-				result["blocked_model"] = bm
-				if decision.ShouldCooldown {
-					sec := until.Sub(time.Now()).Seconds()
-					if sec < 60 {
-						sec = 60
-					}
-					_, _ = options.Store.KickFromPool(r.Context(), auth.ID, errText, &sec)
-					result["kicked_cooldown"] = true
-				}
-			} else if decision.ShouldCooldown {
-				until := time.Now().Add(10 * time.Minute)
-				if decision.Until != nil {
-					until = *decision.Until
-				}
-				sec := until.Sub(time.Now()).Seconds()
-				if sec < 60 {
-					sec = 60
-				}
-				_, _ = options.Store.KickFromPool(r.Context(), auth.ID, errText, &sec)
-				result["kicked_cooldown"] = true
-			}
-		}
-		result["available"] = false
-		result["ok"] = false
-		result["error"] = errText
-		result["status_code"] = status
-		result["latency_ms"] = time.Since(started).Milliseconds()
-		_ = options.Store.SaveLastProbe(r.Context(), auth.ID, result)
-		poolView, _ := options.Store.GetAccountPoolView(r.Context(), auth.ID)
-		touchRedisPool(options, auth.ID, false, errText, nil, status)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "account_id": auth.ID, "email": auth.Email, "result": result, "pool": poolView})
-		return
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
-	_ = resp.Body.Close()
-	_ = options.Store.ReportPoolSuccess(r.Context(), auth.ID, false) /* probe/manual success clears sticky cool */
-	if _, err := options.Store.ClearAccountCooldown(r.Context(), auth.ID); err == nil {
-		result["recovered"] = true
-	}
-	if model != "" {
-		if err := options.Store.UnblockPoolModel(r.Context(), auth.ID, model); err == nil {
-			result["unblocked_model"] = model
-		}
-	}
-	result["available"] = true
-	result["ok"] = true
-	result["status_code"] = resp.StatusCode
-	result["latency_ms"] = time.Since(started).Milliseconds()
-	_ = options.Store.SaveLastProbe(r.Context(), auth.ID, result)
-	touchRedisPool(options, auth.ID, true, "", nil, resp.StatusCode)
-	poolView, _ := options.Store.GetAccountPoolView(r.Context(), auth.ID)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account_id": auth.ID, "email": auth.Email, "result": result, "pool": poolView})
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		"detail": "model health unavailable; strict probe cannot run",
+	})
+	return
 }
 
 func serveAdminSetAccountStatus(w http.ResponseWriter, r *http.Request, options Options) {

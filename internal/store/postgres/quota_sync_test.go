@@ -127,6 +127,19 @@ func TestMergeQuotaSnapshotsKeepsTypeAndUsageOnFailedProbe(t *testing.T) {
 	}
 }
 
+func TestFailedQuotaObservationCannotInheritPreviousHealthyState(t *testing.T) {
+	previous := map[string]any{"ok": true, "exhausted": false, "used": 1.0}
+	current := map[string]any{"ok": false, "error": "billing unavailable"}
+	merged := mergeQuotaSnapshots(previous, current)
+	if merged["ok"] != true {
+		t.Fatalf("display snapshot should retain prior health: %#v", merged)
+	}
+	exhausted, healthy := quotaObservationState(current)
+	if exhausted || healthy {
+		t.Fatalf("failed observation must not drive recovery: exhausted=%v healthy=%v", exhausted, healthy)
+	}
+}
+
 func TestMergeQuotaSnapshotsFreshTypeWins(t *testing.T) {
 	prev := map[string]any{
 		"ok": true, "account_type": "free", "plan": "free", "plan_label": "Free",

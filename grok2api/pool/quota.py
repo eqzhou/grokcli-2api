@@ -10,6 +10,7 @@ so subsequent requests skip it.
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -68,11 +69,17 @@ def _headers(token: str) -> dict[str, str]:
 def _money(obj: Any) -> float | None:
     if obj is None:
         return None
+    if isinstance(obj, bool):
+        return None
     if isinstance(obj, (int, float)):
-        return float(obj)
+        value = float(obj)
+        return value if math.isfinite(value) and value >= 0 else None
     if isinstance(obj, dict) and "val" in obj:
+        if isinstance(obj["val"], bool):
+            return None
         try:
-            return float(obj["val"])
+            value = float(obj["val"])
+            return value if math.isfinite(value) and value >= 0 else None
         except (TypeError, ValueError):
             return None
     return None
@@ -90,15 +97,83 @@ def _fmt_usd(v: float | None) -> str | None:
 
 def normalize_billing(raw: dict[str, Any] | None) -> dict[str, Any]:
     """Flatten cli-chat-proxy /v1/billing payload into a stable shape."""
-    if not isinstance(raw, dict):
-        return {"ok": False, "error": "empty billing response"}
 
-    cfg = raw.get("config") if isinstance(raw.get("config"), dict) else raw
-    monthly_limit = _money(cfg.get("monthlyLimit") or cfg.get("monthly_limit"))
+    def invalid(message: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "available": False,
+            "schema_valid": False,
+            "quota_state": "unknown",
+            "error": message,
+            "raw": raw,
+        }
+
+    if not isinstance(raw, dict) or not raw:
+        return invalid("empty billing response")
+
+    error_value = raw.get("error") or raw.get("errors")
+    if not error_value and raw.get("ok") is False:
+        error_value = raw.get("message") or raw.get("detail") or "upstream returned ok=false"
+    if not error_value and not isinstance(raw.get("config"), dict):
+        error_value = raw.get("message") or raw.get("detail")
+    if error_value:
+        if isinstance(error_value, dict):
+            message = (
+                error_value.get("message")
+                or error_value.get("detail")
+                or str(error_value)
+            )
+        else:
+            message = str(error_value)
+        return invalid(f"billing error: {message}"[:300])
+
+    if "config" in raw and not isinstance(raw.get("config"), dict):
+        return invalid("billing response contains malformed config")
+    cfg = raw["config"] if "config" in raw else raw
+    monetary_fields = {
+        "monthlyLimit",
+        "monthly_limit",
+        "used",
+        "onDemandCap",
+        "on_demand_cap",
+        "prepaidBalance",
+        "prepaid_balance",
+        "onDemandUsed",
+        "on_demand_used",
+    }
+    if not any(key in cfg for key in monetary_fields):
+        return invalid("unrecognized billing response schema")
+
+    def value(*keys: str) -> Any:
+        for key in keys:
+            if key in cfg:
+                return cfg.get(key)
+        return None
+
+    monthly_limit = _money(value("monthlyLimit", "monthly_limit"))
     used = _money(cfg.get("used"))
-    on_demand_cap = _money(cfg.get("onDemandCap") or cfg.get("on_demand_cap"))
-    prepaid = _money(cfg.get("prepaidBalance") or cfg.get("prepaid_balance"))
-    on_demand_used = _money(cfg.get("onDemandUsed") or cfg.get("on_demand_used"))
+    on_demand_cap = _money(value("onDemandCap", "on_demand_cap"))
+    prepaid = _money(value("prepaidBalance", "prepaid_balance"))
+    on_demand_used = _money(value("onDemandUsed", "on_demand_used"))
+    if all(
+        amount is None
+        for amount in (monthly_limit, used, on_demand_cap, prepaid, on_demand_used)
+    ):
+        return invalid("billing response contains no valid quota values")
+    has_monthly_pair = (
+        any(key in cfg for key in ("monthlyLimit", "monthly_limit"))
+        and "used" in cfg
+        and monthly_limit is not None
+        and used is not None
+    )
+    has_on_demand_pair = (
+        any(key in cfg for key in ("onDemandCap", "on_demand_cap"))
+        and any(key in cfg for key in ("onDemandUsed", "on_demand_used"))
+        and on_demand_cap is not None
+        and on_demand_used is not None
+    )
+    if not (has_monthly_pair or has_on_demand_pair):
+        return invalid("billing response is missing a complete quota field pair")
 
     remaining: float | None = None
     if monthly_limit is not None and used is not None:
@@ -109,10 +184,15 @@ def normalize_billing(raw: dict[str, Any] | None) -> dict[str, Any]:
         usage_pct = round(100.0 * used / monthly_limit, 2)
 
     history: list[dict[str, Any]] = []
-    for item in cfg.get("history") or []:
+    raw_history = cfg.get("history") or []
+    if not isinstance(raw_history, list):
+        return invalid("billing response contains malformed history")
+    for item in raw_history:
         if not isinstance(item, dict):
             continue
         cycle = item.get("billingCycle") or item.get("billing_cycle") or {}
+        if not isinstance(cycle, dict):
+            return invalid("billing response contains malformed billing cycle")
         history.append(
             {
                 "year": (cycle or {}).get("year"),
@@ -139,6 +219,9 @@ def normalize_billing(raw: dict[str, Any] | None) -> dict[str, Any]:
 
     return {
         "ok": True,
+        "available": True,
+        "schema_valid": True,
+        "quota_state": "exhausted" if exhausted else "healthy",
         "monthly_limit": monthly_limit,
         "used": used,
         "remaining": remaining,
@@ -286,8 +369,8 @@ def apply_exhaustion_to_pool(
 def maybe_disable_from_quota_result(result: dict[str, Any]) -> dict[str, Any]:
     """If quota result says exhausted, disable the account and annotate result.
 
-    Always persist last_quota into DB/settings for admin UI cache.
-    When billing shows healthy again, re-enable accounts previously removed for quota.
+    Always persist last_quota into DB/settings for admin UI cache. Healthy
+    results are observational only; they cannot race-reenable a newer disable.
     """
     if not result.get("ok"):
         # still cache failed query timestamp/error so UI can show "上次失败"
@@ -319,39 +402,15 @@ def maybe_disable_from_quota_result(result: dict[str, Any]) -> dict[str, Any]:
                 pass
     else:
         result["auto_disabled"] = False
-        reenabled = None
         if account_id:
             try:
                 import grok2api.pool.account_pool as account_pool
-
-                # save_quota_snapshot re-enters pool when healthy; also explicit path
-                # for older rows that only had enabled=false without last_quota.
                 account_pool.save_quota_snapshot(account_id, result)
-                meta = None
-                try:
-                    meta = account_pool.get_account_pool_meta(account_id)
-                except Exception:
-                    meta = None
-                if isinstance(meta, dict) and (
-                    meta.get("disabled_for_quota") or meta.get("enabled") is False
-                ):
-                    src = str(meta.get("quota_source") or meta.get("disabled_source") or "")
-                    if src in ("", "billing", "upstream_error", "model_health", "quota") or bool(
-                        meta.get("disabled_for_quota")
-                    ):
-                        reenabled = account_pool.reenable_for_quota(
-                            account_id,
-                            reason="billing 查询显示额度可用",
-                            source="billing",
-                        )
             except Exception:
-                reenabled = None
-        result["auto_reenabled"] = bool(reenabled)
-        result["reenabled_record"] = reenabled
-        if reenabled:
-            result["display"] = dict(result.get("display") or {})
-            summary = (result.get("display") or {}).get("summary") or "额度可用"
-            result["display"]["summary"] = f"{summary} · 已重新入池"
+                pass
+        # Fail closed against stale healthy responses racing a newer disable.
+        result["auto_reenabled"] = False
+        result["reenabled_record"] = None
     return result
 
 

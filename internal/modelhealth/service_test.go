@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -127,8 +128,8 @@ func TestProbeAccountsConcurrentUsesWorkers(t *testing.T) {
 		time.Sleep(40 * time.Millisecond)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
 	}))
 	defer srv.Close()
 
@@ -189,6 +190,34 @@ func TestProbeAccountBudgetCutDoesNotDisable(t *testing.T) {
 	}
 	if probe["auto_disabled"] == true || probe["kicked_cooldown"] == true {
 		t.Fatalf("budget cut must not kick account: %#v", probe)
+	}
+}
+
+func TestProbeAccountUsesExactPromptAndRawFailureTerminal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("path=%q want /responses", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(body)
+		if !strings.Contains(string(raw), "Reply with exactly OK.") {
+			t.Errorf("strict prompt missing from request: %s", raw)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"code\":\"capacity\",\"message\":\"at capacity\"}}}\n\n")
+	}))
+	defer srv.Close()
+
+	s := &Service{Upstream: srv.URL, Models: []string{"grok-4.5"}, httpClient: newProbeHTTPClient()}
+	probe := s.probeAccount(context.Background(), postgres.AccountAuth{ID: "x", Token: "t"}, "grok-4.5", "manual", true, false)
+	if probe["outcome"] != "failure" || probe["probe_status"] != "fail" || probe["available"] == true {
+		t.Fatalf("explicit failure must fail closed: %#v", probe)
+	}
+	if probe["error_code"] != "capacity" || probe["terminal_event"] != "response.failed" {
+		t.Fatalf("failure details missing: %#v", probe)
 	}
 }
 

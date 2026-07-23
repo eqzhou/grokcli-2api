@@ -78,6 +78,23 @@ func defaultHTTPClient() *http.Client {
 }
 
 func (c *Client) Open(ctx context.Context, account Account, model string, body map[string]any) (*http.Response, error) {
+	response, err := c.OpenRawResponses(ctx, account, model, body)
+	if err != nil {
+		return nil, err
+	}
+	// Translate Responses SSE → chat.completion.chunk SSE for the proxy stack.
+	response.Body = responsesToChatStream(response.Body)
+	if response.Header != nil {
+		response.Header.Set("Content-Type", "text/event-stream")
+		response.Header.Set("X-Grok2API-Upstream-Protocol", "responses")
+	}
+	return response, nil
+}
+
+// OpenRawResponses calls the upstream Responses endpoint without translating its
+// SSE stream. Health checks use this path so terminal failure/incomplete events
+// cannot be hidden by the compatibility bridge.
+func (c *Client) OpenRawResponses(ctx context.Context, account Account, model string, body map[string]any) (*http.Response, error) {
 	if c.HTTP == nil {
 		c.HTTP = defaultHTTPClient()
 	}
@@ -119,12 +136,6 @@ func (c *Client) Open(ctx context.Context, account Account, model string, body m
 			Status: response.StatusCode, Body: string(errBody),
 			RetryAfter: response.Header.Get("Retry-After"),
 		}
-	}
-	// Translate Responses SSE → chat.completion.chunk SSE for the proxy stack.
-	response.Body = responsesToChatStream(response.Body)
-	if response.Header != nil {
-		response.Header.Set("Content-Type", "text/event-stream")
-		response.Header.Set("X-Grok2API-Upstream-Protocol", "responses")
 	}
 	return response, nil
 }

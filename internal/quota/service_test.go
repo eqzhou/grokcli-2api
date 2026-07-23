@@ -1,9 +1,14 @@
 package quota
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 )
 
 func TestSyntheticPoolFromQuotaNoJSONCycle(t *testing.T) {
@@ -73,6 +78,40 @@ func TestNormalizeBillingFree(t *testing.T) {
 	}
 	if n["exhausted"] == true {
 		t.Fatal("free $0 should not exhaust from billing alone")
+	}
+}
+
+func TestNormalizeBillingRejectsEmptyAndIncompleteSchemas(t *testing.T) {
+	for name, raw := range map[string]map[string]any{
+		"empty":        {},
+		"empty config": {"config": map[string]any{}},
+		"used only":    {"config": map[string]any{"used": map[string]any{"val": 0}}},
+		"bad value": {"config": map[string]any{
+			"monthlyLimit": map[string]any{"val": true},
+			"used":         map[string]any{"val": 0},
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := normalizeBilling(raw)
+			if got["ok"] != false {
+				t.Fatalf("invalid billing schema accepted: %#v", got)
+			}
+		})
+	}
+}
+
+func TestFetchOneEmptyBillingAndMissingTokenHeadersIsNotHealthy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	service := New(nil, server.URL)
+	service.httpClient = server.Client()
+	result := service.fetchOne(context.Background(), postgres.AccountAuth{ID: "a", Token: "t"})
+	if result["ok"] == true {
+		t.Fatalf("empty billing/token signals must not be healthy: %#v", result)
 	}
 }
 

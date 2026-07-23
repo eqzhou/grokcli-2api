@@ -100,20 +100,16 @@ PROBE_FAIL_DISABLE_STREAK = 4
 PROBE_KICK_COOLDOWN_SEC = 600.0
 # free-usage (rolling 24h) recovery knobs.
 # First free-usage hit hard-kicks the account into the cooldown pool for ALL
-# rotation strategies. Wall-clock until is a UI/Redis marker only — recovery is
-# probe-only (PROBE_ONLY_COOLDOWN_RECOVERY).
+# rotation strategies. Recovery follows a bounded wall-clock TTL.
 FREE_USAGE_COOLDOWN_BASE_SEC = 900.0   # 15m first hit (UI remaining hint)
 FREE_USAGE_COOLDOWN_MAX_SEC = 3600.0   # 1h hard cap for UI remaining
 FREE_USAGE_STACK_MAX = 4              # stop stacking past this; just refresh until
 FREE_USAGE_RESTACK_MIN_SEC = 30.0     # ignore duplicate free-usage spam within window
-# Strict recovery policy (operator rule):
-# live/request failure → enter cooldown and STAY cooling until the next
-# successful model probe (测活) or an explicit admin clear.
-# Wall-clock cooldown_until is only a UI/Redis marker; it must NOT auto-recover.
-PROBE_ONLY_COOLDOWN_RECOVERY = True
-# Far-future marker so "remaining" UIs and Redis TTL still show cooling.
-# Free-usage "没额度" uses this so the account is hard-kicked out of rotation
-# until probe/admin clear — not a soft 15m self-recover.
+# Temporary cooldowns recover by their bounded TTL. Model probe success remains
+# model-scoped and never clears account cooldown/quota state.
+PROBE_ONLY_COOLDOWN_RECOVERY = False
+# Legacy hold duration retained for compatibility with old persisted settings;
+# new cooldown writes use bounded TTLs.
 PROBE_HOLD_COOLDOWN_SEC = 365.0 * 24.0 * 3600.0
 
 _lock = threading.RLock()
@@ -181,7 +177,7 @@ def parse_free_usage_error(error: str | None, status_code: int | None = None) ->
     return {
         "code": code or "subscription:free-usage-exhausted",
         "reason": (
-            f"临时额度耗尽，已冷却踢出轮询，等待下次测活成功"
+            f"临时额度耗尽，已冷却踢出轮询，等待冷却到期或管理员处理"
             + (f" · {model}" if model else "")
             + (
                 f" · tokens {tokens_actual}/{tokens_limit}"
@@ -248,12 +244,10 @@ def apply_free_usage_cooldown(
 
     Operator rule (all rotation strategies):
     - First free-usage / 额度耗尽 hit → **immediately** leave live rotation
-      (``pool_status=cooldown``, durable ``cooldown_until`` far-future under
-      PROBE_ONLY_COOLDOWN_RECOVERY).
+      (``pool_status=cooldown`` with a bounded durable ``cooldown_until``).
     - Soft-block the exhausted model (extra safety if sticky re-binds).
     - Clear conversation affinity so multi-turn no longer pins this account.
-    - Stay out until the next successful model probe (测活) or admin clear.
-      Wall-clock alone never recovers.
+    - Stay out until the bounded cooldown expires or an admin clears it.
 
     Duplicate free-usage hits inside FREE_USAGE_RESTACK_MIN_SEC only refresh
     the marker (no stack thrash).
@@ -306,6 +300,10 @@ def apply_free_usage_cooldown(
             until_existing = float(meta.get("cooldown_until"))
     except (TypeError, ValueError):
         until_existing = None
+    # Migrate legacy probe-hold rows that used a 365-year marker. A fresh
+    # free-usage signal must never preserve that far-future timestamp.
+    if until_existing is not None and until_existing > now + float(FREE_USAGE_COOLDOWN_MAX_SEC):
+        until_existing = now + float(FREE_USAGE_COOLDOWN_MAX_SEC)
     still_active = bool(until_existing is not None and until_existing > now) or (
         str(meta.get("pool_status") or "").lower() == "cooldown"
     )
@@ -360,7 +358,7 @@ def apply_free_usage_cooldown(
             until = max(until_existing, until)
         reason = str(
             parsed.get("reason")
-            or "临时额度耗尽，已冷却踢出轮询，等待下次测活成功"
+            or "临时额度耗尽，已冷却踢出轮询，等待冷却到期或管理员处理"
         )[:300]
     else:
         ttl = display_ttl
@@ -372,7 +370,7 @@ def apply_free_usage_cooldown(
             )
         reason = str(
             parsed.get("reason")
-            or "临时额度耗尽，已冷却踢出轮询，等待自动恢复/测活成功"
+            or "临时额度耗尽，已冷却踢出轮询，等待冷却到期或管理员处理"
         )[:300]
     patch: dict[str, Any] = {
         "pool_status": "cooldown",
@@ -389,12 +387,8 @@ def apply_free_usage_cooldown(
         "cooldown_sec": float(display_ttl if PROBE_ONLY_COOLDOWN_RECOVERY else ttl),
         "last_error": reason,
         "last_status_code": status_code,
-        # Stay "enabled" so admin can still probe/recover; live rotation excludes
-        # via is_in_cooldown (hard kick from all strategies).
-        "enabled": True,
-        "disabled_reason": None,
-        "disabled_source": None,
-        "disabled_for_quota": False,
+        # Preserve enabled/quota/disabled state. A model or free-usage failure
+        # must never re-enable an independently quota-disabled account.
         "last_probe_status": "cooldown",
         "last_probe_fail_at": now,
         "kicked_from_rotation": True,
@@ -440,7 +434,7 @@ def apply_free_usage_cooldown(
     print(
         f"  [pool] free-usage {action} ×{new_count} "
         f"account={account_id} model={mid} code={parsed.get('code')} "
-        f"(kicked from rotation until probe)"
+        f"(kicked from rotation until cooldown expiry)"
     )
     return {
         "id": account_id,
@@ -834,20 +828,18 @@ def is_model_blocked(
 def is_in_cooldown(meta: dict[str, Any]) -> bool:
     """True while this account must stay out of live rotation.
 
-    Operator rule (strict):
+    Operator rule:
       - live/request failure → enter cooldown
-      - stay cooling until the next successful **model probe** (测活)
-      - ordinary chat success must never recover the account
-      - wall-clock ``cooldown_until`` is only a UI/Redis marker under
-        ``PROBE_ONLY_COOLDOWN_RECOVERY``; clock expiry alone does not recover
+      - model probe success never clears account-level cooldown
+      - bounded temporary cooldowns recover only after their TTL expires
 
     Recovery paths:
-      1. successful model probe
+      1. atomic cooldown expiry / trusted quota recovery
       2. admin clear / manual enable
     """
     if not isinstance(meta, dict):
         return False
-    # Durable cooling flags first (probe-only recovery).
+    # Durable cooling flags first.
     try:
         if int(meta.get("cooldown_count") or 0) > 0:
             return True
@@ -870,13 +862,7 @@ def is_in_cooldown(meta: dict[str, Any]) -> bool:
 
 
 def maybe_expire_cooldown(account_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    """Legacy helper: used to clear cooldowns when cooldown_until elapsed.
-
-    Under ``PROBE_ONLY_COOLDOWN_RECOVERY`` this is a no-op — only a successful
-    model probe (or admin clear) may re-enter the account into rotation.
-    """
-    if PROBE_ONLY_COOLDOWN_RECOVERY:
-        return None
+    """Clear an elapsed temporary cooldown independently of model health."""
     if not account_id:
         return None
     if meta is None:
@@ -893,38 +879,28 @@ def maybe_expire_cooldown(account_id: str, meta: dict[str, Any] | None = None) -
         return None
     if _now() < until_f:
         return None
-    # Expired → re-enter pool as normal. Keep last_error for UI forensics.
+    # Re-check and clear atomically so a newer cooldown cannot be erased.
+    try:
+        from grok2api.admin.settings_store import expire_account_cooldown_atomic
+
+        saved = expire_account_cooldown_atomic(account_id, until_f)
+    except Exception:
+        saved = None
+    if not isinstance(saved, dict):
+        return None
     try:
         from grok2api.store.pool_redis import clear_cooldown
 
         clear_cooldown(account_id)
     except Exception:
         pass
-    saved = patch_account_pool_meta(
-        account_id,
-        {
-            "cooldown_count": 0,
-            "status_stack": [],
-            "cooldown_until": None,
-            "cooldown_sec": None,
-            "cooldown_reason": None,
-            "cooldown_code": None,
-            "cooldown_model": None,
-            "cooldown_tokens_actual": None,
-            "cooldown_tokens_limit": None,
-            "cooldown_detail": None,
-            "consecutive_fails": 0,
-            "pool_status": "normal",
-            "last_probe_status": "normal",
-        },
-    )
     invalidate_pool_summary_cache()
-    out = dict(saved) if isinstance(saved, dict) else {}
+    out = dict(saved)
     out.update(
         {
             "id": account_id,
             "in_cooldown": False,
-            "pool_status": "normal",
+            "pool_status": saved.get("pool_status") or "normal",
             "cooldown_count": 0,
             "expired_cooldown": True,
         }
@@ -941,7 +917,7 @@ def stack_cooldown_count(
 
     Bound to the account row in DB via ``cooldown_count`` / ``pool_status``.
     Each failed probe/live free-usage event increments by 1 (or ``add``).
-    A single successful probe clears the count and status → normal.
+    Model success never clears this account-level state.
     """
     cur = 0
     if isinstance(meta, dict):
@@ -971,7 +947,7 @@ def stack_cooldown_until(
     t0 = float(now if now is not None else _now())
     count = stack_cooldown_count(meta, add=1 if float(add_sec or 0) > 0 else 0)
     # Marker until: long enough that prune_expired won't clear while count>0.
-    # Real recovery is count→0 on successful probe, not clock expiry.
+    # Recovery is an explicit account/quota action, not model success or expiry.
     until = t0 + max(3600.0, float(add_sec or 0.0)) * max(1, count)
     return until, float(count)
 
@@ -980,7 +956,7 @@ def prune_expired_cooldowns(account_id: str | None = None) -> int:
     """Legacy wall-clock prune. Disabled under probe-only recovery.
 
     Returns 0 always when ``PROBE_ONLY_COOLDOWN_RECOVERY`` is on so background
-    status polls cannot re-admit failed accounts without a successful probe.
+    status polls cannot re-admit failed accounts without explicit recovery.
     """
     if PROBE_ONLY_COOLDOWN_RECOVERY:
         return 0
@@ -998,7 +974,32 @@ def prune_expired_cooldowns(account_id: str | None = None) -> int:
         if until is None:
             continue
         try:
-            if now < float(until):
+            until_f = float(until)
+            code = str(meta.get("cooldown_code") or "").lower()
+            stack = meta.get("status_stack") if isinstance(meta.get("status_stack"), list) else []
+            legacy_probe_hold = any(
+                marker in code
+                for marker in ("free-usage", "free_usage", "probe_fail", "empty_upstream", "rate_limit")
+            ) or any(
+                isinstance(entry, dict)
+                and str(entry.get("kind") or "").lower()
+                in {"free_usage_exhausted", "probe_fail", "request_fail", "empty_upstream"}
+                for entry in stack
+            )
+            if (
+                until_f > now + 30 * 24 * 3600
+                and not meta.get("disabled_for_quota")
+                and legacy_probe_hold
+            ):
+                patch_account_pool_meta(
+                    aid,
+                    {
+                        "cooldown_until": now + float(FREE_USAGE_COOLDOWN_MAX_SEC),
+                        "cooldown_sec": float(FREE_USAGE_COOLDOWN_MAX_SEC),
+                    },
+                )
+                continue
+            if now < until_f:
                 continue
         except (TypeError, ValueError):
             continue
@@ -1650,8 +1651,8 @@ def acquire(
     ]
     # Soft recovery for model soft-blocks / expired-refreshable only.
     # Cooling accounts (free-usage 用完 / 429 / empty_upstream 冷却池) are NEVER
-    # re-introduced into live rotation — they stay out until a successful probe
-    # or admin clear (PROBE_ONLY_COOLDOWN_RECOVERY).
+    # re-introduced into live rotation — they stay out until explicit quota/admin
+    # recovery (PROBE_ONLY_COOLDOWN_RECOVERY).
     def _usable(c: GrokCredentials) -> bool:
         return not c.expired
 
@@ -1948,8 +1949,8 @@ def report_failure(
     stack = stack_status_entry(meta, entry)
     new_count = len(stack)
     if PROBE_ONLY_COOLDOWN_RECOVERY:
-        # Stay cooling until the next successful probe. Keep a far-future
-        # until marker so UI remaining-time / Redis hot keys stay "cooling".
+        # Legacy probe-only branch retained for compatibility; current policy
+        # uses bounded TTL recovery independent of model health.
         base = float(PROBE_HOLD_COOLDOWN_SEC)
         until = _now() + base
     elif empty_upstream:
@@ -2162,6 +2163,21 @@ def unblock_model(account_id: str, model: str | None = None) -> dict[str, Any] |
     return out
 
 
+def recover_model_probe(account_id: str, model: str) -> dict[str, Any] | None:
+    """Atomically recover exactly one model and reset probe failure streaks."""
+    if not account_id or not model:
+        return None
+    try:
+        from grok2api.admin.settings_store import recover_model_probe_atomic
+
+        saved = recover_model_probe_atomic(account_id, model)
+    except Exception:
+        saved = None
+    if isinstance(saved, dict):
+        invalidate_pool_summary_cache()
+    return saved
+
+
 def disable_for_quota(
     account_id: str,
     *,
@@ -2265,37 +2281,10 @@ def save_quota_snapshot(account_id: str, quota_result: dict[str, Any]) -> None:
             "quota_source": "billing",
             "pool_status": "quota_disabled",
         })
-    elif snap.get("ok") and not snap.get("exhausted"):
-        # Healthy billing snapshot: re-enter rotation if we previously hard-disabled
-        # this account for quota/billing reasons.
-        try:
-            cur = get_account_pool_meta(account_id) or {}
-        except Exception:
-            cur = {}
-        if not isinstance(cur, dict):
-            cur = {}
-        src = str(cur.get("quota_source") or cur.get("disabled_source") or "")
-        was_quota = bool(cur.get("disabled_for_quota")) or src in (
-            "billing",
-            "upstream_error",
-            "model_health",
-            "quota",
-        )
-        if was_quota or cur.get("enabled") is False and "额度" in str(cur.get("disabled_reason") or ""):
-            patch.update(
-                {
-                    "disabled_for_quota": False,
-                    "enabled": True,
-                    "disabled_reason": None,
-                    "disabled_source": None,
-                    "quota_disabled_at": None,
-                    "quota_source": None,
-                    "pool_status": "normal",
-                }
-            )
+    # A healthy snapshot is observational only. Automatic recovery here would
+    # be a non-atomic read/modify/write that can overwrite a newer auth/model
+    # disable or cooldown. Quota recovery must use an explicit conditional path.
     patch_account_pool_meta(account_id, patch)
-    if patch.get("enabled") is True:
-        invalidate_pool_summary_cache()
 
 
 def reenable_for_quota(
@@ -2340,18 +2329,9 @@ def reenable_for_quota(
 def expire_due_cooldowns(*, limit: int = 200) -> dict[str, Any]:
     """Batch-clear accounts whose cooldown_until has elapsed.
 
-    Disabled under ``PROBE_ONLY_COOLDOWN_RECOVERY``: cooldown recovery is
-    probe-success only (or admin clear). Background ticks must not re-admit.
+    This time-based recovery is separate from model probing. Quota-disabled
+    accounts remain disabled; active model blocks remain model-blocked.
     """
-    if PROBE_ONLY_COOLDOWN_RECOVERY:
-        return {
-            "ok": True,
-            "cleared": 0,
-            "scanned": 0,
-            "errors": 0,
-            "backend": "probe_only",
-            "skipped": True,
-        }
     cleared = 0
     scanned = 0
     errors = 0
@@ -2364,6 +2344,31 @@ def expire_due_cooldowns(*, limit: int = 200) -> dict[str, Any]:
         ids: list[str] = []
         with connection() as conn:
             with conn.cursor() as cur:
+                # Clamp legacy 365-year probe-hold markers without touching
+                # quota-disabled rows or model blocks.
+                cur.execute(
+                    """
+                    UPDATE account_pool
+                    SET cooldown_until = NOW() + INTERVAL '1 hour',
+                        updated_at = NOW()
+                    WHERE account_id IN (
+                        SELECT account_id
+                        FROM account_pool
+                        WHERE COALESCE(disabled_for_quota, false) = false
+                          AND pool_status = 'cooldown'
+                          AND cooldown_until > NOW() + INTERVAL '30 days'
+                          AND (
+                            COALESCE(cooldown_code, '') ILIKE ANY (
+                              ARRAY['%free-usage%', '%free_usage%', '%probe_fail%', '%empty_upstream%', '%rate_limit%']
+                            )
+                            OR COALESCE(extra->'status_stack', '[]'::jsonb)::text ~
+                              'free_usage_exhausted|probe_fail|request_fail|empty_upstream'
+                          )
+                        LIMIT %s
+                    )
+                    """,
+                    (max(1, min(int(limit or 200), 1000)),),
+                )
                 cur.execute(
                     """
                     SELECT account_id
@@ -2807,7 +2812,7 @@ def try_acquire_sequence(
             continue
         meta = _meta(c)
         # Cooling pool is hard-excluded from live rotation (free-usage 用完 /
-        # 429 / empty_upstream). Only successful probe or admin clear recovers.
+        # 429 / empty_upstream). Only explicit quota/admin recovery re-admits.
         if is_in_cooldown(meta):
             continue
         if not meta.get("enabled", True):
@@ -3134,9 +3139,8 @@ def record_model_probe_outcome(
 ) -> dict[str, Any] | None:
     """Track probe success/fail streaks and escalate with cooldown only.
 
-    Never hard-disables accounts for temporary free-usage / 429s.
-    Successful probe is the only automatic path that clears durable cooldown
-    (aside from manual clear / enable). Ordinary live traffic must not.
+    Never hard-disables accounts for temporary free-usage / 429s. A successful
+    probe is model-scoped and never clears account-level cooldown or quota state.
     """
     if not account_id:
         return None
@@ -3149,87 +3153,35 @@ def record_model_probe_outcome(
     disable_at = max(kick_at + 1, disable_at)
 
     if available:
-        # 单次测活成功：改变账号状态 normal，清空 DB 中的 status_stack / 冷却字段。
-        was_cooling = is_in_cooldown(meta)
-        prev_count = 0
-        try:
-            prev_count = int(meta.get("cooldown_count") or 0)
-        except (TypeError, ValueError):
-            prev_count = 0
-        prev_stack = meta.get("status_stack") if isinstance(meta.get("status_stack"), list) else []
-        if prev_stack:
-            prev_count = max(prev_count, len(prev_stack))
+        # Strong model success is model-scoped. It resets probe failure counters
+        # and may remove only the current model block; account cooldown, quota,
+        # enabled state and pool_status remain authoritative.
+        blocked = meta.get("blocked_models")
+        blocked = blocked if isinstance(blocked, dict) else {}
+        was_blocked = bool(model and model in blocked)
         patch: dict[str, Any] = {
             "probe_fail_streak": 0,
             "consecutive_fails": 0,
             "last_probe_ok_at": _now(),
-            "last_probe_status": "normal",
-            # Clear stacked free-usage status (DB columns + extra stack).
-            "cooldown_count": 0,
-            "status_stack": [],
-            "cooldown_until": None,
-            "cooldown_sec": None,
-            "cooldown_reason": None,
-            "cooldown_code": None,
-            "cooldown_model": None,
-            "cooldown_tokens_actual": None,
-            "cooldown_tokens_limit": None,
-            "cooldown_detail": None,
-            "last_error": None,
-            "pool_status": "normal",
+            "last_probe_status": "ok",
         }
-        try:
-            from grok2api.store.pool_redis import clear_cooldown
-
-            clear_cooldown(account_id)
-        except Exception:
-            pass
-        # Also drop soft/temp model blocks for the probed model so status is normal.
-        if model:
-            try:
-                blocked = meta.get("blocked_models") if isinstance(meta.get("blocked_models"), dict) else {}
-                entry = blocked.get(model) if isinstance(blocked, dict) else None
-                if isinstance(entry, dict):
-                    src = str(entry.get("source") or "")
-                    until = entry.get("until")
-                    if until is not None or src in ("temp_usage", "soft", "temporary", "probe", ""):
-                        new_blocked = dict(blocked)
-                        new_blocked.pop(model, None)
-                        patch["blocked_models"] = new_blocked if new_blocked else None
-            except Exception:
-                pass
-        # Auto re-enable only when we previously kicked via model health, not quota.
-        if (
-            meta.get("enabled") is False
-            and not meta.get("disabled_for_quota")
-            and str(meta.get("quota_source") or meta.get("disabled_source") or "")
-            in ("", "model_health", "probe", "probe_kick", "None")
-        ):
-            src = str(meta.get("disabled_source") or meta.get("quota_source") or "")
-            reason = str(meta.get("disabled_reason") or "")
-            if src in ("model_health", "probe", "probe_kick") or reason.startswith(
-                ("模型探测失败", "模型不可用", "探测连续失败", "临时额度耗尽")
-            ):
-                patch["enabled"] = True
-                patch["disabled_reason"] = None
-                patch["disabled_source"] = None
-        # Force status normal after successful probe (unless still quota-disabled).
-        if not meta.get("disabled_for_quota") and patch.get("enabled", meta.get("enabled", True)) is not False:
-            patch["pool_status"] = "normal"
+        if was_blocked and model:
+            new_blocked = dict(blocked)
+            new_blocked.pop(model, None)
+            patch["blocked_models"] = new_blocked if new_blocked else None
         patch_account_pool_meta(account_id, patch)
         invalidate_pool_summary_cache()
         return {
             "id": account_id,
             "probe_fail_streak": 0,
-            "action": "recovered",
-            "enabled": True if patch.get("enabled", meta.get("enabled", True)) is not False else False,
-            "cleared_cooldown": True,
-            "was_cooling": was_cooling,
-            "cleared_cooldown_count": prev_count,
-            "cooldown_count": 0,
-            "pool_status": patch.get("pool_status") or "normal",
+            "action": "model_recovered" if was_blocked else "recorded",
+            "enabled": meta.get("enabled", True),
+            "cleared_cooldown": False,
+            "was_cooling": is_in_cooldown(meta),
+            "cooldown_count": int(meta.get("cooldown_count") or 0),
+            "pool_status": meta.get("pool_status"),
+            "unblocked_model": model if was_blocked else None,
         }
-
     # Failure path — probe changes account status in DB.
     streak = int(meta.get("probe_fail_streak") or 0) + 1
     result: dict[str, Any] = {

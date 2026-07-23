@@ -3,7 +3,6 @@ package modelhealth
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -992,7 +991,7 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool, s
 
 	probes := s.probeAccountsConcurrent(budgetCtx, auths, cycleModels, source, workers)
 
-	available, failed := 0, 0
+	available, failed, inconclusive := 0, 0, 0
 	kickCooldown, kickDisabled, modelBlocks, recovered := 0, 0, 0, 0
 	samples := []map[string]any{}
 	budgetHit := budgetCtx.Err() != nil
@@ -1014,6 +1013,17 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool, s
 		}
 		if probe["budget_cut"] == true {
 			// Do not cover — leave for next wave.
+			continue
+		}
+		if probe["probe_status"] == "inconclusive" || probe["outcome"] == string(probeInconclusive) {
+			inconclusive++
+			if len(samples) < 5 {
+				samples = append(samples, probe)
+			}
+			if aid != "" && !seenAcct[aid] {
+				coverIDs = append(coverIDs, aid)
+				seenAcct[aid] = true
+			}
 			continue
 		}
 		failed++
@@ -1059,7 +1069,10 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool, s
 	result["available"] = available
 	result["available_count"] = available
 	result["failed"] = failed
-	result["unavailable_count"] = failed
+	result["unavailable_count"] = failed + inconclusive
+	result["inconclusive"] = inconclusive
+	result["inconclusive_count"] = inconclusive
+	result["not_success"] = failed + inconclusive
 	result["auto_action_count"] = autoActions
 	result["kick_cooldown"] = kickCooldown
 	result["kick_disabled"] = kickDisabled
@@ -1087,7 +1100,7 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool, s
 	}
 	slog.Info("model health wave",
 		"probed", len(auths), "probes", len(probes),
-		"available", available, "failed", failed,
+		"available", available, "failed", failed, "inconclusive", inconclusive,
 		"models", cycleModels, "workers", workers, "budget_hit", budgetHit,
 		"source", source, "elapsed_ms", time.Since(startedAt).Milliseconds(),
 	)
@@ -1222,9 +1235,9 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 	client := &grok.Client{BaseURL: s.Upstream, HTTP: s.probeHTTP()}
 	body := map[string]any{
 		"model": model, "stream": true, "max_tokens": 8,
-		"messages": []any{map[string]any{"role": "user", "content": "ping"}},
+		"messages": []any{map[string]any{"role": "user", "content": "Reply with exactly OK."}},
 	}
-	resp, err := client.Open(ctx, grok.Account{ID: auth.ID, Token: auth.Token}, model, body)
+	resp, err := client.OpenRawResponses(ctx, grok.Account{ID: auth.ID, Token: auth.Token}, model, body)
 	if err != nil {
 		status := 0
 		errText := err.Error()
@@ -1238,12 +1251,27 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 		}
 		// Context cancel/timeout is not an account fault — surface cleanly.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			base["outcome"] = string(probeInconclusive)
+			base["probe_status"] = "inconclusive"
 			base["status_code"] = status
 			base["error"] = "probe budget exceeded"
 			base["latency_ms"] = time.Since(started).Milliseconds()
 			base["budget_cut"] = true
 			return base
 		}
+		if status == 0 {
+			base["outcome"] = string(probeInconclusive)
+			base["probe_status"] = "inconclusive"
+			base["status_code"] = status
+			base["error"] = errText
+			base["latency_ms"] = time.Since(started).Milliseconds()
+			if s.Store != nil && !deferSave {
+				_ = s.Store.SaveLastProbe(ctx, auth.ID, base)
+			}
+			return base
+		}
+		base["outcome"] = string(probeFailure)
+		base["probe_status"] = "fail"
 		base["status_code"] = status
 		base["error"] = errText
 		base["latency_ms"] = time.Since(started).Milliseconds()
@@ -1302,10 +1330,6 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 					base["cooldown_code"] = decision.Code
 					base["failure_class"] = string(decision.Class)
 				}
-				// Free-usage: ensure no leftover model soft-block from older probes.
-				if decision.Class == pool.ClassFreeUsage {
-					_ = s.Store.UnblockPoolModel(ctx, auth.ID, "")
-				}
 			case status >= 500:
 				sec := 300.0
 				if _, e := s.Store.KickFromPool(ctx, auth.ID, errText, &sec); e == nil {
@@ -1318,12 +1342,76 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 		}
 		return base
 	}
-	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 2048))
+	streamResult := classifyProbeStream(resp.Body)
 	_ = resp.Body.Close()
-	if n == 0 && resp.StatusCode == 200 {
-		base["status_code"] = 200
-		base["error"] = "empty model output"
-		base["latency_ms"] = time.Since(started).Milliseconds()
+	base["outcome"] = string(streamResult.Outcome)
+	base["probe_status"] = map[probeOutcome]string{
+		probeSuccess: "ok", probeFailure: "fail", probeInconclusive: "inconclusive",
+	}[streamResult.Outcome]
+	base["has_output_text"] = streamResult.Text != ""
+	base["terminal_event"] = truncateProbeText(streamResult.Terminal, 200)
+	base["status_code"] = resp.StatusCode
+	base["latency_ms"] = time.Since(started).Milliseconds()
+	if streamResult.ErrorType != "" {
+		base["error_type"] = truncateProbeText(streamResult.ErrorType, 200)
+	}
+	if streamResult.ErrorCode != "" {
+		base["error_code"] = truncateProbeText(streamResult.ErrorCode, 200)
+	}
+	if streamResult.Malformed > 0 {
+		base["malformed_events"] = streamResult.Malformed
+	}
+	if streamResult.Outcome != probeSuccess {
+		errText := streamResult.ErrorMessage
+		if errText == "" {
+			if streamResult.Outcome == probeFailure {
+				errText = "model response failed"
+			} else {
+				errText = "probe response was inconclusive"
+			}
+		}
+		if len(errText) > 800 {
+			errText = errText[:800]
+		}
+		base["error"] = errText
+		if streamResult.Outcome == probeFailure && autoDisable && s.Store != nil {
+			srcLower := strings.ToLower(strings.TrimSpace(source))
+			skipMutate := srcLower == "register" || srcLower == "import" || srcLower == "registration" || srcLower == "sso_import"
+			if !skipMutate {
+				classifierText := strings.TrimSpace(strings.Join([]string{
+					streamResult.ErrorType, streamResult.ErrorCode, errText,
+				}, " "))
+				decision := pool.ClassifyUpstreamFailure(resp.StatusCode, classifierText, model)
+				until := time.Now().Add(10 * time.Minute)
+				if decision.Until != nil {
+					until = *decision.Until
+				}
+				if decision.BlockModel && decision.Class != pool.ClassFreeUsage {
+					blockModel := firstNonEmpty(decision.Model, model)
+					if blockModel != "" {
+						if err := s.Store.BlockPoolModel(ctx, auth.ID, blockModel, &until); err == nil {
+							base["model_blocked"] = true
+							base["blocked_model"] = blockModel
+						}
+					}
+				}
+				if decision.ShouldCooldown {
+					seconds := until.Sub(time.Now()).Seconds()
+					if seconds < 60 {
+						seconds = 60
+					}
+					if seconds > 6*3600 {
+						seconds = 6 * 3600
+					}
+					reason := firstNonEmpty(decision.Code, errText, "model probe failed")
+					if _, err := s.Store.KickFromPool(ctx, auth.ID, reason, &seconds); err == nil {
+						base["kicked_cooldown"] = true
+						base["cooldown_code"] = decision.Code
+						base["failure_class"] = string(decision.Class)
+					}
+				}
+			}
+		}
 		if s.Store != nil && !deferSave {
 			_ = s.Store.SaveLastProbe(ctx, auth.ID, base)
 		}
@@ -1331,15 +1419,9 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 	}
 	base["ok"] = true
 	base["available"] = true
-	base["status_code"] = resp.StatusCode
-	base["latency_ms"] = time.Since(started).Milliseconds()
 	if s.Store != nil {
-		// Clearing cooldown is still immediate so recovered accounts re-enter rotation
-		// even when last_probe is deferred to the batch flush.
-		if _, err := s.Store.ClearAccountCooldown(ctx, auth.ID); err == nil {
-			base["recovered"] = true
-		}
-		// Successful probe for this model clears its soft/hard block (Python parity).
+		// A model probe may only recover that model. Account-level quota/free-usage
+		// cooldown is independent and must remain authoritative.
 		if model != "" {
 			if err := s.Store.UnblockPoolModel(ctx, auth.ID, model); err == nil {
 				base["unblocked_model"] = model
@@ -1434,13 +1516,18 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 		}
 	}
 
-	kickCooldown, kickDisabled, modelBlocks, available := 0, 0, 0, 0
+	kickCooldown, kickDisabled, modelBlocks, available, failed, inconclusive := 0, 0, 0, 0, 0, 0
 	for _, row := range results {
 		out = append(out, row)
 		if row["ok"] == true {
 			available++
 		}
 		if res, ok := row["result"].(map[string]any); ok {
+			if res["probe_status"] == "inconclusive" || res["outcome"] == string(probeInconclusive) {
+				inconclusive++
+			} else if res["available"] != true {
+				failed++
+			}
 			if res["auto_disabled"] == true {
 				kickDisabled++
 			}
@@ -1450,6 +1537,8 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 			if res["model_blocked"] == true {
 				modelBlocks++
 			}
+		} else if row["ok"] != true {
+			failed++
 		}
 	}
 	s.mu.Lock()
@@ -1457,7 +1546,9 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 		"ok": true, "source": source, "implementation": "go", "at": time.Now().Unix(),
 		"probed": len(ids), "count": len(ids),
 		"available": available, "available_count": available,
-		"failed": len(ids) - available, "unavailable_count": len(ids) - available,
+		"failed": failed, "unavailable_count": failed + inconclusive,
+		"inconclusive": inconclusive, "inconclusive_count": inconclusive,
+		"not_success":       failed + inconclusive,
 		"auto_action_count": kickCooldown + kickDisabled + modelBlocks,
 		"kick_cooldown":     kickCooldown, "kick_disabled": kickDisabled, "model_blocked_count": modelBlocks,
 		"model": probeModel, "models": []string{probeModel},

@@ -420,8 +420,15 @@ func (c *Connector) UnblockPoolModel(ctx context.Context, accountID, model strin
 			UPDATE account_pool
 			SET blocked_models = '{}'::jsonb,
 			    pool_status = CASE
-					WHEN enabled = false OR disabled_for_quota = true THEN 'disabled'
+					WHEN pool_status = 'expired' THEN 'expired'
+					WHEN disabled_for_quota = true THEN 'quota_disabled'
+					WHEN enabled = false THEN 'disabled'
 					WHEN cooldown_until IS NOT NULL AND cooldown_until > now() THEN 'cooldown'
+					WHEN COALESCE(cooldown_count, 0) > 0 THEN 'cooldown'
+					WHEN CASE
+						WHEN jsonb_typeof(COALESCE(extra, '{}'::jsonb)->'status_stack') = 'array'
+						THEN jsonb_array_length(COALESCE(extra, '{}'::jsonb)->'status_stack') > 0
+						ELSE false END THEN 'cooldown'
 					ELSE 'normal'
 				END,
 			    updated_at = now()
@@ -432,13 +439,21 @@ func (c *Connector) UnblockPoolModel(ctx context.Context, accountID, model strin
 		UPDATE account_pool
 		SET blocked_models = COALESCE(blocked_models, '{}'::jsonb) - $2,
 		    pool_status = CASE
-				WHEN enabled = false OR disabled_for_quota = true THEN 'disabled'
+				WHEN pool_status = 'expired' THEN 'expired'
+				WHEN disabled_for_quota = true THEN 'quota_disabled'
+				WHEN enabled = false THEN 'disabled'
 				WHEN cooldown_until IS NOT NULL AND cooldown_until > now() THEN 'cooldown'
+				WHEN COALESCE(cooldown_count, 0) > 0 THEN 'cooldown'
+				WHEN CASE
+					WHEN jsonb_typeof(COALESCE(extra, '{}'::jsonb)->'status_stack') = 'array'
+					THEN jsonb_array_length(COALESCE(extra, '{}'::jsonb)->'status_stack') > 0
+					ELSE false END THEN 'cooldown'
 				WHEN (COALESCE(blocked_models, '{}'::jsonb) - $2) = '{}'::jsonb THEN 'normal'
 				ELSE 'model_blocked'
 			END,
 		    updated_at = now()
-		WHERE account_id = $1`, accountID, model)
+		WHERE account_id = $1
+		  AND COALESCE(blocked_models, '{}'::jsonb) ? $2`, accountID, model)
 	if err == nil {
 		c.InvalidateCandidateCache()
 	}

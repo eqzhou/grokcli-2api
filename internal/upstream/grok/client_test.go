@@ -128,6 +128,30 @@ func TestOpenUsesResponsesPathAndBridgesCompletedOutput(t *testing.T) {
 	}
 }
 
+func TestOpenRawResponsesPreservesFailureTerminal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"capacity\"}}}\n\n")
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL, HTTP: server.Client()}
+	response, err := client.OpenRawResponses(context.Background(), Account{ID: "a", Token: "token"}, "grok-4.5", map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "response.failed") || !strings.Contains(string(raw), "capacity") {
+		t.Fatalf("raw terminal was lost: %s", raw)
+	}
+}
+
 func TestChatToResponsesPayloadConvertsTools(t *testing.T) {
 	body := chatToResponsesPayload(map[string]any{
 		"messages": []any{

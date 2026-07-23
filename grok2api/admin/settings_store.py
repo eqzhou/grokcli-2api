@@ -751,6 +751,74 @@ def patch_account_pool_meta(account_id: str, patch: dict[str, Any]) -> dict[str,
         return meta
 
 
+def recover_model_probe_atomic(account_id: str, model: str) -> dict[str, Any] | None:
+    """Reset probe streaks and remove only the current model block atomically."""
+    if not account_id or not model:
+        return None
+    pg = _pg_settings()
+    if pg is not None:
+        return pg.recover_model_probe(account_id, model)
+    with _lock:
+        data = _load()
+        pool = data.setdefault("account_pool", {})
+        if not isinstance(pool, dict):
+            return None
+        meta = dict(pool.get(account_id) or {})
+        blocked = meta.get("blocked_models")
+        blocked = dict(blocked) if isinstance(blocked, dict) else {}
+        changed = model in blocked
+        blocked.pop(model, None)
+        meta["blocked_models"] = blocked
+        meta["probe_fail_streak"] = 0
+        meta["consecutive_fails"] = 0
+        meta["last_probe_ok_at"] = time.time()
+        meta["last_probe_status"] = "ok"
+        meta["pool_status"] = _derive_pool_status(meta)
+        pool[account_id] = meta
+        data["updated_at"] = time.time()
+        _save(data, immediate=True)
+        out = dict(meta)
+        out["probe_unblocked_model"] = model if changed else None
+        return out
+
+
+def expire_account_cooldown_atomic(
+    account_id: str, observed_until: float
+) -> dict[str, Any] | None:
+    """Clear only the exact expired cooldown version observed by the caller."""
+    if not account_id:
+        return None
+    pg = _pg_settings()
+    if pg is not None:
+        return pg.expire_cooldown_if_unchanged(account_id, observed_until)
+    with _lock:
+        data = _load()
+        pool = data.setdefault("account_pool", {})
+        if not isinstance(pool, dict):
+            return None
+        meta = dict(pool.get(account_id) or {})
+        try:
+            current = float(meta.get("cooldown_until"))
+        except (TypeError, ValueError):
+            return None
+        now = time.time()
+        if abs(current - float(observed_until)) > 0.001 or current > now:
+            return None
+        for key in (
+            "cooldown_until", "cooldown_sec", "cooldown_reason", "cooldown_code",
+            "cooldown_model", "cooldown_tokens_actual", "cooldown_tokens_limit",
+            "cooldown_detail", "status_stack",
+        ):
+            meta.pop(key, None)
+        meta["cooldown_count"] = 0
+        meta["consecutive_fails"] = 0
+        meta["pool_status"] = _derive_pool_status(meta)
+        pool[account_id] = meta
+        data["updated_at"] = now
+        _save(data, immediate=True)
+        return dict(meta)
+
+
 def _derive_pool_status(meta: dict[str, Any]) -> str:
     """Canonical status string persisted with pool meta."""
     if not isinstance(meta, dict):

@@ -343,3 +343,58 @@ def test_fresh_probe_owned_by_sibling_worker_is_not_cleared() -> None:
     assert recovered["probing"] == 2
     assert recovered["probe_pending_count"] == 2
     mirror.assert_not_called()
+
+
+def test_post_import_probe_tracks_inconclusive_without_reenabling(monkeypatch) -> None:
+    from grok2api.pool import account_pool, model_health
+    from grok2api.upstream import grok_build_adapter as gba
+
+    sid = "probe-inconclusive-session"
+    gba._sessions[sid] = {
+        "id": sid,
+        "status": "imported",
+        "message": "imported",
+    }
+    status_calls: list[str] = []
+    counter_calls: list[dict] = []
+    monkeypatch.setattr(
+        model_health,
+        "probe_single_account",
+        lambda *a, **k: {
+            "ok": False,
+            "result": {
+                "ok": False,
+                "available": False,
+                "outcome": "inconclusive",
+                "probe_status": "inconclusive",
+                "model": "grok-4.5",
+                "error": "stream ended without a normal completion",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        account_pool,
+        "clear_account_cooldown",
+        lambda *a, **k: status_calls.append("clear"),
+    )
+    monkeypatch.setattr(gba, "_mirror_reg_sess", lambda *a, **k: None)
+    monkeypatch.setattr(
+        gba,
+        "_update_batch_probe_counters",
+        lambda *a, **k: counter_calls.append(k),
+    )
+
+    try:
+        gba._run_post_import_probe_job(
+            {"sid": sid, "account_ids": ["account-1"], "delay_sec": 0}
+        )
+        probe = gba._sessions[sid]["probe"]
+    finally:
+        gba._sessions.pop(sid, None)
+
+    assert probe["ok"] == 0
+    assert probe["fail"] == 0
+    assert probe["inconclusive"] == 1
+    assert probe["results"][0]["outcome"] == "inconclusive"
+    assert status_calls == []
+    assert counter_calls[-1]["inconclusive_delta"] == 1

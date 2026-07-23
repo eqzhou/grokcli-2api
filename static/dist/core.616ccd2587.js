@@ -3666,6 +3666,8 @@ function poolPatchFromProbeResponse(r) {
   const res = (r && (r.result || r)) || {};
   const pool = (r && r.pool) || {};
   const ok = !!(r && (r.ok || res.available));
+  const probeStatus = String(res.probe_status || (res.outcome === "success" ? "ok" : res.outcome === "failure" ? "fail" : res.outcome || (ok ? "ok" : "fail"))).toLowerCase();
+  const inconclusive = probeStatus === "inconclusive";
   const nowSec = Math.floor(Date.now() / 1000);
   // Prefer full DB pool view (after SaveLastProbe / Kick / ClearCooldown).
   let patch = {};
@@ -3697,6 +3699,8 @@ function poolPatchFromProbeResponse(r) {
     ...(pool && pool.last_probe && typeof pool.last_probe === "object" ? pool.last_probe : {}),
     available: ok,
     ok,
+    outcome: res.outcome || (ok ? "success" : (inconclusive ? "inconclusive" : "failure")),
+    probe_status: probeStatus,
     model: res.model || (pool && pool.last_probe && pool.last_probe.model) || pool.cooldown_model || null,
     latency_ms: res.latency_ms != null ? res.latency_ms : (pool && pool.last_probe && pool.last_probe.latency_ms),
     status_code: res.status_code != null ? res.status_code : (pool && pool.last_probe && pool.last_probe.status_code),
@@ -3715,10 +3719,10 @@ function poolPatchFromProbeResponse(r) {
   };
   patch.last_probe = liveProbe;
   // Live result always wins for status; pool.last_probe_status may lag (async SaveLastProbe).
-  patch.last_probe_status = ok ? "ok" : "fail";
-  patch.last_error = ok
-    ? null
-    : (res.error || (r && r.error) || pool.last_error || null);
+  patch.last_probe_status = probeStatus;
+  if (!ok && !inconclusive) {
+    patch.last_error = res.error || (r && r.error) || pool.last_error || null;
+  }
   if (res.model_blocked && res.blocked_model) {
     const ids = Array.isArray(patch.blocked_model_ids) ? patch.blocked_model_ids.slice() : [];
     if (!ids.includes(res.blocked_model)) ids.push(res.blocked_model);
@@ -5304,10 +5308,9 @@ async function runAccountProbe(accountId, model) {
     });
     const res = r.result || r;
     const ok = !!(r.ok || res.available);
+    const inconclusive = res.probe_status === "inconclusive" || res.outcome === "inconclusive";
     const pool = r.pool || {};
-    const recovered = !!(res.recovered || (res.auto_action && res.auto_action.recovered))
-      || !!(pool.pool_status === "normal" && ok && !pool.in_cooldown)
-      || !!(r.pool_status === "normal" && ok);
+    const recovered = !!(res.recovered || (res.auto_action && res.auto_action.recovered));
     // Live kick flags must count even when pool view lags (async last_probe).
     const cooling = !!(
       res.kicked_cooldown
@@ -5317,7 +5320,7 @@ async function runAccountProbe(accountId, model) {
       || (Number(pool.cooldown_remaining_sec || 0) > 0)
     );
     const lines = [
-      ok ? "✓ 探测成功" : "✗ 探测失败",
+      ok ? "✓ 探测成功" : (inconclusive ? "? 探测未完成，账号状态未改变" : "✗ 探测失败"),
       `账号: ${r.email || res.email || accountId}`,
       `模型: ${res.model || pool.cooldown_model || "—"}`,
       res.latency_ms != null ? `耗时: ${res.latency_ms} ms` : null,
@@ -5332,7 +5335,7 @@ async function runAccountProbe(accountId, model) {
     toast(
       ok
         ? (recovered ? "测活成功，已恢复为正常" : "账号模型探测成功")
-        : (cooling ? "测活失败，已进入冷却中" : (res.error || r.error || "探测失败")),
+        : (inconclusive ? "探测未完成，账号状态未改变" : (cooling ? "测活失败，已进入冷却中" : (res.error || r.error || "探测失败"))),
       ok
     );
     const poolPatch = poolPatchFromProbeResponse(r);
@@ -5396,15 +5399,16 @@ async function probeAccounts(ids, { confirmMany = true } = {}) {
       body: JSON.stringify({ ids: list, auto_disable: true }),
     });
     const results = Array.isArray(r.results) ? r.results : [];
-    let okN = 0, badN = 0, coolN = 0;
+    let okN = 0, badN = 0, inconclusiveN = 0, coolN = 0;
     const lines = [`批量模型测试完成：${results.length}/${list.length}`];
     results.forEach((item) => {
       const id = item.account_id || item.id;
       if (!id) return;
       const res = item.result || item;
       const ok = !!(item.ok || res.available);
+      const inconclusive = res.probe_status === "inconclusive" || res.outcome === "inconclusive";
       const pool = item.pool || {};
-      if (ok) okN += 1; else badN += 1;
+      if (ok) okN += 1; else if (inconclusive) inconclusiveN += 1; else badN += 1;
       const cooling = !!(
         res.kicked_cooldown
         || pool.in_cooldown
@@ -5441,16 +5445,16 @@ async function probeAccounts(ids, { confirmMany = true } = {}) {
       }
       setRowBusy(id, false);
       lines.push(
-        `${ok ? "✓" : "✗"} ${item.email || id}` +
+        `${ok ? "✓" : (inconclusive ? "?" : "✗")} ${item.email || id}` +
           (cooling ? " · 冷却中" : (pool.pool_status ? ` · ${pool.pool_status}` : "")) +
           (res.error ? ` · ${String(res.error).slice(0, 80)}` : "")
       );
     });
     // any ids missing from response
     list.forEach((id) => setRowBusy(id, false));
-    lines.splice(1, 0, `成功 ${okN} · 失败 ${badN} · 冷却 ${coolN}`);
+    lines.splice(1, 0, `成功 ${okN} · 失败 ${badN} · 未完成 ${inconclusiveN} · 冷却 ${coolN}`);
     setLogPanel("probe-result", lines.join("\n"), { forceShow: true });
-    toast(`批量测活：成功 ${okN} · 失败 ${badN} · 冷却 ${coolN}`, badN === 0);
+    toast(`批量测活：成功 ${okN} · 失败 ${badN} · 未完成 ${inconclusiveN} · 冷却 ${coolN}`, badN === 0 && inconclusiveN === 0);
     // Only the patched rows were rewritten; soft-refresh pool chips once.
     // Do NOT loadAccountsPage — full tbody rewrite scrolls the page under the user.
     Promise.resolve().then(() => softRefreshPoolChips({ stats: true }));

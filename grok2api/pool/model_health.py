@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 
 from grok2api.pool.auth import GrokCredentials, list_live_credentials, load_credentials_by_id, upstream_headers
+from grok2api.pool.probe_sse import parse_probe_sse
 from grok2api.config import (
     DEFAULT_MODEL,
     MODEL_HEALTH_AUTO_DISABLE,
@@ -389,7 +390,7 @@ def handle_upstream_error_for_model(
             return stacked
         # Fallback soft path if parser missed.
         reason = (
-            f"临时额度耗尽，已冷却，等待下次测活成功"
+            f"临时额度耗尽，已冷却，等待冷却到期或管理员处理"
             + (f" · {model}" if model else "")
         )[:300]
         if model:
@@ -476,9 +477,23 @@ def _save_last_probe(account_id: str | None, result: dict[str, Any], *, overwrit
         meta = get_account_pool_meta(account_id) or {}
         if not isinstance(meta, dict):
             meta = {}
+        outcome = str(result.get("outcome") or "").lower()
+        if outcome not in {"success", "failure", "inconclusive"}:
+            status_value = str(result.get("probe_status") or "").lower()
+            if status_value in {"ok", "success"} or result.get("available"):
+                outcome = "success"
+            elif status_value == "inconclusive":
+                outcome = "inconclusive"
+            else:
+                outcome = "failure"
+        probe_status = (
+            "ok" if outcome == "success" else "fail" if outcome == "failure" else outcome
+        )
         snap = {
             "ok": bool(result.get("ok")),
             "available": bool(result.get("available")),
+            "outcome": outcome,
+            "probe_status": probe_status,
             "model": result.get("model"),
             "status_code": result.get("status_code"),
             "error": (result.get("error") or "")[:400] or None,
@@ -495,12 +510,13 @@ def _save_last_probe(account_id: str | None, result: dict[str, Any], *, overwrit
         patch: dict[str, Any] = {}
         if overwrite or not existing:
             patch["last_probe"] = snap
-        if not snap["available"] and snap.get("error") and overwrite:
+            patch["last_probe_status"] = snap["probe_status"]
+        if snap["outcome"] == "failure" and snap.get("error") and overwrite:
             err = str(snap.get("error") or "")
             low = err.lower()
             if "free-usage-exhausted" in low or "free usage" in low:
                 patch["last_error"] = (
-                    f"[probe {snap.get('model')}] 临时额度耗尽，已冷却，等待下次测活成功"
+                    f"[probe {snap.get('model')}] 临时额度耗尽，已冷却，等待冷却到期或管理员处理"
                 )[:300]
             else:
                 # avoid storing huge JSON blobs in admin UI
@@ -533,7 +549,8 @@ def probe_model_for_creds(
     scanned account, and ONLY when conditions are met:
       - fail + free-usage/temp → cooldown + model soft-block
       - fail + durable model/account issue → block/cooldown
-      - success + currently cooling/blocked → clear cooldown & unblock model
+      - strong success → unblock only the current model
+    A model probe never clears account-level cooldown or quota state.
     Probe does NOT call report_failure/report_success (those are live-traffic paths).
     last_probe is always written for the scanned account.
     """
@@ -550,13 +567,15 @@ def probe_model_for_creds(
         "model": model,
         "probed_at": t0,
         "source": source,
+        "outcome": "inconclusive",
+        "probe_status": "inconclusive",
     }
     url = f"{UPSTREAM_BASE}/chat/completions"
     headers = upstream_headers(creds.token, model)
     headers["Accept"] = "text/event-stream, application/json"
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
+        "messages": [{"role": "user", "content": "Reply with exactly OK."}],
         "stream": True,
         "max_tokens": 8,
         "max_completion_tokens": 8,
@@ -621,71 +640,28 @@ def probe_model_for_creds(
             )
 
     def _apply_success_status() -> None:
-        """测活成功：冷却中 → 正常，并立即写库。
+        """Strong success only unblocks the probed model.
 
-        Successful probe is the recovery signal for free-usage / temp cooldown.
-        Always clear durable cooldown + soft model blocks for this account.
+        Account-level cooldown provenance is not reliable for all historical
+        rows, so a model response never clears or normalizes account cooldown.
         """
         if not creds.auth_key:
             return
         try:
             import grok2api.pool.account_pool as account_pool
-            from grok2api.admin.settings_store import get_account_pool_meta
         except Exception:
             return
         try:
-            meta = get_account_pool_meta(creds.auth_key) or {}
-        except Exception:
-            meta = {}
-        if not isinstance(meta, dict):
-            meta = {}
-        in_cd = False
-        try:
-            until = meta.get("cooldown_until")
-            if until is not None:
-                in_cd = time.time() < float(until)
-        except Exception:
-            in_cd = False
-        # Prefer pool helper (merges redis) for accurate cooling flag.
-        try:
-            in_cd = bool(account_pool.is_in_cooldown(account_pool._pool_meta(creds.auth_key, {creds.auth_key: meta}))) or in_cd
-        except Exception:
-            pass
-        blocked = meta.get("blocked_models") if isinstance(meta.get("blocked_models"), dict) else {}
-        model_blocked = bool(model and isinstance(blocked, dict) and model in blocked)
-        recovered = None
-        # Always record successful probe → clears cooldown, sets pool_status=normal.
-        try:
-            recovered = account_pool.record_model_probe_outcome(
-                creds.auth_key,
-                model=model,
-                available=True,
-                source=source,
-                auto_kick=True,
-            )
+            recovered = account_pool.recover_model_probe(creds.auth_key, model)
         except Exception:
             recovered = None
-        # Drop soft/temp model block for the probed model.
-        if model_blocked:
-            try:
-                account_pool.unblock_model(creds.auth_key, model)
-            except Exception:
-                pass
-        # Belt-and-suspenders: explicit cooldown clear so DB is definitely normal.
-        if in_cd or (recovered and recovered.get("cleared_cooldown")):
-            try:
-                account_pool.clear_account_cooldown(creds.auth_key)
-            except Exception:
-                pass
-        if in_cd or model_blocked or (recovered and recovered.get("cleared_cooldown")):
+        if isinstance(recovered, dict) and recovered.get("probe_unblocked_model") == model:
             base["auto_action"] = {
                 "recovered": True,
-                "cleared_cooldown": bool(in_cd or (recovered and recovered.get("cleared_cooldown"))),
-                "unblocked_model": model_blocked,
-                "pool_status": "normal",
+                "cleared_cooldown": False,
+                "unblocked_model": True,
+                "pool_status": recovered.get("pool_status"),
             }
-            base["pool_status"] = "normal"
-            base["in_cooldown"] = False
 
     owns_client = client is None
     http = client or _probe_http_client(creds.auth_key)
@@ -693,9 +669,20 @@ def probe_model_for_creds(
         with http.stream("POST", url, headers=headers, json=body) as resp:
             status = resp.status_code
             if status >= 400:
-                err_text = (resp.read()).decode("utf-8", errors="replace")[:800]
+                if hasattr(resp, "iter_raw"):
+                    error_body = bytearray()
+                    for chunk in resp.iter_raw():
+                        remaining = (64 * 1024) - len(error_body)
+                        if remaining <= 0:
+                            break
+                        error_body.extend(chunk[:remaining])
+                else:
+                    error_body = bytearray(resp.read()[: 64 * 1024])
+                err_text = bytes(error_body).decode("utf-8", errors="replace")[:800]
                 base["status_code"] = status
                 base["error"] = err_text
+                base["outcome"] = "failure"
+                base["probe_status"] = "fail"
                 base["available"] = False
                 base["latency_ms"] = int((time.time() - t0) * 1000)
                 # Do NOT report_failure here — probe is not live traffic.
@@ -703,38 +690,32 @@ def probe_model_for_creds(
                 _save_last_probe(creds.auth_key, base, overwrite=report_stats)
                 return base
 
-            got_data = False
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                if isinstance(line, bytes):
-                    line = line.decode("utf-8", errors="replace")
-                if line.startswith("data:"):
-                    got_data = True
-                    break
-            base["ok"] = True
-            base["available"] = True
+            if hasattr(resp, "iter_raw"):
+                parsed = parse_probe_sse(resp.iter_raw(), raw_chunks=True)
+            else:
+                parsed = parse_probe_sse(resp.iter_lines())
+            base.update(parsed)
             base["status_code"] = status
-            base["stream_ok"] = got_data
             base["latency_ms"] = int((time.time() - t0) * 1000)
-            # Do NOT report_success here — probe is not live traffic.
-            _apply_success_status()
+            if base["outcome"] == "success":
+                _apply_success_status()
+            elif base["outcome"] == "failure":
+                _apply_fail_status(str(base.get("error") or "probe failed"), status)
             _save_last_probe(creds.auth_key, base, overwrite=report_stats)
             return base
     except httpx.HTTPError as e:
         base["error"] = f"network: {e}"
+        base["outcome"] = "inconclusive"
+        base["probe_status"] = "inconclusive"
         base["latency_ms"] = int((time.time() - t0) * 1000)
-        # Network errors: only record last_probe; do not cool/disable unless auto_disable
-        # and we treat as temporary server issue via probe outcome streak.
-        if auto_disable:
-            _apply_fail_status(base["error"], 502)
+        # Network errors are inconclusive: persist observability only.
         _save_last_probe(creds.auth_key, base, overwrite=report_stats)
         return base
     except Exception as e:  # noqa: BLE001
         base["error"] = str(e)[:300]
+        base["outcome"] = "inconclusive"
+        base["probe_status"] = "inconclusive"
         base["latency_ms"] = int((time.time() - t0) * 1000)
-        if auto_disable:
-            _apply_fail_status(base["error"], 502)
         _save_last_probe(creds.auth_key, base, overwrite=report_stats)
         return base
     finally:
@@ -953,7 +934,13 @@ def _background_probe_priority(
         last_ok = bool(snap.get("available"))
     else:
         last_ok = True
-    if streak > 0 or last_status in ("error", "fail", "failed", "cooldown") or last_ok is False:
+    if streak > 0 or last_status in (
+        "error",
+        "fail",
+        "failed",
+        "cooldown",
+        "inconclusive",
+    ) or last_ok is False:
         # Higher streak first, then oldest fail.
         return (2, -float(streak), last_at, aid)
 
@@ -1026,6 +1013,8 @@ def _is_recoverable_probe_result(result: dict[str, Any] | None) -> bool:
     """
     if not isinstance(result, dict):
         return False
+    if result.get("outcome") == "inconclusive" or result.get("probe_status") == "inconclusive":
+        return True
     if result.get("available"):
         return False
     err = str(result.get("error") or "")
@@ -1465,6 +1454,8 @@ def probe_account_models(
                     {
                         "ok": False,
                         "available": False,
+                        "outcome": "inconclusive",
+                        "probe_status": "inconclusive",
                         "account_id": creds.auth_key,
                         "email": creds.email,
                         "model": model,
@@ -1498,6 +1489,8 @@ def probe_account_models(
                         {
                             "ok": False,
                             "available": False,
+                            "outcome": "inconclusive",
+                            "probe_status": "inconclusive",
                             "error": str(e)[:300],
                             "source": source,
                             "probed_at": time.time(),
@@ -1540,6 +1533,9 @@ def probe_account_models(
         deferred = int(deferred or 0) + int(skipped_accounts)
 
     available = sum(1 for r in results if r.get("available"))
+    inconclusive = sum(
+        1 for r in results if r.get("outcome") == "inconclusive"
+    )
     blocked = sum(
         1 for r in results if not r.get("available") and r.get("auto_disabled")
     )
@@ -1552,6 +1548,7 @@ def probe_account_models(
         "count": len(results),
         "available_count": available,
         "unavailable_count": len(results) - available,
+        "inconclusive_count": inconclusive,
         "auto_action_count": blocked,
         "deferred": deferred,
         "workers": workers,

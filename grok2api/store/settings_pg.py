@@ -563,6 +563,76 @@ def patch_pool_meta(account_id: str, patch: dict[str, Any]) -> dict[str, Any]:
     return meta
 
 
+def recover_model_probe(account_id: str, model: str) -> dict[str, Any] | None:
+    """Atomically reset probe streaks and remove exactly one model block."""
+    if not enabled() or not account_id or not model:
+        return None
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_POOL_SELECT_COLS} FROM account_pool WHERE account_id = %s FOR UPDATE",
+                (account_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            meta = _row_to_meta(row)
+            blocked = meta.get("blocked_models")
+            blocked = dict(blocked) if isinstance(blocked, dict) else {}
+            changed = model in blocked
+            blocked.pop(model, None)
+            meta["blocked_models"] = blocked
+            meta["probe_fail_streak"] = 0
+            meta["consecutive_fails"] = 0
+            meta["last_probe_ok_at"] = time.time()
+            meta["last_probe_status"] = "ok"
+            meta["pool_status"] = _derive_pool_status(meta)
+            _upsert_pool(cur, account_id, meta, preserve_active_cooldown=False)
+        conn.commit()
+    invalidate_pool_state_cache()
+    meta["probe_unblocked_model"] = model if changed else None
+    return meta
+
+
+def expire_cooldown_if_unchanged(
+    account_id: str, observed_until: float
+) -> dict[str, Any] | None:
+    """Atomically clear only the exact expired cooldown snapshot observed."""
+    if not enabled() or not account_id:
+        return None
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_POOL_SELECT_COLS} FROM account_pool WHERE account_id = %s FOR UPDATE",
+                (account_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            meta = _row_to_meta(row)
+            current = meta.get("cooldown_until")
+            try:
+                current_f = float(current)
+            except (TypeError, ValueError):
+                return None
+            now = time.time()
+            if abs(current_f - float(observed_until)) > 0.001 or current_f > now:
+                return None
+            for key in (
+                "cooldown_until", "cooldown_sec", "cooldown_reason", "cooldown_code",
+                "cooldown_model", "cooldown_tokens_actual", "cooldown_tokens_limit",
+                "cooldown_detail", "status_stack",
+            ):
+                meta.pop(key, None)
+            meta["cooldown_count"] = 0
+            meta["consecutive_fails"] = 0
+            meta["pool_status"] = _derive_pool_status(meta)
+            _upsert_pool(cur, account_id, meta, preserve_active_cooldown=False)
+        conn.commit()
+    invalidate_pool_state_cache()
+    return meta
+
+
 def _derive_pool_status(meta: dict[str, Any]) -> str:
     """Canonical status from durable DB fields (no Redis refresh)."""
     if not isinstance(meta, dict):

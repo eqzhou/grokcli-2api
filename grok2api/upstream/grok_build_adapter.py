@@ -458,6 +458,7 @@ def _update_batch_probe_counters(
     pending_delta: int = 0,
     ok_delta: int = 0,
     fail_delta: int = 0,
+    inconclusive_delta: int = 0,
 ) -> None:
     """Persist batch-level probe counters so large batches remain observable."""
     sess = _load_reg_sess(str(sid or ""))
@@ -485,6 +486,11 @@ def _update_batch_probe_counters(
         )
         current["probe_fail_count"] = max(
             0, int(current.get("probe_fail_count") or 0) + int(fail_delta or 0)
+        )
+        current["probe_inconclusive_count"] = max(
+            0,
+            int(current.get("probe_inconclusive_count") or 0)
+            + int(inconclusive_delta or 0),
         )
         current["probe_updated_at"] = _now()
         if pending > 0:
@@ -618,10 +624,25 @@ def _run_post_import_probe_job(job: dict[str, Any]) -> None:
                         or detail.get("elapsed_ms")
                         or detail.get("duration_ms")
                     )
+                    detail_status = str(detail.get("probe_status") or "").lower()
+                    outcome = detail.get("outcome")
+                    if outcome not in {"success", "failure", "inconclusive"}:
+                        outcome = (
+                            "success"
+                            if detail_status in {"ok", "success"}
+                            or bool(pr.get("ok"))
+                            else "inconclusive"
+                            if detail_status == "inconclusive"
+                            else "failure"
+                        )
                     probe_summaries.append(
                         {
                             "account_id": aid,
                             "ok": bool(pr.get("ok") if isinstance(pr, dict) else False),
+                            "available": bool(detail.get("available")),
+                            "outcome": outcome,
+                            "probe_status": detail.get("probe_status")
+                            or ("ok" if bool(pr.get("ok")) else "fail"),
                             "model": detail.get("model")
                             or (pr.get("model") if isinstance(pr, dict) else None),
                             "error": (str(err_text)[:180] if err_text else None),
@@ -633,6 +654,9 @@ def _run_post_import_probe_job(job: dict[str, Any]) -> None:
                         {
                             "account_id": aid,
                             "ok": False,
+                            "available": False,
+                            "outcome": "inconclusive",
+                            "probe_status": "inconclusive",
                             "error": str(pe)[:180],
                         }
                     )
@@ -641,48 +665,19 @@ def _run_post_import_probe_job(job: dict[str, Any]) -> None:
                 {
                     "account_id": None,
                     "ok": False,
+                    "available": False,
+                    "outcome": "inconclusive",
+                    "probe_status": "inconclusive",
                     "error": f"probe module error: {pe}"[:180],
                 }
             )
-        # Re-enable / clear cool so new accounts stay in rotation.
-        try:
-            import grok2api.pool.account_pool as account_pool
-            from grok2api.admin.settings_store import (
-                get_account_pool_meta,
-                patch_account_pool_meta,
-            )
-
-            for aid in ids:
-                try:
-                    account_pool.clear_account_cooldown(aid)
-                except Exception:
-                    pass
-                try:
-                    meta = get_account_pool_meta(aid) or {}
-                    if (
-                        isinstance(meta, dict)
-                        and meta.get("enabled") is False
-                        and not meta.get("disabled_for_quota")
-                    ):
-                        patch_account_pool_meta(
-                            aid,
-                            {
-                                "enabled": True,
-                                "pool_status": "normal",
-                                "disabled_reason": None,
-                                "disabled_source": None,
-                                "cooldown_until": None,
-                                "cooldown_count": 0,
-                            },
-                        )
-                except Exception:
-                    pass
-        except Exception:
-            pass
         probe = {
             "count": len(probe_summaries),
-            "ok": sum(1 for p in probe_summaries if p.get("ok")),
-            "fail": sum(1 for p in probe_summaries if not p.get("ok")),
+            "ok": sum(1 for p in probe_summaries if p.get("outcome") == "success"),
+            "fail": sum(1 for p in probe_summaries if p.get("outcome") == "failure"),
+            "inconclusive": sum(
+                1 for p in probe_summaries if p.get("outcome") == "inconclusive"
+            ),
             "results": probe_summaries,
             "pending": False,
         }
@@ -713,6 +708,7 @@ def _run_post_import_probe_job(job: dict[str, Any]) -> None:
                 if "probe ok=" not in msg:
                     cur["message"] = (
                         f"{msg}; probe ok={probe['ok']} fail={probe['fail']} "
+                        f"inconclusive={probe['inconclusive']} "
                         f"[{ADAPTER_BUILD}]"
                     ).strip("; ")
                 _sessions[sid] = cur
@@ -727,6 +723,7 @@ def _run_post_import_probe_job(job: dict[str, Any]) -> None:
             pending_delta=-len(ids),
             ok_delta=int(probe.get("ok") or 0),
             fail_delta=int(probe.get("fail") or 0),
+            inconclusive_delta=int(probe.get("inconclusive") or 0),
         )
     except Exception as e:  # noqa: BLE001
         print(f"[grok-build-auth] WARN: async probe failed sid={sid}: {e}")
@@ -1511,7 +1508,9 @@ def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
         out["probe"] = {
             "ok": probe.get("ok"),
             "fail": probe.get("fail"),
+            "inconclusive": probe.get("inconclusive"),
             "count": probe.get("count") or len(probe.get("results") or []),
+            "pending": probe.get("pending"),
             "results": list(probe.get("results") or [])[-6:],
         }
     return out
@@ -2632,6 +2631,7 @@ def start_registration(
         "probe_pending_count": 0,
         "probe_ok_count": 0,
         "probe_fail_count": 0,
+        "probe_inconclusive_count": 0,
         "consecutive_rate_limits": 0,
         "spawned": 0,
         "reg_config": reg_cfg,

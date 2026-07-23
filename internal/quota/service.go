@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -1149,12 +1150,19 @@ func proxyFromEnv() *url.URL {
 }
 
 func normalizeBilling(raw map[string]any) map[string]any {
-	if raw == nil {
+	if len(raw) == 0 {
 		return map[string]any{"ok": false, "error": "empty billing response"}
 	}
+	if raw["error"] != nil || raw["errors"] != nil || raw["ok"] == false {
+		return map[string]any{"ok": false, "error": "billing error response"}
+	}
 	cfg := raw
-	if nested, ok := raw["config"].(map[string]any); ok {
-		cfg = nested
+	if nested, exists := raw["config"]; exists {
+		var ok bool
+		cfg, ok = nested.(map[string]any)
+		if !ok || len(cfg) == 0 {
+			return map[string]any{"ok": false, "error": "invalid billing config"}
+		}
 	}
 	// Monthly dollar budget (SuperGrok included allowance).
 	monthly := firstMoney(cfg, "monthlyLimit", "monthly_limit", "monthLimit", "month_limit")
@@ -1165,6 +1173,15 @@ func normalizeBilling(raw map[string]any) map[string]any {
 	onDemand := firstMoney(cfg, "onDemandCap", "on_demand_cap", "onDemandLimit", "on_demand_limit")
 	onDemandUsed := firstMoney(cfg, "onDemandUsed", "on_demand_used")
 	prepaid := firstMoney(cfg, "prepaidBalance", "prepaid_balance", "prepaid")
+	hasMonthlyPair := hasAnyKey(cfg, "monthlyLimit", "monthly_limit", "monthLimit", "month_limit") &&
+		hasAnyKey(cfg, "used", "monthlyUsed", "monthly_used", "includedUsed", "included_used") && monthly != nil && used != nil
+	hasWeeklyPair := hasAnyKey(cfg, "weeklyLimit", "weekly_limit", "weekLimit", "week_limit", "weeklyCap", "weekly_cap") &&
+		hasAnyKey(cfg, "weeklyUsed", "weekly_used", "weekUsed", "week_used") && weekly != nil && weeklyUsed != nil
+	hasOnDemandPair := hasAnyKey(cfg, "onDemandCap", "on_demand_cap", "onDemandLimit", "on_demand_limit") &&
+		hasAnyKey(cfg, "onDemandUsed", "on_demand_used") && onDemand != nil && onDemandUsed != nil
+	if !hasMonthlyPair && !hasWeeklyPair && !hasOnDemandPair {
+		return map[string]any{"ok": false, "error": "unrecognized or incomplete billing schema"}
+	}
 
 	var remaining *float64
 	if monthly != nil && used != nil {
@@ -1263,6 +1280,15 @@ func firstMoney(cfg map[string]any, keys ...string) *float64 {
 		}
 	}
 	return nil
+}
+
+func hasAnyKey(cfg map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := cfg[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func firstString(cfg map[string]any, keys ...string) string {
@@ -1461,18 +1487,22 @@ func normalizeBillingUsageFields(out map[string]any) {
 }
 
 func money(v any) *float64 {
+	valid := func(value float64) *float64 {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+			return nil
+		}
+		return &value
+	}
 	switch t := v.(type) {
 	case float64:
-		return &t
+		return valid(t)
 	case int:
-		f := float64(t)
-		return &f
+		return valid(float64(t))
 	case int64:
-		f := float64(t)
-		return &f
+		return valid(float64(t))
 	case json.Number:
 		if f, err := t.Float64(); err == nil {
-			return &f
+			return valid(f)
 		}
 	case map[string]any:
 		if val, ok := t["val"]; ok {
