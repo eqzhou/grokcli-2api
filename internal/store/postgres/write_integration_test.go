@@ -174,7 +174,7 @@ func TestPoolWritersIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	blocked = decodeMap(blockedBytes)
-	if fails != 1 || status != "cooldown" || cooldownCount != 1 || blocked["grok-4"] == nil {
+	if fails != 1 || status != "model_blocked" || cooldownCount != 1 || blocked["grok-4"] == nil {
 		t.Fatalf("failure row = fails:%d status:%s cooldown:%d blocked:%#v", fails, status, cooldownCount, blocked)
 	}
 }
