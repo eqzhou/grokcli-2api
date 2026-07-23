@@ -40,7 +40,10 @@ func classifyProbeStream(reader io.Reader) probeStreamResult {
 	scanner.Buffer(make([]byte, 32<<10), 1<<20)
 	eventName := ""
 	dataLines := make([]string, 0, 2)
-	textParts := make([]string, 0, 2)
+	responseDeltas := make([]string, 0, 2)
+	completedTexts := make([]string, 0, 2)
+	chatDeltas := make([]string, 0, 2)
+	chatMessages := make([]string, 0, 2)
 	explicitFailure := false
 
 	flush := func() {
@@ -83,7 +86,7 @@ func classifyProbeStream(reader io.Reader) probeStreamResult {
 		switch typeName {
 		case "response.output_text.delta":
 			if delta := strings.TrimSpace(stringAny(payload["delta"])); delta != "" {
-				textParts = append(textParts, delta)
+				responseDeltas = append(responseDeltas, delta)
 			}
 		case "response.completed":
 			response, _ := payload["response"].(map[string]any)
@@ -103,7 +106,7 @@ func classifyProbeStream(reader io.Reader) probeStreamResult {
 			} else {
 				result.Completed = true
 				result.Terminal = "completed"
-				textParts = append(textParts, completedOutputText(response["output"])...)
+				completedTexts = append(completedTexts, completedOutputText(response["output"])...)
 			}
 		case "response.failed", "response.error", "response.incomplete", "error":
 			explicitFailure = true
@@ -115,11 +118,13 @@ func classifyProbeStream(reader io.Reader) probeStreamResult {
 				if choice == nil {
 					continue
 				}
-				for _, key := range []string{"delta", "message"} {
-					part, _ := choice[key].(map[string]any)
-					if content := strings.TrimSpace(stringAny(part["content"])); content != "" {
-						textParts = append(textParts, content)
-					}
+				delta, _ := choice["delta"].(map[string]any)
+				if content := strings.TrimSpace(stringAny(delta["content"])); content != "" {
+					chatDeltas = append(chatDeltas, content)
+				}
+				message, _ := choice["message"].(map[string]any)
+				if content := strings.TrimSpace(stringAny(message["content"])); content != "" {
+					chatMessages = append(chatMessages, content)
 				}
 				finish := strings.ToLower(strings.TrimSpace(stringAny(choice["finish_reason"])))
 				if finish == "stop" {
@@ -162,6 +167,18 @@ func classifyProbeStream(reader io.Reader) probeStreamResult {
 		result.Completed = false
 	}
 
+	textParts := completedTexts
+	if len(chatMessages) > 0 {
+		textParts = chatMessages
+	}
+	if len(chatDeltas) > 0 {
+		textParts = chatDeltas
+	}
+	if len(responseDeltas) > 0 {
+		// Responses completed.output is a final snapshot of the same text already
+		// emitted by output_text.delta events; combining both duplicates content.
+		textParts = responseDeltas
+	}
 	result.Text = strings.TrimSpace(strings.Join(textParts, ""))
 	switch {
 	case explicitFailure:

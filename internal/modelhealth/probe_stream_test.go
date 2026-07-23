@@ -36,6 +36,22 @@ func TestClassifyResponsesProbeAcceptsCompletedOutputText(t *testing.T) {
 	}
 }
 
+func TestClassifyResponsesProbeDoesNotDuplicateDeltaAndCompletedSnapshot(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"OK"}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"OK"}]}]}}`,
+		``,
+	}, "\n")
+
+	result := classifyProbeStream(strings.NewReader(stream))
+	if result.Outcome != probeSuccess || result.Text != "OK" || !result.Completed {
+		t.Fatalf("completed snapshot duplicated streamed delta: %#v", result)
+	}
+}
+
 func TestClassifyResponsesProbeTerminalErrorsAreFailure(t *testing.T) {
 	for _, eventType := range []string{
 		"response.failed",
@@ -97,6 +113,19 @@ func TestClassifyChatProbeRequiresTextAndNormalFinish(t *testing.T) {
 	result := classifyProbeStream(strings.NewReader(stream))
 	if result.Outcome != probeSuccess || result.Text != "OK" || !result.Completed {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestClassifyChatProbeDoesNotDuplicateDeltaAndFinalMessage(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"OK"}}]}`,
+		``,
+		`data: {"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}]}`,
+		``,
+	}, "\n")
+	result := classifyProbeStream(strings.NewReader(stream))
+	if result.Outcome != probeSuccess || result.Text != "OK" || !result.Completed {
+		t.Fatalf("final message duplicated streamed delta: %#v", result)
 	}
 }
 
