@@ -243,12 +243,27 @@ func (c *Connector) WriteTask(ctx context.Context, kind, status, summary, taskID
 			  ORDER BY id DESC
 			  LIMIT 1
 			)
+			AND (
+			  status NOT IN ('cancelled', 'stopped')
+			  OR $1 IN ('cancelled', 'stopped')
+			)
 			RETURNING id
 		`, status, summary, detailBytes, ok, progressDone, progressTotal, finished, kind, taskID).Scan(&id)
 		if err == nil && id > 0 {
 			return id, nil
 		}
-		// No existing row (or update miss) → insert below.
+		// A terminal-sticky row rejects stale progress. Return the existing
+		// id instead of inserting a duplicate lifecycle row.
+		err = c.Pool.QueryRow(ctx, `
+			SELECT id FROM task_logs
+			WHERE kind = $1 AND task_id = $2
+			ORDER BY id DESC
+			LIMIT 1
+		`, kind, taskID).Scan(&id)
+		if err == nil && id > 0 {
+			return id, nil
+		}
+		// No existing row → insert below.
 	}
 
 	var finishedAt *time.Time

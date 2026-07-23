@@ -21,6 +21,9 @@ from __future__ import annotations
 import os
 import secrets
 import sys
+import threading
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 import json
 from typing import Any
@@ -41,8 +44,100 @@ else:
     _IMPORT_ERROR = None
 
 
-app = FastAPI(title="grok2api registration internal API", version="1.0.0")
 API_PREFIX = "/internal/registration/v1"
+_orphan_watchdog_started = False
+_orphan_watchdog_lock = threading.Lock()
+
+
+def _reconcile_shared_sidecar_jobs() -> None:
+    from grok2api.admin import sso_import
+    from grok2api.upstream import oidc_auth
+
+    for label, reconcile in (
+        ("SSO", sso_import.reconcile_orphaned_sso_jobs),
+        ("device", oidc_auth.reconcile_orphaned_device_sessions),
+    ):
+        try:
+            result = reconcile()
+            if not result.get("ok"):
+                print(
+                    f"[registration] {label} orphan reconciliation unavailable: "
+                    f"{result.get('error') or 'unknown error'}"
+                )
+            if int(result.get("cancelled") or 0):
+                print(
+                    f"[registration] {label} orphan reconciliation: "
+                    f"cancelled={int(result.get('cancelled') or 0)}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[registration] {label} orphan reconciliation error: {exc}")
+
+
+def _ensure_shared_sidecar_orphan_watchdog() -> None:
+    global _orphan_watchdog_started
+    with _orphan_watchdog_lock:
+        if _orphan_watchdog_started:
+            return
+        _orphan_watchdog_started = True
+
+    def _loop() -> None:
+        while True:
+            time.sleep(15)
+            _reconcile_shared_sidecar_jobs()
+
+    threading.Thread(
+        target=_loop,
+        daemon=True,
+        name="g2a-sidecar-orphan-watchdog",
+    ).start()
+
+
+def reconcile_orphaned_registration_tasks() -> None:
+    """Fail closed after restart: never silently resume an ownerless batch."""
+    if reg is None:
+        return
+    try:
+        result = reg.reclaim_orphaned_registration_batches(
+            auto_resume=False,
+            max_batches=0,
+        )
+        cancelled = int(result.get("batches_cancelled") or 0)
+        reclaimed = int(result.get("sessions_reclaimed") or 0)
+        if cancelled or reclaimed:
+            print(
+                f"[registration] startup reconciliation: "
+                f"batches_cancelled={cancelled} sessions_reclaimed={reclaimed}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        # Sidecar must remain available so an administrator can retry reclaim.
+        print(f"[registration] startup reconciliation error: {exc}")
+    try:
+        reg._ensure_registration_watchdog()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[registration] watchdog startup error: {exc}")
+
+    try:
+        from grok2api.store.sidecar_owner import start_heartbeat
+
+        if not start_heartbeat():
+            print("[registration] sidecar owner lease unavailable; shared jobs disabled")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[registration] sidecar owner heartbeat error: {exc}")
+    _reconcile_shared_sidecar_jobs()
+    _ensure_shared_sidecar_orphan_watchdog()
+
+
+@asynccontextmanager
+async def _service_lifespan(_app: FastAPI):
+    reconcile_orphaned_registration_tasks()
+    yield
+
+
+app = FastAPI(
+    title="grok2api registration internal API",
+    version="1.0.0",
+    lifespan=_service_lifespan,
+)
 
 
 def _require_auth(request: Request) -> None:
@@ -552,6 +647,13 @@ SSO_PREFIX = "/internal/sso/v1"
 async def sso_import_start(request: Request) -> dict[str, Any]:
     """Start async SSO cookie import using existing Python helpers/scripts."""
     _require_auth(request)
+    from grok2api.store.sidecar_owner import owner_lease_valid
+
+    if not owner_lease_valid():
+        raise HTTPException(
+            status_code=503,
+            detail="sidecar owner lease unavailable; retry after Redis recovers",
+        )
     try:
         body = await request.json()
     except Exception as exc:  # noqa: BLE001
@@ -598,6 +700,8 @@ async def sso_import_start(request: Request) -> dict[str, Any]:
 
     job_id = f"sso_{uuid.uuid4().hex[:16]}"
     now = time.time()
+    from grok2api.store.sidecar_owner import current_owner_id
+
     job = {
         "id": job_id,
         "status": "queued",
@@ -619,6 +723,7 @@ async def sso_import_start(request: Request) -> dict[str, Any]:
         "imported": [],
         "error": None,
         "ok": None,
+        "sidecar_owner": current_owner_id(),
     }
     ar._sso_job_put(job_id, job)
     t = threading.Thread(

@@ -765,6 +765,10 @@ def start_device_authorization(
     scopes: str | None = None,
 ) -> dict[str, Any]:
     """Start OIDC device flow; returns session for UI polling."""
+    from grok2api.store.sidecar_owner import owner_lease_valid
+
+    if not owner_lease_valid():
+        return {"ok": False, "error": "sidecar owner lease unavailable"}
     cid = client_id or GROK_CLI_CLIENT_ID
     scope = scopes or OIDC_SCOPES
     form = {"client_id": cid, "scope": scope}
@@ -795,6 +799,7 @@ def start_device_authorization(
     interval = int(data.get("interval") or 5)
     expires_in = int(data.get("expires_in") or 1800)
     started = time.time()
+    from grok2api.store.sidecar_owner import current_owner_id
 
     sess = {
         "id": session_id,
@@ -815,6 +820,7 @@ def start_device_authorization(
         "output": json.dumps(data, ensure_ascii=False),
         "account_id": None,
         "email": None,
+        "sidecar_owner": current_owner_id(),
     }
     with _lock:
         _device_sessions[session_id] = sess
@@ -845,6 +851,10 @@ def _device_update(session_id: str, **fields: Any) -> dict[str, Any] | None:
         sess = _device_sessions.get(session_id)
         if not sess:
             return None
+        if str(sess.get("status") or "").lower() == "cancelled" and str(
+            fields.get("status") or ""
+        ).lower() != "cancelled":
+            return dict(sess)
         sess.update(fields)
         snap = dict(sess)
     _device_mirror(session_id, snap)
@@ -852,10 +862,26 @@ def _device_update(session_id: str, **fields: Any) -> dict[str, Any] | None:
 
 
 def _device_poll_worker(session_id: str) -> None:
+    from grok2api.store.sidecar_owner import owner_lease_valid
+
     while True:
+        if not owner_lease_valid():
+            _device_update(
+                session_id,
+                status="cancelled",
+                error="sidecar owner lease lost",
+                message="device login cancelled because sidecar owner lease was lost",
+                finished_at=time.time(),
+            )
+            return
         with _lock:
             sess = _device_sessions.get(session_id)
-            if not sess or sess.get("status") in ("success", "error", "expired"):
+            if not sess or sess.get("status") in (
+                "success",
+                "error",
+                "expired",
+                "cancelled",
+            ):
                 return
             if time.time() > float(sess.get("expires_at") or 0):
                 sess["status"] = "expired"
@@ -893,6 +919,15 @@ def _device_poll_worker(session_id: str) -> None:
 
         err = body.get("error") if isinstance(body, dict) else None
         if resp.status_code == 200 and body.get("access_token"):
+            if not owner_lease_valid():
+                _device_update(
+                    session_id,
+                    status="cancelled",
+                    error="sidecar owner lease lost",
+                    message="device login cancelled because sidecar owner lease was lost",
+                    finished_at=time.time(),
+                )
+                return
             try:
                 account_id, entry = entry_from_token_response(body)
                 # enrich email via userinfo if missing
@@ -1047,6 +1082,75 @@ def list_device_sessions() -> list[dict[str, Any]]:
         if item:
             out.append(item)
     return out
+
+
+def reconcile_orphaned_device_sessions() -> dict[str, Any]:
+    """Cancel non-terminal device polls that lost their owning sidecar."""
+    rows: list[tuple[str, dict[str, Any]]] = []
+    try:
+        from grok2api.store.redis_client import redis_url
+
+        redis_configured = bool(redis_url())
+    except Exception:
+        redis_configured = False
+    if redis_configured:
+        try:
+            from grok2api.store import sessions_redis
+
+            rows = sessions_redis.device_list() or []
+        except Exception as exc:
+            return {
+                "ok": False,
+                "cancelled": 0,
+                "redis_read_unknown": True,
+                "error": str(exc),
+            }
+    with _lock:
+        known = {sid for sid, _ in rows}
+        rows.extend(
+            (sid, dict(sess))
+            for sid, sess in _device_sessions.items()
+            if sid not in known
+        )
+    cancelled = 0
+    owner_unknown = False
+    for sid, raw in rows:
+        sess = dict(raw or {})
+        if str(sess.get("status") or "").lower() in {
+            "success",
+            "error",
+            "expired",
+            "cancelled",
+        }:
+            continue
+        owner = str(sess.get("sidecar_owner") or "").strip()
+        if owner:
+            from grok2api.store.sidecar_owner import owner_alive
+
+            alive = owner_alive(owner)
+            if alive is None:
+                owner_unknown = True
+                continue
+            if alive:
+                continue
+        sess.update(
+            {
+                "status": "cancelled",
+                "error": "orphaned sidecar device-login session",
+                "message": "device login cancelled after sidecar restart",
+                "finished_at": time.time(),
+            }
+        )
+        with _lock:
+            _device_sessions[sid] = sess
+        _device_mirror(sid, sess)
+        cancelled += 1
+    return {
+        "ok": not owner_unknown,
+        "cancelled": cancelled,
+        "redis_read_unknown": owner_unknown,
+        "error": "sidecar owner lease unavailable" if owner_unknown else None,
+    }
 
 
 # Strict non-repeat sweep for background token refresh (shared via Redis).

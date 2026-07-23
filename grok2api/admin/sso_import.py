@@ -64,11 +64,18 @@ def _sso_job_key(job_id: str) -> str:
 def _sso_job_put(job_id: str, job: dict[str, Any]) -> None:
     payload = dict(job)
     with _sso_jobs_lock:
+        current = _sso_jobs_local.get(job_id) or {}
+        if str(current.get("status") or "").lower() == "cancelled" and str(
+            payload.get("status") or ""
+        ).lower() != "cancelled":
+            return
         _sso_jobs_local[job_id] = payload
     try:
-        from grok2api.store.redis_client import set_json
+        from grok2api.store.redis_client import set_json_preserving_cancelled
 
-        set_json(_sso_job_key(job_id), payload, _SSO_JOB_TTL_SEC)
+        set_json_preserving_cancelled(
+            _sso_job_key(job_id), payload, _SSO_JOB_TTL_SEC
+        )
     except Exception:
         pass
 
@@ -85,6 +92,86 @@ def _sso_job_get(job_id: str) -> dict[str, Any] | None:
     with _sso_jobs_lock:
         job = _sso_jobs_local.get(job_id)
         return dict(job) if isinstance(job, dict) else None
+
+
+def reconcile_orphaned_sso_jobs() -> dict[str, Any]:
+    """Cancel queued/running SSO jobs left without a sidecar worker."""
+    jobs: dict[str, dict[str, Any]] = {}
+    try:
+        from grok2api.store.redis_client import get_client, get_json, key, redis_url
+
+        if redis_url():
+            client = get_client()
+            if client is None:
+                raise RuntimeError("Redis client unavailable")
+            for redis_key in client.scan_iter(
+                match=key("sso_import", "job", "*"), count=50
+            ):
+                data = get_json(str(redis_key))
+                if isinstance(data, dict):
+                    job_id = str(data.get("id") or str(redis_key).rsplit(":", 1)[-1])
+                    jobs[job_id] = data
+    except Exception as exc:
+        return {"ok": False, "cancelled": 0, "redis_read_unknown": True, "error": str(exc)}
+    with _sso_jobs_lock:
+        for job_id, job in _sso_jobs_local.items():
+            jobs.setdefault(job_id, dict(job))
+
+    cancelled = 0
+    owner_unknown = False
+    now = time.time()
+    for job_id, job in jobs.items():
+        if str(job.get("status") or "").lower() not in {"queued", "running"}:
+            continue
+        owner = str(job.get("sidecar_owner") or "").strip()
+        if owner:
+            from grok2api.store.sidecar_owner import owner_alive
+
+            alive = owner_alive(owner)
+            if alive is None:
+                owner_unknown = True
+                continue
+            if alive:
+                continue
+        total = int(job.get("total") or 0)
+        done = int(job.get("done") or 0)
+        message = "SSO import cancelled after registration sidecar restart"
+        _sso_job_put(
+            job_id,
+            {
+                **job,
+                "status": "cancelled",
+                "phase": "cancelled",
+                "message": message,
+                "error": "orphaned sidecar job",
+                "finished_at": now,
+                "updated_at": now,
+                "ok": False,
+            },
+        )
+        try:
+            import grok2api.admin.task_log as task_log
+
+            task_log.record(
+                "sso_import",
+                task_id=job_id,
+                summary=message,
+                status="cancelled",
+                ok=False,
+                progress_done=done,
+                progress_total=total,
+                finished=True,
+                detail={"stop_kind": "startup_orphan"},
+            )
+        except Exception:
+            pass
+        cancelled += 1
+    return {
+        "ok": not owner_unknown,
+        "cancelled": cancelled,
+        "redis_read_unknown": owner_unknown,
+        "error": "sidecar owner lease unavailable" if owner_unknown else None,
+    }
 
 
 def _sso_job_patch(job_id: str, **fields: Any) -> dict[str, Any] | None:
@@ -351,6 +438,7 @@ def _run_sso_import_job(
 ) -> None:
     """Background worker: convert SSO cookies then bulk-import with progress updates."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from grok2api.store.sidecar_owner import owner_lease_valid
 
     total = len(sso_items)
     try:
@@ -400,6 +488,10 @@ def _run_sso_import_job(
             "index": i,
             "sso_hint": (sso[:12] + "...") if len(sso) > 12 else sso,
         }
+        if not owner_lease_valid():
+            item["status"] = "failed"
+            item["error"] = "sidecar owner lease lost"
+            return item
         try:
             # quiet=True: less stdout lock contention under multi-thread import
             token = _sso_script().sso_to_token(sso, quiet=True)
@@ -532,6 +624,35 @@ def _run_sso_import_job(
                             fail=fail,
                             results=list(results),
                         )
+
+        if not owner_lease_valid():
+            msg = "SSO import cancelled because sidecar owner lease was lost"
+            _sso_job_patch(
+                job_id,
+                status="cancelled",
+                phase="cancelled",
+                message=msg,
+                error="sidecar owner lease lost",
+                finished_at=time.time(),
+                ok=False,
+            )
+            try:
+                import grok2api.admin.task_log as task_log
+
+                task_log.record(
+                    "sso_import",
+                    task_id=job_id,
+                    summary=msg,
+                    status="cancelled",
+                    ok=False,
+                    progress_done=converted_count + fail,
+                    progress_total=total,
+                    finished=True,
+                    detail={"stop_kind": "owner_lease_lost"},
+                )
+            except Exception:
+                pass
+            return
 
         # Stage 2: one storage write for all converted accounts.
         imported: list[dict[str, Any]] = []

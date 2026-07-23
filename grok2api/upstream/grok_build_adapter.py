@@ -118,7 +118,18 @@ _sessions: dict[str, dict[str, Any]] = {}
 _batches: dict[str, dict[str, Any]] = {}
 _lock = threading.RLock()
 # batch_id -> True while a local ThreadPool spawner is alive in THIS process.
-_active_batch_runners: dict[str, bool] = {}
+_active_batch_runners: dict[str, str | bool] = {}
+# Futures are process-local only. Stop uses this registry to cancel queued work
+# immediately instead of waiting for the batch runner's next polling tick.
+_active_batch_futures: dict[str, set[Any]] = {}
+_scheduled_batch_finalizers: set[str] = set()
+try:
+    REG_STOP_DRAIN_SEC = max(
+        1.0,
+        min(15.0, float(os.environ.get("GROK2API_REG_STOP_DRAIN_SEC", "15") or 15)),
+    )
+except (TypeError, ValueError):
+    REG_STOP_DRAIN_SEC = 15.0
 # Local captcha: limit concurrent solves to the Camoufox browser pool size.
 # RLock serialization used to force 1-at-a-time even with TURNSTILE_THREAD=4,
 # killing multi-thread throughput. Semaphore lets N browsers work in parallel.
@@ -760,6 +771,13 @@ try:
 except (TypeError, ValueError):
     REG_WATCHDOG_STALE_SEC = 90.0
 
+# On process start, keep the watchdog fail-closed until any lock left by the
+# previous sidecar generation has expired and one reconciliation pass ran.
+_reg_startup_reconcile_pending = True
+_reg_startup_reconcile_after = time.monotonic() + max(
+    5.0, float(REG_BATCH_RUNNER_LOCK_TTL) + 2.0
+)
+
 
 def _now() -> float:
     return time.time()
@@ -822,6 +840,16 @@ def _reg_redis() -> bool:
         return False
 
 
+def _reg_redis_configured() -> bool:
+    """Return whether distributed registration state is configured at all."""
+    try:
+        from grok2api.store.redis_client import redis_url
+
+        return bool(redis_url())
+    except Exception:
+        return False
+
+
 def _batch_runner_lock_key(batch_id: str) -> str:
     try:
         from grok2api.store.redis_client import key
@@ -840,12 +868,13 @@ def _try_acquire_batch_runner(batch_id: str) -> tuple[bool, str | None]:
     bid = str(batch_id or "").strip()
     if not bid:
         return False, None
+    local_token = f"local|{os.getpid()}|{uuid.uuid4().hex}"
     with _lock:
         if _active_batch_runners.get(bid):
             return False, None
-        _active_batch_runners[bid] = True
-    token = f"{uuid.uuid4().hex}|{os.getpid()}|{_now():.0f}"
-    if _reg_redis():
+        _active_batch_runners[bid] = local_token
+    token = local_token
+    if _reg_redis() or _reg_redis_configured():
         try:
             from grok2api.store.redis_client import set_nx_ex, worker_id
 
@@ -853,29 +882,45 @@ def _try_acquire_batch_runner(batch_id: str) -> tuple[bool, str | None]:
             ok = set_nx_ex(_batch_runner_lock_key(bid), token, REG_BATCH_RUNNER_LOCK_TTL)
             if not ok:
                 with _lock:
-                    _active_batch_runners.pop(bid, None)
+                    if _active_batch_runners.get(bid) == local_token:
+                        _active_batch_runners.pop(bid, None)
                 return False, None
+            with _lock:
+                if _active_batch_runners.get(bid) == local_token:
+                    _active_batch_runners[bid] = token
         except Exception:
-            # Fall through to local-only claim.
-            pass
+            # Redis is configured, so an unknown ownership result must not
+            # degrade to local-only and create a second distributed runner.
+            with _lock:
+                if _active_batch_runners.get(bid) == local_token:
+                    _active_batch_runners.pop(bid, None)
+            return False, None
     return True, token
 
 
-def _renew_batch_runner(batch_id: str, token: str | None) -> None:
-    if not token or not _reg_redis():
-        return
+def _renew_batch_runner(batch_id: str, token: str | None) -> bool:
+    if not token:
+        return True
+    if not (_reg_redis() or _reg_redis_configured()):
+        return True
     try:
         from grok2api.store.redis_client import renew_if_owner
 
-        renew_if_owner(_batch_runner_lock_key(batch_id), token, REG_BATCH_RUNNER_LOCK_TTL)
+        return bool(
+            renew_if_owner(
+                _batch_runner_lock_key(batch_id), token, REG_BATCH_RUNNER_LOCK_TTL
+            )
+        )
     except Exception:
-        pass
+        return False
 
 
 def _release_batch_runner(batch_id: str, token: str | None) -> None:
     bid = str(batch_id or "").strip()
     with _lock:
-        _active_batch_runners.pop(bid, None)
+        if token is None or _active_batch_runners.get(bid) == token:
+            _active_batch_runners.pop(bid, None)
+            _active_batch_futures.pop(bid, None)
     if token and _reg_redis():
         try:
             from grok2api.store.redis_client import compare_and_delete
@@ -1026,6 +1071,15 @@ def _mirror_reg_sess(sid: str, sess: dict[str, Any] | None, *, force: bool = Fal
             sessions_redis.reg_sess_delete(sid)
             _reg_mirror_last.pop(f"s:{sid}", None)
             return
+        incoming_status = str(sess.get("status") or "").lower()
+        with _lock:
+            authoritative = _sessions.get(sid) or {}
+            authoritative_status = str(authoritative.get("status") or "").lower()
+        if authoritative_status in {"cancelled", "stopped"} and incoming_status not in {
+            "cancelled",
+            "stopped",
+        }:
+            return
         # Throttle non-terminal mirrors — local RAM still updates every step for
         # same-process batch GET; Redis only needs ~100ms freshness for multi-worker UI.
         st = str(sess.get("status") or "").lower()
@@ -1064,6 +1118,18 @@ def _mirror_reg_batch(batch_id: str, batch: dict[str, Any] | None, *, force: boo
         from grok2api.store import sessions_redis
 
         st = str(batch.get("status") or batch.get("batch_status") or "").lower()
+        with _lock:
+            authoritative = _batches.get(batch_id) or {}
+            authoritative_status = str(
+                authoritative.get("status")
+                or authoritative.get("batch_status")
+                or ""
+            ).lower()
+        if authoritative_status in {"cancelled", "stopped"} and st not in {
+            "cancelled",
+            "stopped",
+        }:
+            return
         terminal = st in ("done", "partial", "error", "cancelled", "stopped", "failed") or force
         if not terminal:
             now = float(_now())
@@ -1089,6 +1155,7 @@ def _record_register_task(
     progress_total: int = 0,
     finished: bool = True,
     detail: dict[str, Any] | None = None,
+    allow_terminal_restart: bool = False,
 ) -> None:
     """Best-effort write into admin「任务日志」for protocol registration."""
     tid = str(task_id or "").strip()
@@ -1107,10 +1174,322 @@ def _record_register_task(
             progress_total=int(progress_total or 0),
             finished=bool(finished),
             detail=detail if isinstance(detail, dict) else {},
+            allow_terminal_restart=allow_terminal_restart,
         )
     except Exception:
         # Never break registration workers because of logging.
         pass
+
+
+def _prepare_registration_sidecar_restart(reason: str) -> None:
+    """Durably cancel other sidecar-owned work before a process-level kill."""
+    message = str(reason or "registration worker stop timeout")
+
+    # A Python process exit is the only reliable way to kill a stuck native or
+    # HTTP worker thread. Make every collateral registration batch explicit in
+    # the UI/task log instead of leaving it looking alive after the restart.
+    with _lock:
+        other_batches = list(_active_batch_runners)
+    for other_bid in other_batches:
+        try:
+            _finalize_cancelled_batch(
+                other_bid,
+                reason=f"sidecar restart interrupted task: {message}",
+                stop_kind="sidecar_restart",
+            )
+        except Exception:
+            pass
+
+    # Single registrations have no batch finalizer.
+    single_snapshots: list[tuple[str, dict[str, Any]]] = []
+    with _lock:
+        for sid, raw in list(_sessions.items()):
+            sess = dict(raw or {})
+            if sess.get("batch_id") or str(sess.get("status") or "").lower() in _TERMINAL_STATUSES:
+                continue
+            sess.update(
+                {
+                    "status": "cancelled",
+                    "cancel_requested": True,
+                    "error": message,
+                    "message": "cancelled because registration sidecar restarted",
+                    "updated_at": _now(),
+                    "finished_at": _now(),
+                }
+            )
+            _sessions[sid] = sess
+            single_snapshots.append((sid, dict(sess)))
+    for sid, sess in single_snapshots:
+        _mirror_reg_sess(sid, sess, force=True)
+        _record_register_task(
+            task_id=sid,
+            summary=str(sess.get("message") or "single registration cancelled"),
+            status="cancelled",
+            ok=False,
+            progress_done=0,
+            progress_total=1,
+            finished=True,
+            detail={"session_id": sid, "stop_kind": "sidecar_restart"},
+        )
+
+    # SSO import and device-login share this sidecar. Mark their local active
+    # jobs terminal before exiting so a forced batch stop cannot strand them.
+    try:
+        from grok2api.admin import sso_import
+
+        with sso_import._sso_jobs_lock:
+            sso_jobs = [
+                (job_id, dict(job))
+                for job_id, job in sso_import._sso_jobs_local.items()
+                if str((job or {}).get("status") or "").lower()
+                not in {"done", "partial", "error", "failed", "cancelled"}
+            ]
+        for job_id, job in sso_jobs:
+            done = int(job.get("done") or 0)
+            total = int(job.get("total") or 0)
+            sso_import._sso_job_patch(
+                job_id,
+                status="cancelled",
+                phase="cancelled",
+                message="SSO import cancelled because registration sidecar restarted",
+                error=message,
+                finished_at=_now(),
+                ok=False,
+            )
+            try:
+                import grok2api.admin.task_log as task_log
+
+                task_log.record(
+                    "sso_import",
+                    task_id=job_id,
+                    summary="SSO import cancelled because registration sidecar restarted",
+                    status="cancelled",
+                    ok=False,
+                    progress_done=done,
+                    progress_total=total,
+                    finished=True,
+                    detail={"stop_kind": "sidecar_restart", "reason": message[:400]},
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        from grok2api.upstream import oidc_auth
+
+        device_snapshots: list[tuple[str, dict[str, Any]]] = []
+        with oidc_auth._lock:
+            for sid, raw in list(oidc_auth._device_sessions.items()):
+                sess = dict(raw or {})
+                if str(sess.get("status") or "").lower() in {
+                    "success",
+                    "error",
+                    "expired",
+                    "cancelled",
+                }:
+                    continue
+                sess.update(
+                    {
+                        "status": "cancelled",
+                        "error": message,
+                        "message": "device login cancelled because sidecar restarted",
+                        "finished_at": _now(),
+                    }
+                )
+                oidc_auth._device_sessions[sid] = sess
+                device_snapshots.append((sid, dict(sess)))
+        for sid, sess in device_snapshots:
+            oidc_auth._device_mirror(sid, sess)
+    except Exception:
+        pass
+
+
+def _terminate_registration_sidecar(reason: str) -> None:
+    """Hard-stop this sidecar after durable timeout fencing.
+
+    Python cannot safely kill an individual running thread. The entrypoint
+    supervisor restarts only this loopback sidecar; Go and the captcha solver
+    stay online.
+    """
+    _prepare_registration_sidecar_restart(reason)
+    print(f"[registration] restarting sidecar after forced stop: {reason}", flush=True)
+    os._exit(75)
+
+
+def _finalize_cancelled_batch(
+    batch_id: str,
+    *,
+    reason: str,
+    stop_kind: str = "stop_timeout",
+    expected_runner_token: str | bool | None = None,
+    require_stopping: bool = False,
+) -> dict[str, Any] | None:
+    """Idempotently fence a stopped/orphaned batch and close its UI task.
+
+    ``finished`` remains the amount of work that actually reached a terminal
+    worker result. Timed-out and never-started futures are intentionally left
+    in ``unattempted`` so a 75/100 batch never becomes fictitious progress.
+    """
+    bid = str(batch_id or "").strip()
+    if not bid:
+        return None
+    loaded = _load_reg_batch(bid)
+    if not loaded:
+        return None
+
+    futures: list[Any] = []
+    runner_token: str | None = None
+    restart_sidecar = False
+    with _lock:
+        current = dict(_batches.get(bid) or loaded)
+        status = str(current.get("status") or "").strip().lower()
+        if require_stopping and (
+            status != "stopping"
+            or not current.get("cancel_requested")
+            or _active_batch_runners.get(bid) != expected_runner_token
+        ):
+            # A force-resume/new generation won during the grace period.
+            _scheduled_batch_finalizers.discard(bid)
+            return None
+        total = max(0, int(current.get("count") or 0))
+        finished = max(0, int(current.get("finished") or 0))
+        if status in {"cancelled", "stopped"}:
+            _scheduled_batch_finalizers.discard(bid)
+            return current
+        if status in {"done", "completed"} or (
+            status in {"partial", "error"} and total > 0 and finished >= total
+        ):
+            _scheduled_batch_finalizers.discard(bid)
+            return current
+
+        ok_count = max(0, int(current.get("ok_count") or 0))
+        fail_count = max(0, int(current.get("fail_count") or 0))
+        unattempted = max(0, total - finished)
+        summary = (
+            f"force cancelled residual after stop; {finished}/{total} "
+            f"(ok={ok_count} fail={fail_count} "
+            f"unattempted={unattempted}, threads={int(current.get('concurrency') or 1)})"
+        )
+        current.update(
+            {
+                "status": "cancelled",
+                "batch_status": "cancelled",
+                "cancel_requested": True,
+                "runner_alive": False,
+                "owner_pid": None,
+                "inflight": 0,
+                "running": 0,
+                "finished": finished,
+                "done": finished,
+                "imported": ok_count,
+                "error": fail_count,
+                "unattempted": unattempted,
+                "message": summary,
+                "stop_kind": stop_kind,
+                "stop_reason": str(reason or "registration stop timeout"),
+                "updated_at": _now(),
+                "finished_at": _now(),
+                "state_generation": int(current.get("state_generation") or 0) + 1,
+            }
+        )
+        _batches[bid] = current
+        raw_runner = _active_batch_runners.pop(bid, None)
+        if isinstance(raw_runner, str):
+            runner_token = raw_runner
+            restart_sidecar = stop_kind in {"stop_timeout", "runner_lock_lost"}
+        futures = list(_active_batch_futures.pop(bid, set()))
+        _scheduled_batch_finalizers.discard(bid)
+        session_ids = list(current.get("session_ids") or [])
+
+    for future in futures:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+
+    # Persist session cancellation after the batch fence. Late workers observe
+    # the terminal/cancel_requested batch before performing their next action.
+    for sid in session_ids:
+        loaded_sess = dict(_load_reg_sess(str(sid)) or {})
+        if not loaded_sess:
+            continue
+        with _lock:
+            sess = dict(_sessions.get(str(sid)) or loaded_sess)
+            if str(sess.get("status") or "").lower() in _TERMINAL_STATUSES:
+                continue
+            sess["status"] = "cancelled"
+            sess["cancel_requested"] = True
+            sess["error"] = str(reason or "registration stop timeout")
+            sess["message"] = "force cancelled after registration stop timeout"
+            sess["updated_at"] = _now()
+            sess["state_generation"] = int(sess.get("state_generation") or 0) + 1
+            _sessions[str(sid)] = dict(sess)
+            session_snapshot = dict(sess)
+        _mirror_reg_sess(str(sid), session_snapshot, force=True)
+
+    _mirror_reg_batch(bid, current, force=True)
+    if runner_token and _reg_redis() and not restart_sidecar:
+        try:
+            from grok2api.store.redis_client import compare_and_delete
+
+            compare_and_delete(_batch_runner_lock_key(bid), runner_token)
+        except Exception:
+            pass
+    _record_register_task(
+        task_id=bid,
+        summary=str(current.get("message") or f"registration batch {bid} cancelled"),
+        status="cancelled",
+        ok=False,
+        progress_done=int(current.get("finished") or 0),
+        progress_total=int(current.get("count") or 0),
+        finished=True,
+        detail={
+            "batch_id": bid,
+            "ok_count": int(current.get("ok_count") or 0),
+            "fail_count": int(current.get("fail_count") or 0),
+            "unattempted": int(current.get("unattempted") or 0),
+            "status": "cancelled",
+            "phase": "finished",
+            "stop_kind": stop_kind,
+            "stop_reason": str(reason or "registration stop timeout"),
+            "adapter_build": ADAPTER_BUILD,
+        },
+    )
+    if restart_sidecar:
+        _terminate_registration_sidecar(str(reason or "registration stop timeout"))
+    return current
+
+
+def _schedule_cancelled_batch_finalizer(batch_id: str, *, reason: str) -> None:
+    bid = str(batch_id or "").strip()
+    if not bid:
+        return
+    with _lock:
+        if bid in _scheduled_batch_finalizers:
+            return
+        _scheduled_batch_finalizers.add(bid)
+        expected_runner_token = _active_batch_runners.get(bid)
+
+    def _finish_after_grace() -> None:
+        try:
+            time.sleep(max(0.0, float(REG_STOP_DRAIN_SEC)))
+            _finalize_cancelled_batch(
+                bid,
+                reason=reason,
+                stop_kind="stop_timeout",
+                expected_runner_token=expected_runner_token,
+                require_stopping=True,
+            )
+        finally:
+            with _lock:
+                _scheduled_batch_finalizers.discard(bid)
+
+    threading.Thread(
+        target=_finish_after_grace,
+        daemon=True,
+        name=f"gba-stop-{bid[-8:]}",
+    ).start()
 
 
 
@@ -2724,6 +3103,7 @@ def _spawn_batch_runner(
     domain: str | None,
     expiry_ms: int | None,
     mail_provider: str | None = None,
+    preacquired_runner_token: str | None = None,
 ) -> dict[str, Any]:
     """Start the ThreadPool spawner for a batch (also used by resume/reclaim)."""
     bid = str(batch_id or "").strip()
@@ -2756,8 +3136,13 @@ def _spawn_batch_runner(
             "batch": get_registration_batch(bid),
         }
 
-    acquired, lock_token = _try_acquire_batch_runner(bid)
-    if not acquired:
+    lock_token = preacquired_runner_token
+    if lock_token is not None:
+        with _lock:
+            acquired = _active_batch_runners.get(bid) == lock_token
+    else:
+        acquired, lock_token = _try_acquire_batch_runner(bid)
+    if not acquired or not lock_token:
         return {
             "ok": False,
             "error": "batch runner already active on another worker",
@@ -2785,7 +3170,8 @@ def _spawn_batch_runner(
         os.environ["YESCAPTCHA_ENDPOINT"] = solver_url
         solver_wait = probe_local_solver(solver_url, timeout=0.45)
         if not solver_wait.get("ready"):
-            _release_batch_runner(bid, lock_token)
+            if preacquired_runner_token is None:
+                _release_batch_runner(bid, lock_token)
             return {
                 "ok": False,
                 "error": (
@@ -2798,7 +3184,8 @@ def _spawn_batch_runner(
             }
     else:
         if not key:
-            _release_batch_runner(bid, lock_token)
+            if preacquired_runner_token is None:
+                _release_batch_runner(bid, lock_token)
             return {
                 "ok": False,
                 "error": "YESCAPTCHA_KEY missing",
@@ -2921,6 +3308,8 @@ def _spawn_batch_runner(
         # of mailboxes immediately and made stop/cancel racey under multi-thread.
         next_i = 1
         in_flight: dict[Any, int] = {}
+        stop_started_at: float | None = None
+        force_sidecar_restart = False
         prefetch = max(0, min(int(REG_PREFETCH_SLOTS), max(0, workers)))
         # Never queue more work than global admission + local captcha can take.
         # Prefetch used to create extra mailboxes/sessions that pile up in RAM.
@@ -2928,6 +3317,8 @@ def _spawn_batch_runner(
 
         def _batch_cancel_requested() -> bool:
             with _lock:
+                if _active_batch_runners.get(bid) != lock_token:
+                    return True
                 local = _batches.get(bid) or {}
             if local.get("cancel_requested") or str(local.get("status") or "").lower() in (
                 "stopping",
@@ -3000,10 +3391,15 @@ def _spawn_batch_runner(
                 time.sleep(max(5.0, REG_BATCH_RUNNER_LOCK_TTL / 3))
                 if stop_renew:
                     break
+                with _lock:
+                    if _active_batch_runners.get(bid) != lock_token:
+                        break
                 if _batch_cancel_requested():
                     # Keep heartbeat while draining, but mark status as stopping.
                     mirror_bb = None
                     with _lock:
+                        if _active_batch_runners.get(bid) != lock_token:
+                            break
                         bb = _batches.get(bid)
                         if bb is not None:
                             bb["cancel_requested"] = True
@@ -3023,9 +3419,36 @@ def _spawn_batch_runner(
                             _mirror_reg_batch(bid, mirror_bb)
                         except Exception:
                             pass
-                _renew_batch_runner(bid, lock_token)
+                if not _renew_batch_runner(bid, lock_token):
+                    with _lock:
+                        if _active_batch_runners.get(bid) != lock_token:
+                            break
+                        bb = _batches.get(bid)
+                        if bb is not None:
+                            bb["cancel_requested"] = True
+                            bb["status"] = "stopping"
+                            bb["stop_kind"] = "runner_lock_lost"
+                            bb["stop_reason"] = (
+                                "distributed runner lock renewal failed"
+                            )
+                            bb["message"] = (
+                                "stopping: distributed runner ownership lost"
+                            )
+                            bb["updated_at"] = _now()
+                    _finalize_cancelled_batch(
+                        bid,
+                        reason="distributed runner lock renewal failed",
+                        stop_kind="runner_lock_lost",
+                        expected_runner_token=lock_token,
+                        require_stopping=True,
+                    )
+                    # The finalizer hard-exits this sidecar. This return is only
+                    # reachable under a test double or if the generation changed.
+                    return
                 mirror_bb = None
                 with _lock:
+                    if _active_batch_runners.get(bid) != lock_token:
+                        break
                     bb = _batches.get(bid)
                     if bb is not None:
                         bb["updated_at"] = _now()
@@ -3084,8 +3507,12 @@ def _spawn_batch_runner(
                 # Re-check cancel after prepare (user may stop mid-queue).
                 b1 = _batches.get(bid) or {}
                 sess = _sessions.get(sid) or {}
+                if sid in _sessions:
+                    _sessions[sid]["_runner_token"] = lock_token
+                    sess = _sessions[sid]
                 if (
-                    b1.get("cancel_requested")
+                    _active_batch_runners.get(bid) != lock_token
+                    or b1.get("cancel_requested")
                     or str(b1.get("status") or "").lower() in ("stopping", "cancelled", "stopped")
                     or sess.get("cancel_requested")
                 ):
@@ -3181,6 +3608,12 @@ def _spawn_batch_runner(
 
         def _note_result(idx: int, r: dict[str, Any] | None = None, exc: Exception | None = None) -> None:
             nonlocal finished, ok_n, fail_n, cancelled_n, consecutive_rate_limits
+            with _lock:
+                current_status = str(
+                    (_batches.get(bid) or {}).get("status") or ""
+                ).lower()
+            if current_status in {"cancelled", "stopped"}:
+                return
             finished += 1
             if finished % 10 == 0:
                 try:
@@ -3312,12 +3745,34 @@ def _spawn_batch_runner(
                 except Exception:
                     pass
 
+        class _StopAwareExecutor(ThreadPoolExecutor):
+            def __exit__(self, exc_type, exc_value, traceback):
+                cancelled = _batch_cancel_requested()
+                self.shutdown(wait=not cancelled, cancel_futures=cancelled)
+                return False
+
         try:
             target_total = int((_load_reg_batch(bid) or {}).get("count") or remaining)
-            with ThreadPoolExecutor(
+            with _StopAwareExecutor(
                 max_workers=workers, thread_name_prefix=f"gba-batch-{bid[-6:]}"
             ) as pool:
                 while True:
+                    cancel_now = _batch_cancel_requested()
+                    if cancel_now:
+                        if stop_started_at is None:
+                            stop_started_at = time.monotonic()
+                        for future in list(in_flight):
+                            try:
+                                future.cancel()
+                            except Exception:
+                                pass
+                        if (time.monotonic() - stop_started_at) >= float(
+                            REG_STOP_DRAIN_SEC
+                        ):
+                            force_sidecar_restart = any(
+                                not future.done() for future in in_flight
+                            )
+                            break
                     # Fill up to concurrency(+prefetch) only while not cancelled.
                     while (
                         next_i <= remaining
@@ -3327,6 +3782,8 @@ def _spawn_batch_runner(
                     ):
                         fut = pool.submit(_job, next_i)
                         in_flight[fut] = next_i
+                        with _lock:
+                            _active_batch_futures.setdefault(bid, set()).add(fut)
                         next_i += 1
                         mirror_bb = None
                         task_summary = None
@@ -3410,6 +3867,10 @@ def _spawn_batch_runner(
                         continue
                     for fut in done:
                         idx = in_flight.pop(fut, 0)
+                        with _lock:
+                            _active_batch_futures.get(bid, set()).discard(fut)
+                        if fut.cancelled():
+                            continue
                         try:
                             r = fut.result()
                             _note_result(idx, r=r)
@@ -3434,6 +3895,17 @@ def _spawn_batch_runner(
             task_args = None
             with _lock:
                 b = _batches.get(bid)
+                if (
+                    b is not None
+                    and str(b.get("status") or "").lower() == "cancelled"
+                    and not b.get("runner_alive")
+                    and str(b.get("stop_kind") or "")
+                    in {"stop_timeout", "stop_without_runner", "startup_orphan"}
+                ):
+                    # A timeout/startup reconciler already wrote the terminal
+                    # state and task log. The detached old runner must not
+                    # overwrite that authoritative snapshot when it eventually exits.
+                    b = None
                 if b is not None:
                     b["updated_at"] = _now()
                     b["finished"] = finished
@@ -3460,6 +3932,12 @@ def _spawn_batch_runner(
                     )
                     if stop_requested and finished < target_total:
                         b["status"] = "cancelled"
+                        b["state_generation"] = int(
+                            b.get("state_generation") or 0
+                        ) + 1
+                        if force_sidecar_restart:
+                            b["stop_kind"] = "stop_timeout"
+                            b["stop_reason"] = "runner did not exit after cooperative stop"
                         b["message"] = (
                             f"stopped {finished}/{target_total} "
                             f"(ok={ok_n} fail={fail_n} cancelled={cancelled_n} "
@@ -3523,7 +4001,19 @@ def _spawn_batch_runner(
                     _record_register_task(**task_args)
                 except Exception:
                     pass
-            _release_batch_runner(bid, lock_token)
+            if force_sidecar_restart:
+                # Keep the Redis owner lock until this process is gone. The
+                # replacement sidecar reconciles after the lock TTL instead of
+                # allowing a second generation to overlap detached workers.
+                with _lock:
+                    if _active_batch_runners.get(bid) == lock_token:
+                        _active_batch_runners.pop(bid, None)
+                        _active_batch_futures.pop(bid, None)
+                _terminate_registration_sidecar(
+                    "runner did not exit after cooperative stop"
+                )
+            else:
+                _release_batch_runner(bid, lock_token)
 
     threading.Thread(
         target=_run_batch,
@@ -3645,7 +4135,16 @@ def _run_registration(
             batch_hit = False
             if bid:
                 bb = _batches.get(bid) or {}
-                if bb.get("cancel_requested") or _is_cancel_status(bb.get("status")):
+                session_runner = cur.get("_runner_token")
+                runner_mismatch = bool(
+                    session_runner
+                    and _active_batch_runners.get(bid) != session_runner
+                )
+                if (
+                    runner_mismatch
+                    or bb.get("cancel_requested")
+                    or _is_cancel_status(bb.get("status"))
+                ):
                     batch_hit = True
                     cur["cancel_requested"] = True
             # Do not overwrite a terminal cancel with intermediate progress.
@@ -3653,7 +4152,6 @@ def _run_registration(
                 "cancelled",
                 "stopped",
                 "error",
-                "imported",
             ):
                 raise _RegCancelled(cur.get("message") or "cancelled by user")
             cur["status"] = status
@@ -3736,7 +4234,16 @@ def _run_registration(
             bid = str(cur.get("batch_id") or "")
             if bid:
                 bb = _batches.get(bid) or {}
-                if bb.get("cancel_requested") or _is_cancel_status(bb.get("status")):
+                session_runner = cur.get("_runner_token")
+                runner_mismatch = bool(
+                    session_runner
+                    and _active_batch_runners.get(bid) != session_runner
+                )
+                if (
+                    runner_mismatch
+                    or bb.get("cancel_requested")
+                    or _is_cancel_status(bb.get("status"))
+                ):
                     cur["cancel_requested"] = True
                     _sessions[sid] = cur
         if _session_cancel_requested(cur):
@@ -4923,15 +5430,34 @@ def reclaim_orphaned_registration_sessions(
     reclaimed: list[dict[str, Any]] = []
     # Prefer durable Redis list when available.
     sessions: list[dict[str, Any]] = []
-    if _reg_redis():
+    redis_active = _reg_redis()
+    if _reg_redis_configured() and not redis_active:
+        return {
+            "ok": False,
+            "reclaimed": 0,
+            "stale_sec": ttl,
+            "items": [],
+            "redis_read_unknown": True,
+            "error": "registration Redis is configured but unavailable",
+        }
+    if redis_active:
         try:
             from grok2api.store import sessions_redis
 
             listed = sessions_redis.reg_sess_list() or []
             if isinstance(listed, list):
                 sessions = [s for s in listed if isinstance(s, dict)]
-        except Exception:
-            sessions = []
+            else:
+                raise RuntimeError("registration session list is not a list")
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reclaimed": 0,
+                "stale_sec": ttl,
+                "items": [],
+                "redis_read_unknown": True,
+                "error": f"registration session list unavailable: {exc}",
+            }
     if not sessions:
         with _lock:
             sessions = [dict(v) for v in _sessions.values() if isinstance(v, dict)]
@@ -4944,6 +5470,7 @@ def reclaim_orphaned_registration_sessions(
             return batch_live[bid0]
         info = {
             "has_runner": False,
+            "runner_lock_unknown": False,
             "batch_age": 1e18,
             "batch_status": "",
             "runner_alive_flag": False,
@@ -4967,7 +5494,8 @@ def reclaim_orphaned_registration_sessions(
                 if redis_get(_batch_runner_lock_key(bid0)):
                     info["has_runner"] = True
             except Exception:
-                pass
+                # Redis uncertainty is not proof that a remote runner is dead.
+                info["runner_lock_unknown"] = True
         # IMPORTANT: do NOT treat runner_alive/updated_at alone as live.
         # Multi-worker reclaim/TTL paths used to refresh updated_at and leave
         # runner_alive=true after the real runner died, which permanently
@@ -4993,6 +5521,8 @@ def reclaim_orphaned_registration_sessions(
             "runner_alive_flag": False,
         }
         has_runner = bool(live.get("has_runner"))
+        if live.get("runner_lock_unknown"):
+            continue
         batch_age = float(live.get("batch_age") or 1e18)
         # Live batch: only reclaim truly stalled sessions.
         # Local Turnstile is process-global serialized — under bulk load
@@ -5097,6 +5627,7 @@ def reclaim_orphaned_registration_sessions(
         "reclaimed": len(reclaimed),
         "stale_sec": ttl,
         "items": reclaimed[:100],
+        "redis_read_unknown": False,
     }
 
 
@@ -5133,30 +5664,37 @@ def resume_registration_batch(
             "batch_id": bid,
         }
 
-    # Drop dead runner lock if our process does not own it (TTL may still hold).
-    if force and _reg_redis():
+    # Never resume over a draining/live owner. Running Python threads cannot be
+    # killed safely; timeout handling restarts the sidecar and leaves the Redis
+    # lock to expire as a generation fence.
+    with _lock:
+        local_alive = bool(_active_batch_runners.get(bid))
+    if local_alive:
+        return {
+            "ok": False,
+            "error": "batch runner is still draining; retry after it exits",
+            "batch_id": bid,
+            "status": st,
+        }
+    if _reg_redis():
         try:
             from grok2api.store.redis_client import get_str as redis_get
 
-            lock_k = _batch_runner_lock_key(bid)
-            token = redis_get(lock_k)
-            with _lock:
-                local_alive = bool(_active_batch_runners.get(bid))
-            if token and not local_alive:
-                try:
-                    from grok2api.store.redis_client import compare_and_delete
-
-                    compare_and_delete(lock_k, str(token))
-                except Exception:
-                    try:
-                        # last resort: overwrite with short TTL empty marker then let expire
-                        from grok2api.store.redis_client import set_ex
-
-                        set_ex(lock_k, "reclaimed", 1)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            token = redis_get(_batch_runner_lock_key(bid))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"runner lock state unavailable: {exc}",
+                "batch_id": bid,
+                "status": st,
+            }
+        if token:
+            return {
+                "ok": False,
+                "error": "batch runner lock is still active; retry after lock expiry",
+                "batch_id": bid,
+                "status": st,
+            }
 
     reclaimed = reclaim_orphaned_registration_sessions(
         stale_sec=reclaim_stale_sec, batch_id=bid
@@ -5237,9 +5775,22 @@ def resume_registration_batch(
     )
     proxy_strategy = str(cfg.get("proxy_strategy") or "round_robin").strip().lower()
 
-    # Clear cancel so spawn is allowed.
+    # Claim distributed ownership before changing generation/state. A losing
+    # concurrent resume must not write cancelled over the winning runner.
+    acquired, resume_runner_token = _try_acquire_batch_runner(bid)
+    if not acquired or not resume_runner_token:
+        return {
+            "ok": False,
+            "error": "batch runner already active on another worker",
+            "batch_id": bid,
+            "status": st,
+        }
+
+    # Clear cancel only after the runner lease belongs to this request.
     with _lock:
         b = _batches.get(bid) or dict(batch)
+        b["state_generation"] = int(b.get("state_generation") or 0) + 1
+        resume_generation = int(b["state_generation"])
         b["cancel_requested"] = False
         if force:
             for key_name in (
@@ -5277,6 +5828,7 @@ def resume_registration_batch(
         domain=mail_dom,
         expiry_ms=cfg.get("expiry_ms"),
         mail_provider=mail_provider,
+        preacquired_runner_token=resume_runner_token,
     )
     out = {
         "ok": bool(spawned.get("ok")),
@@ -5289,6 +5841,50 @@ def resume_registration_batch(
     }
     if not out["ok"]:
         out["error"] = spawned.get("error") or "spawn failed"
+        rollback_owned_generation = False
+        if force:
+            with _lock:
+                current_resume = dict(_batches.get(bid) or {})
+                rollback_owned_generation = (
+                    _active_batch_runners.get(bid) == resume_runner_token
+                    and int(current_resume.get("state_generation") or 0)
+                    == resume_generation
+                )
+                if rollback_owned_generation:
+                    current_resume["status"] = "cancelled"
+                    current_resume["batch_status"] = "cancelled"
+                    current_resume["cancel_requested"] = True
+                    current_resume["runner_alive"] = False
+                    current_resume["message"] = f"force resume failed: {out['error']}"
+                    current_resume["updated_at"] = _now()
+                    _batches[bid] = current_resume
+                    failed_resume = dict(current_resume)
+            if rollback_owned_generation:
+                _mirror_reg_batch(bid, failed_resume, force=True)
+        if rollback_owned_generation or not force:
+            _release_batch_runner(bid, resume_runner_token)
+    elif force:
+        resumed_batch = _load_reg_batch(bid) or b
+        _record_register_task(
+            task_id=bid,
+            summary=str(
+                resumed_batch.get("message")
+                or f"registration batch {bid} force resumed"
+            ),
+            status="running",
+            ok=None,
+            progress_done=int(resumed_batch.get("finished") or 0),
+            progress_total=int(resumed_batch.get("count") or 0),
+            finished=False,
+            detail={
+                "batch_id": bid,
+                "phase": "resumed",
+                "state_generation": int(
+                    resumed_batch.get("state_generation") or 0
+                ),
+            },
+            allow_terminal_restart=True,
+        )
     return out
 
 
@@ -5316,22 +5912,80 @@ def reclaim_orphaned_registration_batches(
 
     # First pass: mark dead in-flight sessions.
     sess_result = reclaim_orphaned_registration_sessions(stale_sec=ttl)
+    if sess_result.get("redis_read_unknown"):
+        return {
+            "ok": False,
+            "sessions_reclaimed": 0,
+            "session_reclaim": sess_result,
+            "batches_resumed": 0,
+            "batches_cancelled": 0,
+            "cancelled": [],
+            "resumed": [],
+            "skipped": [
+                {
+                    "batch_id": "",
+                    "reason": "redis_registration_list_unknown",
+                    "status": "unknown",
+                }
+            ],
+            "redis_read_unknown": True,
+        }
 
     batches: list[dict[str, Any]] = []
-    if _reg_redis():
+    redis_active = _reg_redis()
+    if _reg_redis_configured() and not redis_active:
+        return {
+            "ok": False,
+            "sessions_reclaimed": sess_result.get("reclaimed") or 0,
+            "session_reclaim": sess_result,
+            "batches_resumed": 0,
+            "batches_cancelled": 0,
+            "cancelled": [],
+            "resumed": [],
+            "skipped": [
+                {
+                    "batch_id": "",
+                    "reason": "redis_registration_list_unknown",
+                    "status": "unknown",
+                }
+            ],
+            "redis_read_unknown": True,
+            "error": "registration Redis is configured but unavailable",
+        }
+    if redis_active:
         try:
             from grok2api.store import sessions_redis
 
             listed = sessions_redis.reg_batch_list() or []
             if isinstance(listed, list):
                 batches = [b for b in listed if isinstance(b, dict)]
-        except Exception:
-            batches = []
+            else:
+                raise RuntimeError("registration batch list is not a list")
+        except Exception as exc:
+            return {
+                "ok": False,
+                "sessions_reclaimed": sess_result.get("reclaimed") or 0,
+                "session_reclaim": sess_result,
+                "batches_resumed": 0,
+                "batches_cancelled": 0,
+                "cancelled": [],
+                "resumed": [],
+                "skipped": [
+                    {
+                        "batch_id": "",
+                        "reason": "redis_registration_list_unknown",
+                        "status": "unknown",
+                    }
+                ],
+                "redis_read_unknown": True,
+                "error": f"registration batch list unavailable: {exc}",
+            }
     if not batches:
         with _lock:
             batches = [dict(v) for v in _batches.values() if isinstance(v, dict)]
 
     resumed: list[dict[str, Any]] = []
+    cancelled_batches: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     now_ts = _now()
     # Newest first.
@@ -5339,7 +5993,7 @@ def reclaim_orphaned_registration_batches(
         batches, key=lambda b: float(b.get("updated_at") or b.get("created_at") or 0), reverse=True
     )
     for b in batches:
-        if len(resumed) >= max(0, int(max_batches)):
+        if auto_resume and len(resumed) >= max(0, int(max_batches)):
             break
         bid = str(b.get("id") or "").strip()
         if not bid:
@@ -5349,7 +6003,7 @@ def reclaim_orphaned_registration_batches(
             st == "error" and int(b.get("finished") or 0) < int(b.get("count") or 0)
         ):
             continue
-        if b.get("cancel_requested") and st in {"stopping", "cancelled", "stopped"}:
+        if auto_resume and b.get("cancel_requested") and st in {"stopping", "cancelled", "stopped"}:
             skipped.append({"batch_id": bid, "reason": "cancel_requested", "status": st})
             continue
         # Skip only if THIS process has a live runner. Redis locks from a dead
@@ -5366,13 +6020,23 @@ def reclaim_orphaned_registration_batches(
         # orphan reclaim of healthy in-flight sessions.
         batch_age = now_ts - float(b.get("updated_at") or b.get("created_at") or 0)
         lock_token = None
+        lock_unknown = False
         if _reg_redis():
             try:
                 from grok2api.store.redis_client import get_str as redis_get
 
                 lock_token = redis_get(_batch_runner_lock_key(bid))
             except Exception:
-                lock_token = None
+                lock_unknown = True
+        if lock_unknown:
+            skipped.append(
+                {
+                    "batch_id": bid,
+                    "reason": "remote_runner_lock_unknown",
+                    "status": st,
+                }
+            )
+            continue
         if lock_token:
             # Live lock means another process still owns the runner.
             skipped.append(
@@ -5405,7 +6069,17 @@ def reclaim_orphaned_registration_batches(
             skipped.append({"batch_id": bid, "reason": "already_finished", "status": st})
             continue
         if not auto_resume:
-            skipped.append({"batch_id": bid, "reason": "auto_resume_disabled", "status": st})
+            finalized = _finalize_cancelled_batch(
+                bid,
+                reason="startup reconciliation found no live registration runner",
+                stop_kind="startup_orphan",
+            )
+            if finalized is not None and str(finalized.get("status") or "").lower() == "cancelled":
+                cancelled_batches.append(
+                    {"batch_id": bid, "status": "cancelled", "finished": int(finalized.get("finished") or 0)}
+                )
+            else:
+                skipped.append({"batch_id": bid, "reason": "reconcile_protected", "status": st})
             continue
         r = resume_registration_batch(bid, force=True, reclaim_stale_sec=ttl)
         resumed.append(r)
@@ -5415,8 +6089,11 @@ def reclaim_orphaned_registration_batches(
         "sessions_reclaimed": sess_result.get("reclaimed") or 0,
         "session_reclaim": sess_result,
         "batches_resumed": sum(1 for r in resumed if r.get("ok")),
+        "batches_cancelled": len(cancelled_batches),
+        "cancelled": cancelled_batches[:100],
         "resumed": resumed,
         "skipped": skipped[:20],
+        "redis_read_unknown": False,
     }
 
 
@@ -5504,6 +6181,7 @@ def _ensure_registration_watchdog() -> None:
         _reg_watchdog_started = True
 
     def _loop() -> None:
+        global _reg_startup_reconcile_pending
         # First pass soon after startup so orphan mid-captcha sessions recover
         # quickly after image restarts (was up to 20s of "stuck" UI).
         time.sleep(min(8.0, max(3.0, REG_WATCHDOG_SEC / 3.0)))
@@ -5517,18 +6195,28 @@ def _ensure_registration_watchdog() -> None:
                     )
                 except (TypeError, ValueError):
                     max_batches = 3
+                startup_reconcile = bool(_reg_startup_reconcile_pending)
                 result = reclaim_orphaned_registration_batches(
-                    auto_resume=True,
+                    auto_resume=not startup_reconcile,
                     max_batches=max(0, min(10, max_batches)),
                     stale_sec=REG_WATCHDOG_STALE_SEC,
                 )
+                if startup_reconcile and time.monotonic() >= _reg_startup_reconcile_after:
+                    unknown_lock = bool(result.get("redis_read_unknown")) or any(
+                        item.get("reason") == "remote_runner_lock_unknown"
+                        for item in result.get("skipped", [])
+                        if isinstance(item, dict)
+                    )
+                    if not unknown_lock:
+                        _reg_startup_reconcile_pending = False
                 resumed_n = int(result.get("batches_resumed") or 0)
+                cancelled_n = int(result.get("batches_cancelled") or 0)
                 reclaimed_n = int(result.get("sessions_reclaimed") or 0)
-                if refreshed or resumed_n or reclaimed_n:
+                if refreshed or resumed_n or cancelled_n or reclaimed_n:
                     print(
                         f"[registration] watchdog tick: "
                         f"ttl_refresh={refreshed} reclaimed={reclaimed_n} "
-                        f"resumed={resumed_n}"
+                        f"resumed={resumed_n} cancelled={cancelled_n}"
                     )
             except Exception as e:  # noqa: BLE001
                 print(f"[registration] watchdog error: {e}")
@@ -5614,24 +6302,37 @@ def stop_registration_batch(batch_id: str) -> dict[str, Any]:
     if not batch:
         return {"ok": False, "error": "registration batch not found"}
 
+    def _needs_stop(row: dict[str, Any]) -> bool:
+        status = str(row.get("status") or "").lower()
+        total = max(0, int(row.get("count") or 0))
+        finished = max(0, int(row.get("finished") or 0))
+        if status in {"cancelled", "stopped", "done", "completed"}:
+            return False
+        if status in {"partial", "error"} and total > 0 and finished >= total:
+            return False
+        return True
+
     # Mark batch cancelled FIRST so spawner/workers observe stop even before
     # individual session mirrors catch up (multi-worker / Redis path).
     with _lock:
         b = _batches.get(bid) or dict(batch)
         b["cancel_requested"] = True
-        if str(b.get("status") or "").lower() not in (
-            "done",
-            "partial",
-            "error",
-            "cancelled",
-            "stopped",
-        ):
+        if _needs_stop(b):
             b["status"] = "stopping"
         b["message"] = "stop requested; signalling sessions"
         b["updated_at"] = _now()
         _batches[bid] = b
         _mirror_reg_batch(bid, dict(b))
         sids = list(b.get("session_ids") or [])
+        futures = list(_active_batch_futures.get(bid, set()))
+
+    # Cancel work that has not started before walking sessions. Running futures
+    # receive the batch/session cancellation signal below and get a short grace.
+    for future in futures:
+        try:
+            future.cancel()
+        except Exception:
+            pass
 
     stopped: list[str] = []
     already: list[str] = []
@@ -5649,13 +6350,7 @@ def stop_registration_batch(batch_id: str) -> dict[str, Any]:
     with _lock:
         b = _batches.get(bid) or dict(batch)
         b["cancel_requested"] = True
-        if str(b.get("status") or "").lower() not in (
-            "done",
-            "partial",
-            "error",
-            "cancelled",
-            "stopped",
-        ):
+        if _needs_stop(b):
             b["status"] = "stopping"
         b["message"] = (
             f"stop requested: stopping={len(stopped)} "
@@ -5665,6 +6360,28 @@ def stop_registration_batch(batch_id: str) -> dict[str, Any]:
         _batches[bid] = b
         _mirror_reg_batch(bid, dict(b))
         out = dict(b)
+        has_local_runner = bool(_active_batch_runners.get(bid))
+
+    has_remote_runner = False
+    if not has_local_runner and _reg_redis():
+        try:
+            from grok2api.store.redis_client import get_str
+
+            has_remote_runner = bool(get_str(_batch_runner_lock_key(bid)))
+        except Exception:
+            # An explicit stop still fences the batch, but uncertainty is not
+            # grounds for immediate finalization; give remote workers the grace.
+            has_remote_runner = True
+    if str(out.get("status") or "").lower() == "stopping":
+        reason = "runner did not exit after cooperative stop"
+        if not has_local_runner and not has_remote_runner:
+            finalized = _finalize_cancelled_batch(
+                bid, reason=reason, stop_kind="stop_without_runner"
+            )
+            if finalized is not None:
+                out = dict(finalized)
+        else:
+            _schedule_cancelled_batch_finalizer(bid, reason=reason)
     return {
         "ok": True,
         "batch_id": bid,
@@ -5697,7 +6414,11 @@ def stop_all_active_registrations() -> dict[str, Any]:
         if not bid:
             continue
         st = str(b.get("status") or b.get("batch_status") or "").lower()
-        if st in ("done", "partial", "error", "cancelled", "stopped"):
+        total = max(0, int(b.get("count") or 0))
+        finished = max(0, int(b.get("finished") or 0))
+        if st in ("done", "cancelled", "stopped") or (
+            st in ("partial", "error") and total > 0 and finished >= total
+        ):
             continue
         try:
             stop_registration_batch(bid)

@@ -6,6 +6,7 @@ unset, all helpers no-op / return None so file-mode code paths keep working.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -150,6 +151,42 @@ def set_ex(k: str, value: str, ttl_sec: float | int) -> bool:
     ttl = max(1, int(ttl_sec))
     c.set(k, value, ex=ttl)
     return True
+
+
+def set_json_preserving_cancelled(
+    k: str, value: dict[str, Any], ttl_sec: float | int
+) -> bool:
+    """Atomically prevent stale workers from reviving a cancelled object."""
+    c = get_client()
+    if c is None:
+        return False
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    script = """
+    local current_raw = redis.call('get', KEYS[1])
+    if current_raw then
+        local current_ok, current = pcall(cjson.decode, current_raw)
+        local incoming_ok, incoming = pcall(cjson.decode, ARGV[1])
+        if current_ok and incoming_ok then
+            local current_status = string.lower(tostring(current.status or current.batch_status or ''))
+            local incoming_status = string.lower(tostring(incoming.status or incoming.batch_status or ''))
+            local current_generation = tonumber(current.state_generation or 0) or 0
+            local incoming_generation = tonumber(incoming.state_generation or 0) or 0
+            if incoming_generation < current_generation then
+                redis.call('expire', KEYS[1], ARGV[2])
+                return 0
+            end
+            if (current_status == 'cancelled' or current_status == 'stopped')
+               and incoming_status ~= 'cancelled' and incoming_status ~= 'stopped'
+               and incoming_generation <= current_generation then
+                redis.call('expire', KEYS[1], ARGV[2])
+                return 0
+            end
+        end
+    end
+    redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2])
+    return 1
+    """
+    return bool(c.eval(script, 1, k, payload, str(max(1, int(ttl_sec)))))
 
 
 def delete(*keys: str) -> int:

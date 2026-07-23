@@ -63,7 +63,9 @@ def device_put(session_id: str, sess: dict[str, Any], *, ttl: int = DEVICE_TTL) 
         return
     # Drop non-serializable runtime objects if any
     clean = {k: v for k, v in sess.items() if not str(k).startswith("_")}
-    set_json(_device_key(session_id), clean, ttl)
+    from grok2api.store.redis_client import set_json_preserving_cancelled
+
+    set_json_preserving_cancelled(_device_key(session_id), clean, ttl)
 
 
 def device_get(session_id: str) -> dict[str, Any] | None:
@@ -112,7 +114,9 @@ def reg_sess_put(session_id: str, sess: dict[str, Any], *, ttl: int = REG_TTL) -
             continue
         clean[k] = v
     try:
-        set_json(_reg_sess_key(session_id), clean, ttl)
+        from grok2api.store.redis_client import set_json_preserving_cancelled
+
+        set_json_preserving_cancelled(_reg_sess_key(session_id), clean, ttl)
     except (TypeError, ValueError):
         # Last resort: drop any remaining non-JSON values.
         safe = {}
@@ -124,7 +128,9 @@ def reg_sess_put(session_id: str, sess: dict[str, Any], *, ttl: int = REG_TTL) -
                 safe[k] = v
             except Exception:
                 continue
-        set_json(_reg_sess_key(session_id), safe, ttl)
+        from grok2api.store.redis_client import set_json_preserving_cancelled
+
+        set_json_preserving_cancelled(_reg_sess_key(session_id), safe, ttl)
 
 
 def reg_sess_touch(session_id: str, *, ttl: int = REG_TTL) -> bool:
@@ -200,7 +206,9 @@ def reg_sess_list() -> list[dict[str, Any]]:
 def reg_batch_put(batch_id: str, batch: dict[str, Any], *, ttl: int = REG_TTL) -> None:
     if not redis_enabled():
         return
-    set_json(_reg_batch_key(batch_id), batch, ttl)
+    from grok2api.store.redis_client import set_json_preserving_cancelled
+
+    set_json_preserving_cancelled(_reg_batch_key(batch_id), batch, ttl)
 
 
 def reg_batch_touch(batch_id: str, *, ttl: int = REG_TTL) -> bool:

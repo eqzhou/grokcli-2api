@@ -16,6 +16,7 @@ def record(
     progress_done: int = 0,
     progress_total: int = 0,
     finished: bool = True,
+    allow_terminal_restart: bool = False,
 ) -> int | None:
     try:
         from grok2api.store.task_logs_pg import write_task
@@ -30,6 +31,7 @@ def record(
             progress_done=progress_done,
             progress_total=progress_total,
             finished=finished,
+            allow_terminal_restart=allow_terminal_restart,
         )
     except Exception:
         return None

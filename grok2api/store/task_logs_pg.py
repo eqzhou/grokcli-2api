@@ -28,6 +28,7 @@ def write_task(
     progress_done: int = 0,
     progress_total: int = 0,
     finished: bool = True,
+    allow_terminal_restart: bool = False,
 ) -> int | None:
     """Write one task log row.
 
@@ -71,6 +72,7 @@ def write_task(
                           updated_at = now(),
                           finished_at = CASE
                             WHEN %s THEN COALESCE(finished_at, now())
+                            WHEN %s THEN NULL
                             ELSE finished_at
                           END
                         WHERE id = (
@@ -78,6 +80,11 @@ def write_task(
                           WHERE kind = %s AND task_id = %s
                           ORDER BY id DESC
                           LIMIT 1
+                        )
+                        AND (
+                          %s
+                          OR status NOT IN ('cancelled', 'stopped')
+                          OR %s IN ('cancelled', 'stopped')
                         )
                         RETURNING id
                         """,
@@ -89,14 +96,32 @@ def write_task(
                             done_i,
                             total_i,
                             bool(finished),
+                            bool(allow_terminal_restart),
                             str(kind)[:64],
                             tid,
+                            bool(allow_terminal_restart),
+                            st[:64],
                         ),
                     )
                     row = cur.fetchone()
                     if row:
                         conn.commit()
                         return int(row[0])
+                    # A terminal-sticky row intentionally rejects stale progress.
+                    # Return its id instead of inserting a duplicate task row.
+                    cur.execute(
+                        """
+                        SELECT id FROM task_logs
+                        WHERE kind = %s AND task_id = %s
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (str(kind)[:64], tid),
+                    )
+                    existing = cur.fetchone()
+                    if existing:
+                        conn.commit()
+                        return int(existing[0])
 
                 cur.execute(
                     """

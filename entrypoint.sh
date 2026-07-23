@@ -103,6 +103,32 @@ start_inline_solver() {
   echo "[entrypoint] WARN: turnstile-solver not ready after 90s; registration will wait/block until it is" >&2
 }
 
+registration_sidecar_supervisor() {
+  local child_pid="" rc=0
+  trap '
+    if [[ -n "${child_pid}" ]] && kill -0 "${child_pid}" 2>/dev/null; then
+      kill "${child_pid}" 2>/dev/null || true
+      wait "${child_pid}" 2>/dev/null || true
+    fi
+    exit 0
+  ' TERM INT
+  while true; do
+    (
+      cd /app
+      export PYTHONDONTWRITEBYTECODE=1
+      exec python3 -B scripts/registration_service.py
+    ) &
+    child_pid=$!
+    set +e
+    wait "${child_pid}"
+    rc=$?
+    set -e
+    child_pid=""
+    echo "[entrypoint] registration sidecar exited rc=${rc}; restarting in 1s" >&2
+    sleep 1
+  done
+}
+
 start_registration_sidecar() {
   local reg_host reg_port wait_sec
   reg_host="${GROK2API_REGISTRATION_HOST:-127.0.0.1}"
@@ -119,11 +145,8 @@ start_registration_sidecar() {
   fi
   mkdir -p /app/turnstile-solver/logs
   echo "[entrypoint] starting Python registration/SSO sidecar on ${reg_host}:${reg_port}"
-  (
-    cd /app
-    export PYTHONDONTWRITEBYTECODE=1
-    exec python3 -B scripts/registration_service.py
-  ) > /app/turnstile-solver/logs/registration_sidecar.log 2>&1 &
+  registration_sidecar_supervisor \
+    > /app/turnstile-solver/logs/registration_sidecar.log 2>&1 &
   reg_pid=$!
   echo "${reg_pid}" > /app/turnstile-solver/logs/registration_sidecar.pid
   echo "[entrypoint] registration sidecar pid=${reg_pid} url=${GROK2API_REGISTRATION_SERVICE_URL}"
