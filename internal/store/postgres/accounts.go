@@ -1736,6 +1736,16 @@ const probeableAccountSQL = `
 		  AND (a.expires_at IS NULL OR a.expires_at > now())
 `
 
+// probeEpochOrderSQL accepts JSON numbers and legacy numeric strings without
+// allowing one malformed historical snapshot to abort the entire probe wave.
+const probeEpochOrderSQL = `
+			  COALESCE(CASE
+			    WHEN jsonb_typeof(ap.last_probe->'probed_at') IN ('number', 'string')
+			      AND pg_input_is_valid(ap.last_probe->>'probed_at', 'numeric')
+			      THEN (ap.last_probe->>'probed_at')::numeric
+			    ELSE 0
+			  END, 0) ASC`
+
 // CountProbeableAccounts matches ListAccountAuthsForProbe eligibility (for sweep remaining).
 func (c *Connector) CountProbeableAccounts(ctx context.Context) (int64, error) {
 	var n int64
@@ -1790,7 +1800,7 @@ func (c *Connector) ListAccountAuthsForProbe(ctx context.Context, limit int, exc
 			    WHEN ap.last_probe_status = 'fail' THEN 1
 			    ELSE 2
 			  END ASC,
-			  COALESCE((ap.last_probe->>'probed_at')::bigint, 0) ASC,
+			  `+probeEpochOrderSQL+`,
 			  a.updated_at ASC
 			LIMIT $1`, limit)
 	} else {
@@ -1806,7 +1816,7 @@ func (c *Connector) ListAccountAuthsForProbe(ctx context.Context, limit int, exc
 			    WHEN ap.last_probe_status = 'fail' THEN 1
 			    ELSE 2
 			  END ASC,
-			  COALESCE((ap.last_probe->>'probed_at')::bigint, 0) ASC,
+			  `+probeEpochOrderSQL+`,
 			  a.updated_at ASC
 			LIMIT $1`, limit, ex)
 	}

@@ -179,6 +179,48 @@ func TestPoolWritersIntegration(t *testing.T) {
 	}
 }
 
+func TestProbeCandidatesAcceptFractionalAndMalformedProbeEpochIntegration(t *testing.T) {
+	conn := testConnector(t)
+	ctx := context.Background()
+	suffix := fmt.Sprintf("probe-epoch-%d", time.Now().UnixNano())
+	accountIDs := []string{suffix + "-fractional", suffix + "-malformed"}
+	for _, accountID := range accountIDs {
+		_, err := conn.Pool.Exec(ctx, `
+			INSERT INTO accounts (id, payload)
+			VALUES ($1, '{"key":"test-token"}'::jsonb)`, accountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = conn.Pool.Exec(context.Background(), `DELETE FROM account_pool WHERE account_id = ANY($1::text[])`, accountIDs)
+		_, _ = conn.Pool.Exec(context.Background(), `DELETE FROM accounts WHERE id = ANY($1::text[])`, accountIDs)
+	})
+	_, err := conn.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, last_probe_status, last_probe)
+		VALUES
+			($1, 'ok', jsonb_build_object('probed_at', 1784778438.4101453)),
+			($2, 'ok', jsonb_build_object('probed_at', '1e999999'))`,
+		accountIDs[0], accountIDs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	auths, err := conn.ListAccountAuthsForProbe(ctx, 10)
+	if err != nil {
+		t.Fatalf("list probe candidates: %v", err)
+	}
+	found := map[string]bool{}
+	for _, auth := range auths {
+		found[auth.ID] = true
+	}
+	for _, accountID := range accountIDs {
+		if !found[accountID] {
+			t.Fatalf("probe candidate %q was not returned", accountID)
+		}
+	}
+}
+
 const httpStatusOK = 200
 
 func intPtrValue(value int) *int { return &value }
