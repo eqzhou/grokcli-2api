@@ -246,6 +246,30 @@ func TestManualLiveClearsAdminLockIntegration(t *testing.T) {
 	}
 }
 
+func TestRecoveryMissDelayMatchesLadder(t *testing.T) {
+	// Documents applyRecoveryMiss SQL CASE: schedule uses pre-increment fail count.
+	cases := []struct {
+		outcome RecoveryOutcome
+		fails   int
+		want    time.Duration
+	}{
+		{RecoveryOutcomeInconclusive, 0, 15 * time.Minute},
+		{RecoveryOutcomeInconclusive, 5, 15 * time.Minute},
+		{RecoveryOutcomeFailure, 0, 15 * time.Minute},
+		{RecoveryOutcomeFailure, 1, 30 * time.Minute},
+		{RecoveryOutcomeFailure, 2, time.Hour},
+		{RecoveryOutcomeFailure, 3, 3 * time.Hour},
+		{RecoveryOutcomeFailure, 4, 6 * time.Hour},
+		{RecoveryOutcomeFailure, 5, 12 * time.Hour},
+		{RecoveryOutcomeFailure, 99, 12 * time.Hour},
+	}
+	for _, tc := range cases {
+		if got := recoveryMissDelay(tc.outcome, tc.fails); got != tc.want {
+			t.Fatalf("outcome=%s fails=%d: got %s want %s", tc.outcome, tc.fails, got, tc.want)
+		}
+	}
+}
+
 func copyRecoveryTestMap(in map[string]any) map[string]any {
 	out := make(map[string]any, len(in))
 	for key, value := range in {

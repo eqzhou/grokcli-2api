@@ -145,7 +145,9 @@ func (s *Service) runRecoveryLane(ctx context.Context, model string) recoveryRun
 				continue
 			}
 			if status == "stale_or_protected" {
+				// CAS miss or admin lock: surface both conflict and protected counters.
 				stats.Conflicts++
+				stats.Protected++
 				mu.Unlock()
 				continue
 			}
@@ -190,7 +192,7 @@ func (s *Service) recoverCandidate(ctx context.Context, candidate postgres.Recov
 	probeStatus := strings.ToLower(strings.TrimSpace(stringValueAny(probe["probe_status"])))
 	if probeStatus == "inconclusive" || strings.EqualFold(stringValueAny(probe["outcome"]), string(probeInconclusive)) {
 		outcome = postgres.RecoveryOutcomeInconclusive
-	} else if probeStatus == "ok" && isStrictProbeReply(stringValueAny(probe["output_text"])) && probe["terminal_event"] == "completed" {
+	} else if probeStatus == "ok" && isStrictProbeReply(stringValueAny(probe["output_text"])) && strings.EqualFold(stringValueAny(probe["terminal_event"]), "completed") {
 		quotaObservation := s.Quota.ObserveRecovery(ctx, auth, recoveryHTTPHeaders(probe["rate_limit_headers"]))
 		quotaSnapshot = quotaObservation.Snapshot
 		switch quotaObservation.Outcome {

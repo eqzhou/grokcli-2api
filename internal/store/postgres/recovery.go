@@ -80,9 +80,9 @@ func (c *Connector) ListRecoveryCandidates(ctx context.Context, limit int) ([]Re
 			  AND (ap.recovery_next_probe_at IS NULL OR ap.recovery_next_probe_at <= now())
 			  AND (ap.recovery_lease_until IS NULL OR ap.recovery_lease_until <= now())
 			  AND (
-			       COALESCE(a.payload->>'key', '') <> ''
-			    OR COALESCE(a.payload->>'access_token', '') <> ''
-			    OR COALESCE(a.payload->>'token', '') <> ''
+			       btrim(COALESCE(a.payload->>'key', '')) <> ''
+			    OR btrim(COALESCE(a.payload->>'access_token', '')) <> ''
+			    OR btrim(COALESCE(a.payload->>'token', '')) <> ''
 			  )
 			ORDER BY ap.recovery_next_probe_at NULLS FIRST, ap.updated_at ASC, ap.account_id ASC
 			FOR UPDATE OF ap SKIP LOCKED
@@ -273,13 +273,16 @@ func (c *Connector) applyRecoveryMiss(ctx context.Context, in RecoveryApplyInput
 		    last_quota = CASE WHEN $5::jsonb = '{}'::jsonb THEN ap.last_quota ELSE $5::jsonb END,
 		    last_recovery_probe_at = now(),
 		    last_recovery_outcome = $6,
+		    -- Schedule from the pre-increment fail count so the ladder matches recoveryBackoff:
+		    -- 0→15m, 1→30m, 2→1h, 3→3h, 4→6h, 5+→12h. Inconclusive does not bump.
 		    recovery_fail_count = CASE WHEN $6 = 'fail' THEN ap.recovery_fail_count + 1 ELSE ap.recovery_fail_count END,
 		    recovery_next_probe_at = now() + CASE
 		      WHEN $6 = 'inconclusive' THEN interval '15 minutes'
-		      WHEN ap.recovery_fail_count <= 0 THEN interval '30 minutes'
-		      WHEN ap.recovery_fail_count = 1 THEN interval '1 hour'
-		      WHEN ap.recovery_fail_count = 2 THEN interval '3 hours'
-		      WHEN ap.recovery_fail_count = 3 THEN interval '6 hours'
+		      WHEN ap.recovery_fail_count <= 0 THEN interval '15 minutes'
+		      WHEN ap.recovery_fail_count = 1 THEN interval '30 minutes'
+		      WHEN ap.recovery_fail_count = 2 THEN interval '1 hour'
+		      WHEN ap.recovery_fail_count = 3 THEN interval '3 hours'
+		      WHEN ap.recovery_fail_count = 4 THEN interval '6 hours'
 		      ELSE interval '12 hours' END,
 		    recovery_lease_until = NULL,
 		    updated_at = now()
@@ -366,12 +369,15 @@ func (c *Connector) DisableAccountRecoverable(ctx context.Context, accountID, re
 	if source == "" {
 		source = "model_health"
 	}
+	// Reset the failure ladder on a fresh recoverable disable so the first
+	// recovery miss starts at recoveryBackoff(0)=15m rather than skipping a step.
+	// The 30m delay below is only "wait before first recovery attempt", not a fail.
 	_, err := c.Pool.Exec(ctx, `
 		INSERT INTO account_pool (
 		  account_id, enabled, admin_locked, disabled_reason, pool_status,
 		  recovery_next_probe_at, recovery_fail_count, last_error, extra, updated_at
 		) VALUES (
-		  $1, false, false, $2, 'disabled', now() + interval '30 minutes', 1, $2,
+		  $1, false, false, $2, 'disabled', now() + interval '30 minutes', 0, $2,
 		  jsonb_build_object('disabled_source', $3::text), now()
 		)
 		ON CONFLICT (account_id) DO UPDATE SET
@@ -381,7 +387,7 @@ func (c *Connector) DisableAccountRecoverable(ctx context.Context, accountID, re
 		  pool_status = 'disabled',
 		  recovery_lease_until = NULL,
 		  recovery_next_probe_at = CASE WHEN account_pool.admin_locked THEN account_pool.recovery_next_probe_at ELSE now() + interval '30 minutes' END,
-		  recovery_fail_count = CASE WHEN account_pool.admin_locked THEN account_pool.recovery_fail_count ELSE GREATEST(account_pool.recovery_fail_count, 0) + 1 END,
+		  recovery_fail_count = CASE WHEN account_pool.admin_locked THEN account_pool.recovery_fail_count ELSE 0 END,
 		  last_error = $2,
 		  extra = CASE WHEN account_pool.admin_locked THEN account_pool.extra
 		               ELSE COALESCE(account_pool.extra, '{}'::jsonb) || jsonb_build_object('disabled_source', $3::text) END,
@@ -409,6 +415,9 @@ func isRecoveryQuotaCooldownCode(code string) bool {
 	return false
 }
 
+// recoveryBackoff is the failure ladder applied by applyRecoveryMiss.
+// The SQL CASE uses the pre-increment fail count, so these durations match
+// the next_probe schedule written for a row that currently has failureCount fails.
 func recoveryBackoff(failureCount int) time.Duration {
 	switch {
 	case failureCount <= 0:
@@ -424,6 +433,15 @@ func recoveryBackoff(failureCount int) time.Duration {
 	default:
 		return 12 * time.Hour
 	}
+}
+
+// recoveryMissDelay is the next-probe wait for a miss, given the fail count
+// before the miss is recorded. Inconclusive probes never advance the ladder.
+func recoveryMissDelay(outcome RecoveryOutcome, failCountBefore int) time.Duration {
+	if outcome == RecoveryOutcomeInconclusive {
+		return 15 * time.Minute
+	}
+	return recoveryBackoff(failCountBefore)
 }
 
 func validateRecoveryApplyInput(in RecoveryApplyInput) error {
