@@ -57,3 +57,23 @@ func TestSSOImportJobPath(t *testing.T) {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 }
+
+func TestManualOAuthCredentialsUsesSensitiveSessionPath(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/registration/v1/sessions/reg-1/manual-oauth-credentials" {
+			t.Fatalf("method=%s path=%s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":       true,
+			"email":    "alias@example.com",
+			"password": "secret",
+		})
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL, HTTP: server.Client()}
+	result, err := client.ManualOAuthCredentials(context.Background(), "reg-1")
+	if err != nil || result["password"] != "secret" {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}

@@ -381,6 +381,9 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("POST /admin/api/accounts/register-email/sessions/{session_id}/stop", func(w http.ResponseWriter, r *http.Request) {
 		serveRegistrationStopSession(w, r, options)
 	})
+	mux.HandleFunc("POST /admin/api/accounts/register-email/sessions/{session_id}/manual-oauth-credentials", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationManualOAuthCredentials(w, r, options)
+	})
 	mux.HandleFunc("GET /admin/api/accounts/register-email/batches/{batch_id}", func(w http.ResponseWriter, r *http.Request) {
 		serveRegistrationBatch(w, r, options)
 	})
@@ -5808,6 +5811,25 @@ func serveRegistrationStopSession(w http.ResponseWriter, r *http.Request, option
 		writeRegistrationError(w, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationManualOAuthCredentials(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	payload, err := client.ManualOAuthCredentials(r.Context(), r.PathValue("session_id"))
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	writeJSON(w, http.StatusOK, payload)
 }
 

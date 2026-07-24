@@ -523,6 +523,20 @@
         <div id="reg-progress-fill" class="g2a-reg-bar-fill" style="width:0%"></div>
       </div>
     </div>
+    <div id="reg-manual-oauth" class="device-result hidden" hidden>
+      <div class="g2a-device-code-row">
+        <div class="g2a-kv g2a-device-code-kv"><span>人工授权账号</span><code id="reg-manual-oauth-email" class="g2a-code-inline">—</code></div>
+        <div class="g2a-kv g2a-device-code-kv"><span>登录密码</span><code id="reg-manual-oauth-password" class="g2a-code-inline">按需获取</code></div>
+        <div class="g2a-kv g2a-device-code-kv"><span>设备码</span><code id="reg-manual-oauth-code" class="g2a-code-inline">—</code></div>
+        <div class="g2a-kv g2a-device-url-kv"><span>验证链接</span><a id="reg-manual-oauth-url" href="#" target="_blank" rel="noopener">—</a></div>
+      </div>
+      <div class="g2a-actions">
+        <button type="button" class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-copy-reg-manual-credentials">获取并复制登录凭据</button>
+        <button type="button" class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-copy-reg-manual-code">复制设备码</button>
+        <a class="g2a-btn g2a-btn-primary g2a-btn-sm" id="btn-open-reg-manual-oauth" href="#" target="_blank" rel="noopener">打开授权页面</a>
+      </div>
+      <p class="g2a-muted g2a-reg-log-hint">请登录上方对应邮箱，依次点击“继续”和“允许”。授权账号不匹配时后端会拒绝入池。</p>
+    </div>
     <p class="g2a-muted g2a-reg-log-hint">实时步骤 · 入池后自动测活 · 切页后仍可恢复进行中任务</p>
     <pre id="reg-log" class="g2a-log g2a-reg-log is-empty hidden" hidden>—</pre>
   </div>
@@ -643,6 +657,6 @@
   <script src="/static/dist/api.1bf56e45fe.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4eb51a7835.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.ba52f4df57.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.4e07776048.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

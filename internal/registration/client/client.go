@@ -57,6 +57,10 @@ func (c *Client) StopSession(ctx context.Context, id string) (map[string]any, er
 	return c.do(ctx, http.MethodPost, "/sessions/"+url.PathEscape(id)+"/stop", map[string]any{}, nil)
 }
 
+func (c *Client) ManualOAuthCredentials(ctx context.Context, id string) (map[string]any, error) {
+	return c.do(ctx, http.MethodPost, "/sessions/"+url.PathEscape(id)+"/manual-oauth-credentials", map[string]any{}, nil)
+}
+
 func (c *Client) Batch(ctx context.Context, id string) (map[string]any, error) {
 	return c.do(ctx, http.MethodGet, "/batches/"+url.PathEscape(id), nil, nil)
 }

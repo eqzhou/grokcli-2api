@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from grok2api.secure_files import secure_write_text
 
@@ -165,6 +165,9 @@ try:
 except (TypeError, ValueError):
     _GLOBAL_REG_INFLIGHT_MAX = 4
 _global_reg_inflight = threading.Semaphore(_GLOBAL_REG_INFLIGHT_MAX)
+# Human approval must stay serial: each pending browser consent occupies an
+# xAI device code and requires the administrator to select the matching alias.
+_manual_oauth_lock = threading.Lock()
 # Throttle Redis mirror writes: progress still updates local RAM every step;
 # cross-worker / admin poll only needs ~100–200ms freshness.
 _REG_MIRROR_MIN_INTERVAL_SEC = float(os.environ.get("GROK2API_REG_MIRROR_MIN_SEC", "0.12") or 0.12)
@@ -1024,6 +1027,118 @@ def _snapshot_reg_config(
 
 class _RegCancelled(Exception):
     """Cooperative cancel for in-flight registration workers."""
+
+
+def _manual_oauth_enabled() -> bool:
+    raw = str(os.environ.get("GROK2API_REG_MANUAL_OAUTH", "1") or "1")
+    return raw.strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _wait_for_manual_oauth(
+    *,
+    email: str,
+    check_cancel: Callable[[], None],
+    update: Callable[..., None],
+) -> dict[str, Any]:
+    """Wait for one real-browser device approval, serialized across registrations."""
+    from grok2api.upstream import oidc_auth
+
+    acquired = False
+    queued_announced = False
+    device_session_id = ""
+    completed = False
+    try:
+        while not acquired:
+            check_cancel()
+            acquired = _manual_oauth_lock.acquire(timeout=0.5)
+            if not acquired and not queued_announced:
+                queued_announced = True
+                update(
+                    "queued_manual_oauth",
+                    "等待前一个账号完成人工 OAuth 授权",
+                    manual_oauth_status="queued",
+                )
+
+        check_cancel()
+        started = oidc_auth.start_device_authorization(
+            expected_email=email,
+            source="register-email-manual",
+        )
+        if not started.get("ok"):
+            raise RuntimeError(
+                "manual OAuth start failed: "
+                + str(started.get("error") or "unknown error")
+            )
+        device_session_id = str(started.get("session_id") or "").strip()
+        if not device_session_id:
+            raise RuntimeError("manual OAuth start returned no session id")
+        public_fields = {
+            "manual_oauth_session_id": device_session_id,
+            "manual_oauth_user_code": started.get("user_code"),
+            "manual_oauth_verification_url": started.get("verification_url"),
+            "manual_oauth_expected_email": email,
+        }
+        update(
+            "waiting_manual_oauth",
+            "请在真实浏览器打开授权链接，登录当前邮箱并点击继续、允许",
+            **public_fields,
+            manual_oauth_status=started.get("status") or "waiting_user",
+        )
+
+        last_status = ""
+        while True:
+            check_cancel()
+            state = oidc_auth.get_device_session(device_session_id)
+            if not state:
+                raise RuntimeError("manual OAuth session disappeared")
+            status = str(state.get("status") or "").strip().lower()
+            if status == "success":
+                if not oidc_auth.authorized_email_matches(email, state.get("email")):
+                    raise RuntimeError(
+                        "authorized account does not match registration email"
+                    )
+                if not state.get("account_id"):
+                    raise RuntimeError("manual OAuth succeeded without account id")
+                completed = True
+                update(
+                    "importing",
+                    "人工 OAuth 授权成功，正在绑定注册凭据",
+                    **public_fields,
+                    manual_oauth_status="success",
+                )
+                return state
+            if status in {"error", "expired", "cancelled"}:
+                raise RuntimeError(
+                    "manual OAuth "
+                    + status
+                    + ": "
+                    + str(state.get("error") or state.get("message") or status)
+                )
+            if status != last_status:
+                last_status = status
+                update(
+                    "waiting_manual_oauth",
+                    str(state.get("message") or "等待浏览器授权"),
+                    **public_fields,
+                    manual_oauth_status=status or "waiting_user",
+                )
+            time.sleep(2.0)
+    finally:
+        if device_session_id and not completed:
+            try:
+                oidc_auth.cancel_device_authorization(
+                    device_session_id,
+                    reason="registration stopped or manual OAuth failed",
+                )
+            except Exception:
+                pass
+        if acquired:
+            _manual_oauth_lock.release()
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -5021,22 +5136,51 @@ def _run_registration(
         )
         import scripts.sso_to_auth_json as sso_import
 
-        token = sso_import.sso_to_token(sso)
-        if not token or not token.get("access_token"):
+        sso_backup_path = ""
+        manual_oauth = _manual_oauth_enabled()
+        token = None if manual_oauth else sso_import.sso_to_token(sso)
+        if token and token.get("access_token"):
+            _key, entry = sso_import.token_to_auth_entry(token, email=email)
+        elif manual_oauth:
+            update("queued_manual_oauth", "SSO 已就绪，等待人工 OAuth 授权")
+            # Preserve the recoverable registration credentials before waiting
+            # for a human browser. The native device worker stores tokens only
+            # after the administrator completes Continue -> Allow.
+            sso_backup_path = _persist_registration_sso(
+                sid=sid,
+                email=email,
+                password=str(password or ""),
+                sso=sso,
+                batch_id=str(sess.get("batch_id") or "") or None,
+            )
+            manual = _wait_for_manual_oauth(
+                email=email,
+                check_cancel=_check_cancel,
+                update=update,
+            )
+            manual_account_id = str(manual.get("account_id") or "").strip()
+            from grok2api.pool.auth_store import read_auth_entry as _read_auth_entry
+
+            existing = _read_auth_entry(manual_account_id)
+            if not existing or not isinstance(existing[1], dict):
+                raise RuntimeError(
+                    "manual OAuth account was not readable after token import"
+                )
+            entry = dict(existing[1])
+            if not entry.get("key"):
+                raise RuntimeError("manual OAuth account has no access token")
+            entry["email"] = entry.get("email") or email
+        else:
             _note_reg_pressure("device-flow conversion failed", pause_sec=10)
             raise RuntimeError(
-                "SSO obtained but sso_to_auth_json conversion failed "
-                "(device verify/approve/token poll; often xAI device-flow "
-                "rate_limited/slow_down under concurrent registration). "
-                f"adapter_build={ADAPTER_BUILD}; sso_sha256={sso_fingerprint}"
+                "SSO obtained but automatic sso_to_auth_json conversion failed; "
+                "set GROK2API_REG_MANUAL_OAUTH=1 to require real-browser approval"
             )
-        _key, entry = sso_import.token_to_auth_entry(token, email=email)
         # Keep the raw SSO cookie with the account so export/re-import works
         # after process restart (registration sessions are ephemeral).
         sso_cookie = str(sso or sess.get("sso") or "").strip()
         reg_password = str(password or sess.get("password") or "").strip()
-        sso_backup_path = ""
-        if sso_cookie:
+        if sso_cookie and not sso_backup_path:
             try:
                 sso_backup_path = _persist_registration_sso(
                     sid=sid,
@@ -6247,6 +6391,7 @@ def stop_registration_session(session_id: str) -> dict[str, Any]:
             "message": sess.get("message") or st,
         }
     handles: list[Any] = []
+    manual_oauth_session_id = ""
     mirror_payload: dict[str, Any] | None = None
     with _lock:
         cur = _sessions.get(sid) or dict(sess)
@@ -6280,6 +6425,7 @@ def stop_registration_session(session_id: str) -> dict[str, Any]:
         # Best-effort immediate release of process-local handles so Camoufox /
         # mailbox sockets do not linger until the worker next hits update().
         handles = _detach_reg_handles(cur)
+        manual_oauth_session_id = str(cur.get("manual_oauth_session_id") or "").strip()
         try:
             _append_session_log(cur, "stopping", "stop requested")
         except Exception:
@@ -6288,6 +6434,16 @@ def stop_registration_session(session_id: str) -> dict[str, Any]:
         mirror_payload = dict(cur)
         out = _compact_session(cur)
     _close_reg_handles(handles)
+    if manual_oauth_session_id:
+        try:
+            from grok2api.upstream import oidc_auth
+
+            oidc_auth.cancel_device_authorization(
+                manual_oauth_session_id,
+                reason="registration stopped by administrator",
+            )
+        except Exception:
+            pass
     if mirror_payload is not None:
         _mirror_reg_sess(sid, mirror_payload, force=True)
     return {"ok": True, "id": sid, **out}
@@ -6533,6 +6689,30 @@ def get_registration_session(
     if include_auth_json and isinstance(sess.get("auth_json"), (dict, list)):
         out["auth_json"] = sess.get("auth_json")
     return out
+
+
+def get_registration_manual_oauth_credentials(sid: str) -> dict[str, Any]:
+    """Return login credentials only for an active admin-driven OAuth wait."""
+    session_id = str(sid or "").strip()
+    if not session_id:
+        return {"ok": False, "error": "missing session id"}
+    sess = _load_reg_sess(session_id)
+    if not sess:
+        return {"ok": False, "error": "registration session not found"}
+    if str(sess.get("status") or "").lower() != "waiting_manual_oauth":
+        return {"ok": False, "error": "registration is not waiting for manual OAuth"}
+    if not sess.get("manual_oauth_session_id"):
+        return {"ok": False, "error": "manual OAuth session is not ready"}
+    email = str(sess.get("email") or "").strip()
+    password = str(sess.get("password") or "")
+    if not email or not password:
+        return {"ok": False, "error": "registration login credentials are unavailable"}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "email": email,
+        "password": password,
+    }
 
 
 def _batch_counters_from_batch(batch: dict[str, Any] | None) -> dict[str, int] | None:

@@ -132,6 +132,7 @@ TURNSTILE_THREAD=3 GROK2API_REG_CONCURRENCY=3 docker compose up -d --build
 | `GROK2API_REG_GLOBAL_INFLIGHT` | `6` | 跨批次全局同时注册上限 |
 | `GROK2API_REG_TTL_SEC` | `259200`（72h） | 注册批次/会话 Redis TTL（大批量可调高） |
 | `GROK2API_REG_WATCHDOG_SEC` | `45` | 运行中自愈扫描间隔 |
+| `GROK2API_REG_MANUAL_OAUTH` | `1` | 注册取得 SSO 后等待管理员在真实浏览器完成 Device Flow；设为 `0` 回退旧自动转换 |
 | `GROK2API_SSO_DEVICE_RETRIES` | `6` | device-flow 限流重试次数 |
 | `TURNSTILE_THREAD` | `= REG_CONCURRENCY` | 本地过盾浏览器线程数 |
 | `TURNSTILE_BROWSER_TYPE` | `camoufox` | 过盾浏览器类型 |

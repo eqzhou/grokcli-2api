@@ -763,6 +763,8 @@ def start_device_authorization(
     *,
     client_id: str | None = None,
     scopes: str | None = None,
+    expected_email: str | None = None,
+    source: str = "device-login",
 ) -> dict[str, Any]:
     """Start OIDC device flow; returns session for UI polling."""
     from grok2api.store.sidecar_owner import owner_lease_valid
@@ -799,6 +801,8 @@ def start_device_authorization(
     interval = int(data.get("interval") or 5)
     expires_in = int(data.get("expires_in") or 1800)
     started = time.time()
+    expected_email = str(expected_email or "").strip().lower()
+    source = str(source or "device-login").strip() or "device-login"
     from grok2api.store.sidecar_owner import current_owner_id
 
     sess = {
@@ -820,6 +824,8 @@ def start_device_authorization(
         "output": json.dumps(data, ensure_ascii=False),
         "account_id": None,
         "email": None,
+        "expected_email": expected_email or None,
+        "source": source,
         "sidecar_owner": current_owner_id(),
     }
     with _lock:
@@ -842,6 +848,7 @@ def start_device_authorization(
         "expires_in": expires_in,
         "capture": True,
         "native_oidc": True,
+        "expected_email": expected_email or None,
         "command": f"OIDC device @ {OIDC_DEVICE_URL}",
     }
 
@@ -859,6 +866,40 @@ def _device_update(session_id: str, **fields: Any) -> dict[str, Any] | None:
         snap = dict(sess)
     _device_mirror(session_id, snap)
     return snap
+
+
+def authorized_email_matches(expected_email: str | None, actual_email: str | None) -> bool:
+    """Fail closed when manual OAuth is bound to a registration email."""
+    expected = str(expected_email or "").strip().lower()
+    actual = str(actual_email or "").strip().lower()
+    if not expected:
+        return True
+    return bool(actual and actual == expected)
+
+
+def cancel_device_authorization(
+    session_id: str,
+    *,
+    reason: str = "cancelled by user",
+) -> dict[str, Any]:
+    """Cancel a pending device flow so its poller cannot import later."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return {"ok": False, "error": "missing session id"}
+    current = _device_load(sid)
+    if not current:
+        return {"ok": False, "error": "device session not found"}
+    status = str(current.get("status") or "").lower()
+    if status in {"success", "error", "expired", "cancelled"}:
+        return {**(get_device_session(sid) or {}), "ok": True, "already_terminal": True}
+    _device_update(
+        sid,
+        status="cancelled",
+        error=str(reason or "cancelled by user"),
+        message=str(reason or "cancelled by user"),
+        finished_at=time.time(),
+    )
+    return {**(get_device_session(sid) or {}), "ok": True}
 
 
 def _device_poll_worker(session_id: str) -> None:
@@ -949,8 +990,26 @@ def _device_poll_worker(session_id: str) -> None:
                                         entry["last_name"] = u["family_name"]
                     except Exception:
                         pass
+                with _lock:
+                    bound = dict(_device_sessions.get(session_id) or {})
+                if str(bound.get("status") or "").lower() in {
+                    "cancelled",
+                    "error",
+                    "expired",
+                }:
+                    return
+                expected_email = str(bound.get("expected_email") or "").strip()
+                if not authorized_email_matches(expected_email, entry.get("email")):
+                    _device_update(
+                        session_id,
+                        status="error",
+                        error="authorized account does not match registration email",
+                        message="授权账号与当前注册邮箱不一致，请使用对应账号重新授权",
+                        finished_at=time.time(),
+                    )
+                    return
                 # Mark durable source so admin UI/export can tell device-login rows apart.
-                entry.setdefault("source", "device-login")
+                entry.setdefault("source", str(bound.get("source") or "device-login"))
                 entry.setdefault("auth_mode", entry.get("auth_mode") or "oidc")
                 # Ensure account_pool row + durable payload land via row-level upsert.
                 upsert_entry(account_id, entry)
@@ -1049,6 +1108,7 @@ def get_device_session(session_id: str) -> dict[str, Any] | None:
         "finished_at": sess.get("finished_at"),
         "account_id": sess.get("account_id"),
         "email": sess.get("email"),
+        "expected_email": sess.get("expected_email"),
         "ok": sess.get("status") in ("running", "waiting_user", "success"),
         "native_oidc": True,
     }

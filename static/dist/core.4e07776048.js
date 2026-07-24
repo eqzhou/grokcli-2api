@@ -1204,6 +1204,13 @@ function rebindPageControls() {
   on("btn-login-device", "onclick", async () => startDeviceLogin());
   on("btn-poll-device", "onclick", async () => pollDeviceSession());
   on("btn-copy-device", "onclick", async () => copyDeviceCode());
+  on("btn-copy-reg-manual-code", "onclick", async () => {
+    const code = String(($("reg-manual-oauth-code") && $("reg-manual-oauth-code").textContent) || "").trim();
+    if (!code || code === "—") return toast("暂无人工授权设备码", false);
+    const ok = await copyText(code);
+    toast(ok ? "设备码已复制" : code, ok);
+  });
+  on("btn-copy-reg-manual-credentials", "onclick", async () => copyRegManualOAuthCredentials());
   on("btn-import", "onclick", async () => importJsonFiles());
   on("btn-import-sso", "onclick", async () => importSsoCookies());
   on("btn-export-sso", "onclick", async () => exportRegistrationSso());
@@ -7634,8 +7641,90 @@ function buildRegLogText(sessions, { batch = null, extraLines = [] } = {}) {
   return lines.join("\n");
 }
 
+function manualOAuthUrl(raw) {
+  try {
+    const u = new URL(String(raw || ""));
+    if (u.protocol !== "https:" || u.hostname !== "accounts.x.ai") return "";
+    return u.href;
+  } catch (_) {
+    return "";
+  }
+}
+
+function renderRegManualOAuth(sessions) {
+  const box = $("reg-manual-oauth");
+  if (!box) return;
+  const list = Array.isArray(sessions) ? sessions : [];
+  const current = list.find((s) => {
+    if (!s || !s.manual_oauth_verification_url) return false;
+    const st = String(s.manual_oauth_status || s.status || "").toLowerCase();
+    return !["success", "error", "expired", "cancelled"].includes(st);
+  });
+  if (!current) {
+    box.classList.add("hidden");
+    box.hidden = true;
+    box.dataset.sessionId = "";
+    box.dataset.credentialSession = "";
+    if ($("reg-manual-oauth-password")) $("reg-manual-oauth-password").textContent = "按需获取";
+    return;
+  }
+  const url = manualOAuthUrl(current.manual_oauth_verification_url);
+  const code = String(current.manual_oauth_user_code || "").trim();
+  const email = String(current.manual_oauth_expected_email || current.email || "—");
+  const sessionId = regSessionKey(current);
+  if (box.dataset.sessionId !== sessionId) {
+    box.dataset.sessionId = sessionId;
+    box.dataset.credentialSession = "";
+    if ($("reg-manual-oauth-password")) $("reg-manual-oauth-password").textContent = "按需获取";
+  }
+  if ($("reg-manual-oauth-email")) $("reg-manual-oauth-email").textContent = email;
+  if ($("reg-manual-oauth-code")) $("reg-manual-oauth-code").textContent = code || "—";
+  const link = $("reg-manual-oauth-url");
+  const open = $("btn-open-reg-manual-oauth");
+  for (const el of [link, open]) {
+    if (!el) continue;
+    if (url) {
+      el.href = url;
+      el.removeAttribute("aria-disabled");
+    } else {
+      el.removeAttribute("href");
+      el.setAttribute("aria-disabled", "true");
+    }
+  }
+  if (link) link.textContent = url || "等待生成授权链接…";
+  const copy = $("btn-copy-reg-manual-code");
+  if (copy) copy.disabled = !code;
+  box.classList.remove("hidden");
+  box.hidden = false;
+}
+
+async function copyRegManualOAuthCredentials() {
+  const box = $("reg-manual-oauth");
+  const sessionId = String((box && box.dataset.sessionId) || "").trim();
+  if (!sessionId) {
+    toast("人工授权会话尚未就绪", false);
+    return;
+  }
+  try {
+    const result = await api(
+      "/accounts/register-email/sessions/" + encodeURIComponent(sessionId) + "/manual-oauth-credentials",
+      { method: "POST" }
+    );
+    const email = String((result && result.email) || "").trim();
+    const password = String((result && result.password) || "");
+    if (!email || !password) throw new Error("登录凭据不可用");
+    if ($("reg-manual-oauth-password")) $("reg-manual-oauth-password").textContent = password;
+    if (box) box.dataset.credentialSession = sessionId;
+    const ok = await copyText(email + "\n" + password);
+    toast(ok ? "邮箱和密码已复制" : "登录凭据已显示，请手动复制", ok);
+  } catch (e) {
+    toast((e && e.message) || "获取登录凭据失败", false);
+  }
+}
+
 function showRegSession(s, opts = {}) {
   showPanel("reg-session-box");
+  renderRegManualOAuth(s ? [s] : []);
   const rawSt = String((s && (s.status || s.message)) || "—");
   const stLow = rawSt.toLowerCase();
   // While user requested stop, keep a stable "stopping" label to avoid flicker
@@ -7676,6 +7765,7 @@ function showRegSession(s, opts = {}) {
 
 function showRegSessionGroup(sessions, opts = {}) {
   showPanel("reg-session-box");
+  renderRegManualOAuth(sessions);
   const stats = summarizeRegSessions(sessions);
   const batch = opts.batch || null;
   // Prefer batch-level counters for large jobs (UI may only hold a compact session window).
@@ -9508,6 +9598,16 @@ async function pollDeviceSession() {
 on("btn-login-device", "onclick", () => startDeviceLogin());
 on("btn-poll-device", "onclick", () => pollDeviceSession());
 on("btn-copy-device", "onclick", () => copyDeviceCode());
+on("btn-copy-reg-manual-code", "onclick", async () => {
+  const code = String(($("reg-manual-oauth-code") && $("reg-manual-oauth-code").textContent) || "").trim();
+  if (!code || code === "—") {
+    toast("暂无人工授权设备码", false);
+    return;
+  }
+  const ok = await copyText(code);
+  toast(ok ? "设备码已复制" : code, ok);
+});
+on("btn-copy-reg-manual-credentials", "onclick", async () => copyRegManualOAuthCredentials());
 
 // Module-level fallbacks (first paint). Soft-nav rebinds the same ids in rebindPageControls.
 on("import-file", "onchange", () => {

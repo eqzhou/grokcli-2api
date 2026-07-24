@@ -490,6 +490,19 @@ def get_session(session_id: str, request: Request) -> dict[str, Any]:
     return _jsonable(sess)
 
 
+@app.post(f"{API_PREFIX}/sessions/{{session_id}}/manual-oauth-credentials")
+def get_manual_oauth_credentials(session_id: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    adapter = _adapter()
+    result = adapter.get_registration_manual_oauth_credentials(session_id)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=409,
+            detail=str(result.get("error") or "credentials unavailable"),
+        )
+    return _jsonable(result)
+
+
 @app.post(f"{API_PREFIX}/sessions/{{session_id}}/stop")
 def stop_session(session_id: str, request: Request) -> dict[str, Any]:
     _require_auth(request)
