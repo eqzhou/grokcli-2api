@@ -150,9 +150,9 @@ func Snapshot() map[string]any {
 }
 
 func DefaultOptions() Options {
-	enabled := envBool("GROK2API_HISTORY_COMPACT", false)
-	keep := envInt("GROK2API_HISTORY_KEEP_TOOL_ROUNDS", 32, 1, 64)
-	maxTR := envInt("GROK2API_HISTORY_MAX_TOOL_RESULT_CHARS", 48000, 512, 2_000_000)
+	enabled := envBool("GROK2API_HISTORY_COMPACT", true)
+	keep := envInt("GROK2API_HISTORY_KEEP_TOOL_ROUNDS", 8, 1, 64)
+	maxTR := envInt("GROK2API_HISTORY_MAX_TOOL_RESULT_CHARS", 16000, 512, 2_000_000)
 	runtimeMu.RLock()
 	if runtime.enabledSet {
 		enabled = runtime.enabled
@@ -172,7 +172,7 @@ func DefaultOptions() Options {
 		MaxToolResultChars: maxTR,
 		MidToolResultChars: envInt("GROK2API_HISTORY_MID_TOOL_RESULT_CHARS", 16000, 512, 2_000_000),
 		OldToolResultChars: envInt("GROK2API_HISTORY_OLD_TOOL_RESULT_CHARS", 8000, 256, 2_000_000),
-		MaxMessagesChars:   envInt("GROK2API_HISTORY_MAX_MESSAGES_CHARS", 1_200_000, 8_000, 5_000_000),
+		MaxMessagesChars:   envInt("GROK2API_HISTORY_MAX_MESSAGES_CHARS", 600_000, 8_000, 5_000_000),
 	}
 }
 
@@ -265,8 +265,8 @@ func Apply(body map[string]any, userAgent ...string) map[string]any {
 			opts.OldToolResultChars = 4000
 		}
 		// Cap absolute message budget for Codex to leave room for tools/system.
-		if opts.MaxMessagesChars > 900_000 {
-			opts.MaxMessagesChars = 900_000
+		if opts.MaxMessagesChars > 600_000 {
+			opts.MaxMessagesChars = 600_000
 		}
 	}
 	compacted, stats := CompactMessages(messages, opts)
@@ -402,12 +402,13 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 					}
 					newText := truncateText(text, tier.cap, "tool_result/"+tier.reason)
 					if newText != text {
+						beforeMsg := messageCharSize(msg)
 						if applyTextCompactIfSafe(msg, newText) {
 							stats["truncated_tool_msgs"] = asInt(stats["truncated_tool_msgs"]) + 1
+							after += messageCharSize(msg) - beforeMsg
 						}
 					}
 				}
-				after = messagesCharSize(out)
 			}
 		}
 	}
@@ -432,9 +433,10 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 				}
 				newText := placeholder(text, "size budget")
 				if newText != text {
+					beforeMsg := messageCharSize(msg)
 					if applyTextCompactIfSafe(msg, newText) {
 						stats["compacted_tool_msgs"] = asInt(stats["compacted_tool_msgs"]) + 1
-						after = messagesCharSize(out)
+						after += messageCharSize(msg) - beforeMsg
 					}
 				}
 			}
@@ -460,12 +462,13 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 				}
 				newText := truncateText(text, hard, "tool_result")
 				if newText != text {
+					beforeMsg := messageCharSize(msg)
 					if applyTextCompactIfSafe(msg, newText) {
 						stats["truncated_tool_msgs"] = asInt(stats["truncated_tool_msgs"]) + 1
+						after += messageCharSize(msg) - beforeMsg
 					}
 				}
 			}
-			after = messagesCharSize(out)
 		}
 	}
 
@@ -500,8 +503,9 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 			}
 			newText := truncateText(text, limit, role)
 			if newText != text {
+				beforeMsg := messageCharSize(msg)
 				if applyTextCompactIfSafe(msg, newText) {
-					after = messagesCharSize(out)
+					after += messageCharSize(msg) - beforeMsg
 				}
 			}
 		}
@@ -754,6 +758,14 @@ func messagesCharSize(messages []any) int {
 			total += len(stringValue(item))
 		}
 		return total
+	}
+	return len(encoded)
+}
+
+func messageCharSize(message any) int {
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		return len(stringValue(message))
 	}
 	return len(encoded)
 }

@@ -226,6 +226,37 @@ func TestClassifyEmptyModelOutputShortCool(t *testing.T) {
 	}
 }
 
+func TestClassifyEmptyModelOutputDefaultBlockUsesSafeWindow(t *testing.T) {
+	ConfigureEmptyOutputBlockSec(0)
+	t.Cleanup(func() { ConfigureEmptyOutputBlockSec(0) })
+	t.Setenv("GROK2API_EMPTY_OUTPUT_BLOCK_SEC", "")
+	before := time.Now()
+	d := ClassifyUpstreamFailure(
+		http.StatusBadGateway,
+		"Upstream returned HTTP 200 with empty model output (no content/tool_calls)",
+		"grok-4.5",
+	)
+
+	if !d.BlockModel || d.ShouldCooldown || d.Until == nil {
+		t.Fatalf("empty output must model-block without account cooldown: %+v", d)
+	}
+	// Four minutes is too short during an empty-output storm: the same broken
+	// account/model pair returns to rotation before the incident has settled.
+	if d.Until.Before(before.Add(10 * time.Minute)) {
+		t.Fatalf("default empty-output model block is unsafe: got %v, want at least 10m", d.Until.Sub(before))
+	}
+}
+
+func TestClassifyEmptyModelOutputUsesRuntimePolicy(t *testing.T) {
+	ConfigureEmptyOutputBlockSec(1200)
+	t.Cleanup(func() { ConfigureEmptyOutputBlockSec(0) })
+	before := time.Now()
+	d := ClassifyUpstreamFailure(502, "empty model output", "grok-4.5")
+	if d.Until == nil || d.Until.Before(before.Add(1199*time.Second)) {
+		t.Fatalf("runtime empty-output policy not applied: %+v", d)
+	}
+}
+
 func TestClassifyForbiddenEdgeBlock(t *testing.T) {
 	d := ClassifyUpstreamFailure(403, "error code: 1020\nAccess denied\ncloudflare", "grok-4.5")
 	if !d.ShouldCooldown {

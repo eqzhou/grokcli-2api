@@ -2,9 +2,36 @@ package historycompact
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestCompactMessagesHighRoundCountBounded(t *testing.T) {
+	messages := make([]any, 0, 1201)
+	messages = append(messages, map[string]any{"role": "system", "content": "system"})
+	for i := 0; i < 600; i++ {
+		id := "call-" + strconv.Itoa(i)
+		messages = append(messages,
+			map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": id, "type": "function", "function": map[string]any{"name": "Read", "arguments": "{}"}}}},
+			map[string]any{"role": "tool", "tool_call_id": id, "content": strings.Repeat("x", 4096)},
+		)
+	}
+	started := time.Now()
+	_, stats := CompactMessages(messages, Options{
+		Enabled: true, PrefixStable: true,
+		KeepToolRounds: 8, MidToolRounds: 24,
+		MaxToolResultChars: 16_000, MidToolResultChars: 8_000, OldToolResultChars: 4_000,
+		MaxMessagesChars: 250_000,
+	})
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("high-round compaction took %v; expected bounded passes", elapsed)
+	}
+	if after := asInt(stats["after_chars"]); after > 250_000 {
+		t.Fatalf("compaction did not meet budget: stats=%#v", stats)
+	}
+}
 
 func TestCompactMessagesSoftTierPreservesRecentToolResults(t *testing.T) {
 	messages := []any{
@@ -39,7 +66,7 @@ func TestCompactMessagesSoftTierPreservesRecentToolResults(t *testing.T) {
 	}
 }
 
-func TestApplyDisabledByDefault(t *testing.T) {
+func TestApplyEnabledByDefaultWithoutMutatingSmallHistory(t *testing.T) {
 	Reset()
 	t.Cleanup(Reset)
 	_ = os.Unsetenv("GROK2API_HISTORY_COMPACT")
@@ -51,12 +78,12 @@ func TestApplyDisabledByDefault(t *testing.T) {
 		},
 	}
 	stats := Apply(body)
-	if truthy(stats["enabled"]) || truthy(stats["applied"]) {
-		t.Fatalf("default should be off: %#v", stats)
+	if !truthy(stats["enabled"]) || truthy(stats["applied"]) {
+		t.Fatalf("default should be enabled but leave small history unchanged: %#v", stats)
 	}
 	content := body["messages"].([]any)[1].(map[string]any)["content"]
 	if len(stringValue(content)) != 5000 {
-		t.Fatalf("content mutated while disabled")
+		t.Fatalf("small tool content mutated unexpectedly")
 	}
 }
 

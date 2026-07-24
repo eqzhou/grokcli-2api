@@ -141,13 +141,16 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 	if request.Stream {
 		return ChatResult{}, fmt.Errorf("Go chat streaming requires ChatService.Stream")
 	}
-	model, chain, client, err := s.prepareChain(ctx, request, candidates, mode)
-	if err != nil {
-		return ChatResult{}, err
-	}
-	accounts := upstreamAccounts(chain)
 	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	ensureUpstreamCacheKey(body, request)
+	if err := CheckPreparedContext(body, request.Model); err != nil {
+		return ChatResult{Prep: prep}, err
+	}
+	model, chain, client, err := s.prepareChain(ctx, request, candidates, mode)
+	if err != nil {
+		return ChatResult{Prep: prep}, err
+	}
+	accounts := upstreamAccounts(chain)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
 	// Avoid a second Redis GET on the TTFT hot path.
@@ -171,6 +174,10 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		s.markAttempt(ctx, account.ID)
 		attempt, err := OpenWithFailover(ctx, client, []grok.Account{account}, model, body, &CommitState{})
 		if err != nil {
+			if IsContextLimitFailure(err) {
+				s.releaseChain(ctx, chain)
+				return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep}, err
+			}
 			// Intermediate + final losers: report so free-usage / 额度用完 bodies
 			// enter the cooldown pool even when a later account succeeds.
 			s.reportAccountFailure(account.ID, model, err)
@@ -244,13 +251,16 @@ func (s *ChatService) OpenStream(ctx context.Context, request ChatRequest, candi
 }
 
 func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequest, candidates []pool.Candidate, mode string) (StreamOpen, error) {
-	model, chain, client, err := s.prepareChain(ctx, request, candidates, mode)
-	if err != nil {
-		return StreamOpen{}, err
-	}
-	accounts := upstreamAccounts(chain)
 	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	ensureUpstreamCacheKey(body, request)
+	if err := CheckPreparedContext(body, request.Model); err != nil {
+		return StreamOpen{Prep: prep}, err
+	}
+	model, chain, client, err := s.prepareChain(ctx, request, candidates, mode)
+	if err != nil {
+		return StreamOpen{Prep: prep}, err
+	}
+	accounts := upstreamAccounts(chain)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
 	// Avoid a second Redis GET on the TTFT hot path.
@@ -277,7 +287,9 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 		s.markAttempt(ctx, account.ID)
 		attempt, err := OpenWithFailover(ctx, client, []grok.Account{account}, model, body, &CommitState{})
 		if err != nil {
-			s.reportAccountFailure(account.ID, model, err)
+			if !IsContextLimitFailure(err) {
+				s.reportAccountFailure(account.ID, model, err)
+			}
 			s.releasePick(ctx, account.ID)
 			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: account.ID}, false, err
 		}
@@ -349,6 +361,10 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 			stickyMissID = account.ID
 		}
 		if err != nil {
+			if IsContextLimitFailure(err) {
+				s.releaseChain(ctx, chain)
+				return meta, err
+			}
 			// Prefer the concrete failing account id so open-failure paths still
 			// feed reportChatPool / cooldown classification.
 			if strings.TrimSpace(opened.AccountID) != "" {
@@ -457,7 +473,9 @@ func (s *ChatService) parallelFirstByteOpen(
 			attempt, err := OpenWithFailover(ctx, client, []grok.Account{account}, model, body, &CommitState{})
 			if err != nil {
 				// Parallel loser / exhausted account — still classify free-usage text.
-				s.reportAccountFailure(account.ID, model, err)
+				if !IsContextLimitFailure(err) {
+					s.reportAccountFailure(account.ID, model, err)
+				}
 				s.releasePick(ctx, account.ID)
 				select {
 				case ch <- raced{err: err, idx: i}:
@@ -548,6 +566,12 @@ func (s *ChatService) parallelFirstByteOpen(
 		case r := <-ch:
 			remaining--
 			if r.err != nil {
+				if IsContextLimitFailure(r.err) {
+					cancel()
+					wg.Wait()
+					s.releaseChain(context.Background(), chain)
+					return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep}, r.err
+				}
 				lastErr = r.err
 				continue
 			}

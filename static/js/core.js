@@ -10147,7 +10147,7 @@ function fillSystemSettingsForm(s) {
   // Pool / kick policy — fill with effective values (server defaults when DB
   // has none). Cooldown itself is a sticky status (no duration knobs).
   const polDefaults = {
-    soft_model_block_ttl_sec: 180,
+    soft_model_block_ttl_sec: 900,
     durable_model_block_ttl_sec: 3600,
     probe_fail_kick_streak: 2,
     probe_fail_disable_streak: 4,
@@ -10526,14 +10526,14 @@ function settingsGroupDefaults(group) {
         outbound_max_tools_openai: 0,
         outbound_tool_gap_sec: 0.08,
         sse_keepalive: 8,
-        history_compact_enabled: false,
-        history_compact_auto_chars: 0,
-        history_keep_tool_rounds: 32,
-        history_max_tool_result_chars: 48000,
+        history_compact_enabled: true,
+        history_compact_auto_chars: 600000,
+        history_keep_tool_rounds: 8,
+        history_max_tool_result_chars: 16000,
       };
     case "cooldown":
       return {
-        soft_model_block_ttl_sec: 180,
+        soft_model_block_ttl_sec: 900,
         durable_model_block_ttl_sec: 3600,
         probe_fail_kick_streak: 2,
         probe_fail_disable_streak: 4,

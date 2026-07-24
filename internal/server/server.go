@@ -122,6 +122,9 @@ func applyHistoryCompactSettings(settings map[string]any) {
 	if opts.Enabled != nil || opts.AutoChars != nil || opts.KeepToolRounds != nil || opts.MaxToolResultChars != nil {
 		historycompact.ConfigureFull(opts)
 	}
+	if n, ok := asSettingsIntLocal(settings["soft_model_block_ttl_sec"]); ok {
+		pool.ConfigureEmptyOutputBlockSec(n)
+	}
 }
 
 func asSettingsIntLocal(value any) (int, bool) {
@@ -703,13 +706,13 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 			if err != nil {
 				lastAccount = strings.TrimSpace(opened.AccountID)
 				if lastAccount == "" {
-					recordChatUsage(r, options, apiKey, opened.AccountID, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
+					recordChatUsage(r, options, apiKey, opened.AccountID, chatReq.Model, chatReq.Stream, false, usageFailureStatus(err), started, nil, err, 0, chatReq.Raw)
 					writeProxyError(w, err)
 					return
 				}
 				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, lastModel)
 				if attempt+1 >= maxOpenAttempts || !isRetryableUpstreamOpenErr(err) {
-					recordChatUsage(r, options, apiKey, lastAccount, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
+					recordChatUsage(r, options, apiKey, lastAccount, chatReq.Model, chatReq.Stream, false, usageFailureStatus(err), started, nil, err, 0, chatReq.Raw)
 					writeProxyError(w, err)
 					return
 				}
@@ -758,7 +761,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		if err == nil {
 			err = errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
 		}
-		recordChatUsage(r, options, apiKey, lastAccount, chatReq.Model, true, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
+		recordChatUsage(r, options, apiKey, lastAccount, chatReq.Model, true, false, usageFailureStatus(err), started, nil, err, 0, chatReq.Raw)
 		writeProxyError(w, err)
 		return
 	}
@@ -768,7 +771,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 	}
 	if err != nil {
 		// Failures already reported per-account via FailureReporter.
-		recordChatUsage(r, options, apiKey, result.AccountID, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
+		recordChatUsage(r, options, apiKey, result.AccountID, chatReq.Model, chatReq.Stream, false, usageFailureStatus(err), started, nil, err, 0, chatReq.Raw)
 		writeProxyError(w, err)
 		return
 	}
@@ -1525,6 +1528,16 @@ func writeProxyError(w http.ResponseWriter, err error) {
 // writeOpenAIProxyError maps upstream/proxy failures onto OpenAI error JSON
 // with useful status codes and unwrapped human/quota messages.
 func writeOpenAIProxyError(w http.ResponseWriter, err error) {
+	if isContextLimitFailure(err) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+			"error": map[string]any{
+				"message": contextLimitMessage(err),
+				"type":    "invalid_request_error",
+				"code":    "context_length_exceeded",
+			},
+		})
+		return
+	}
 	status := http.StatusBadGateway
 	message, errorType := openAIErrorFromCause(err)
 	if errors.Is(err, pool.ErrNoEligibleAccounts) {
@@ -1766,14 +1779,14 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 				lastAccount = strings.TrimSpace(opened.AccountID)
 				if lastAccount == "" {
 					// Open failed with no account — nothing to rotate.
-					recordAnthropicUsage(r, options, apiKey, opened.AccountID, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+					recordAnthropicUsage(r, options, apiKey, opened.AccountID, model, true, false, usageFailureStatus(err), started, nil, err, 0, raw)
 					writeAnthropicProxyError(w, err)
 					return
 				}
 				// Open-time empty/5xx: report + try another window if attempts remain.
 				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, lastModel)
 				if attempt+1 >= maxOpenAttempts || !isRetryableUpstreamOpenErr(err) {
-					recordAnthropicUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+					recordAnthropicUsage(r, options, apiKey, lastAccount, model, true, false, usageFailureStatus(err), started, nil, err, 0, raw)
 					writeAnthropicProxyError(w, err)
 					return
 				}
@@ -1830,7 +1843,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		if err == nil {
 			err = errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
 		}
-		recordAnthropicUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+		recordAnthropicUsage(r, options, apiKey, lastAccount, model, true, false, usageFailureStatus(err), started, nil, err, 0, raw)
 		writeAnthropicProxyError(w, err)
 		return
 	}
@@ -1840,7 +1853,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	if err != nil {
 		// Per-account free-usage / 额度用完 already kicked via FailureReporter.
-		recordAnthropicUsage(r, options, apiKey, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0, raw)
+		recordAnthropicUsage(r, options, apiKey, result.AccountID, model, false, false, usageFailureStatus(err), started, nil, err, 0, raw)
 		writeAnthropicProxyError(w, err)
 		return
 	}
@@ -2290,13 +2303,13 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 			if err != nil {
 				lastAccount = strings.TrimSpace(opened.AccountID)
 				if lastAccount == "" {
-					recordResponsesUsage(r, options, apiKey, opened.AccountID, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+					recordResponsesUsage(r, options, apiKey, opened.AccountID, model, true, false, usageFailureStatus(err), started, nil, err, 0, raw)
 					writeOpenAIProxyError(w, err)
 					return
 				}
 				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, lastModel)
 				if attempt+1 >= maxOpenAttempts || !isRetryableUpstreamOpenErr(err) {
-					recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+					recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, usageFailureStatus(err), started, nil, err, 0, raw)
 					writeOpenAIProxyError(w, err)
 					return
 				}
@@ -2305,13 +2318,13 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 			break
 		}
 		if err != nil {
-			recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+			recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, usageFailureStatus(err), started, nil, err, 0, raw)
 			writeOpenAIProxyError(w, err)
 			return
 		}
 		if opened.Body == nil {
 			err = errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
-			recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+			recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, usageFailureStatus(err), started, nil, err, 0, raw)
 			writeOpenAIProxyError(w, err)
 			return
 		}
@@ -2390,7 +2403,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	if err != nil {
 		// Per-account free-usage / 额度用完 already kicked via FailureReporter.
-		recordResponsesUsage(r, options, apiKey, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0, raw)
+		recordResponsesUsage(r, options, apiKey, result.AccountID, model, false, false, usageFailureStatus(err), started, nil, err, 0, raw)
 		writeOpenAIProxyError(w, err)
 		return
 	}
@@ -3933,6 +3946,15 @@ func stringValue(value any) string {
 // writeAnthropicProxyError maps upstream/proxy failures onto Anthropic JSON errors
 // with useful status codes (429/401/503) instead of always 502 + raw Error() text.
 func writeAnthropicProxyError(w http.ResponseWriter, err error) {
+	if isContextLimitFailure(err) {
+		writeAnthropicError(
+			w,
+			http.StatusRequestEntityTooLarge,
+			contextLimitMessage(err),
+			"request_too_large",
+		)
+		return
+	}
 	status := http.StatusBadGateway
 	message := "request failed"
 	errorType := "api_error"
@@ -3967,6 +3989,28 @@ func writeAnthropicProxyError(w http.ResponseWriter, err error) {
 		typ = anthropicErrorTypeForStatus(status)
 	}
 	writeAnthropicError(w, status, msg, typ)
+}
+
+func isContextLimitFailure(err error) bool {
+	return proxy.IsContextLimitFailure(err)
+}
+
+func contextLimitMessage(err error) string {
+	if err == nil {
+		return "context length exceeded"
+	}
+	var upstream *grok.UpstreamError
+	if errors.As(err, &upstream) && upstream != nil && strings.TrimSpace(upstream.Body) != "" {
+		return preferAnthropicErrorBody(upstream.Body)
+	}
+	return strings.TrimSpace(err.Error())
+}
+
+func usageFailureStatus(err error) int {
+	if isContextLimitFailure(err) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadGateway
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, message, errorType string) {

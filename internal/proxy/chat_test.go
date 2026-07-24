@@ -228,6 +228,47 @@ func TestChatServiceCompleteRetriesEligibleChainBeforeCommit(t *testing.T) {
 	}
 }
 
+func TestChatServiceCompleteRetriesHTTP200EmptyOutputOnDifferentAccount(t *testing.T) {
+	attempts := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		attempts = append(attempts, token)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if token == "empty-token" {
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"id\":\"live\",\"model\":\"grok\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	started := time.Now()
+	result, err := (&ChatService{
+		Client: &grok.Client{BaseURL: server.URL + "/v1", HTTP: server.Client()},
+		Now:    func() time.Time { return time.Unix(1000, 0) },
+	}).CompleteWithResult(t.Context(), ChatRequest{
+		Model: "grok",
+		Raw:   map[string]any{"model": "grok", "messages": []any{map[string]any{"role": "user", "content": "hi"}}},
+	}, []pool.Candidate{
+		{ID: "empty-account", Token: "empty-token", Enabled: true, RequestCount: 0},
+		{ID: "live-account", Token: "live-token", Enabled: true, RequestCount: 1},
+	}, "least_used")
+
+	if err != nil {
+		t.Fatalf("empty first account should transparently fail over: %v", err)
+	}
+	if result.AccountID != "live-account" || !result.Failover {
+		t.Fatalf("result=%+v, want successful failover to live-account", result)
+	}
+	if got := strings.Join(attempts, ","); got != "empty-token,live-token" {
+		t.Fatalf("attempts=%q, want immediate retry on a different account", got)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("empty HTTP 200 failover was not immediate: %v", elapsed)
+	}
+}
+
 func TestChatServiceCompleteReleasesChainWhenAllFail(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)

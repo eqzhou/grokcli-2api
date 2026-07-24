@@ -86,7 +86,7 @@ DEFAULT_COOLDOWN = 20
 AUTH_COOLDOWN = 90  # shorter: recover faster after transient 401/refresh races
 RATE_LIMIT_COOLDOWN = 45  # 429 baseline before Retry-After / streak boost
 SERVER_ERROR_COOLDOWN = 20
-SOFT_MODEL_BLOCK_TTL = 180.0  # free-usage soft block default
+SOFT_MODEL_BLOCK_TTL = 900.0  # empty/free-usage model soft block default
 # Durable model unavailability: keep account out of this model until probe recovers.
 DURABLE_MODEL_BLOCK_TTL = 3600.0
 # Keep short for TTFT: long chains mainly help after first failure, but inflate

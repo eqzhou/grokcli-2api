@@ -2967,7 +2967,7 @@ def get_pool_policy() -> dict[str, Any]:
             "cooldown_rate_limit_sec": 45,
             "cooldown_server_error_sec": 20,
             "cooldown_max_sec": 600,
-            "soft_model_block_ttl_sec": 180,
+            "soft_model_block_ttl_sec": 900,
             "durable_model_block_ttl_sec": 3600,
             "probe_fail_kick_streak": 2,
             "probe_fail_disable_streak": 4,

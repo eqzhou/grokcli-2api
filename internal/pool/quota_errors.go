@@ -7,8 +7,24 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+var configuredEmptyOutputBlockSec atomic.Int64
+
+// ConfigureEmptyOutputBlockSec applies the durable admin policy at runtime.
+// Pass 0 to return to env/default behavior (primarily for tests).
+func ConfigureEmptyOutputBlockSec(seconds int) {
+	if seconds == 0 {
+		configuredEmptyOutputBlockSec.Store(0)
+		return
+	}
+	if seconds < 30 || seconds > 3600 {
+		return
+	}
+	configuredEmptyOutputBlockSec.Store(int64(seconds))
+}
 
 // FailureClass categorizes upstream/account errors for cooldown decisions.
 type FailureClass string
@@ -162,12 +178,19 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 	// Status is often rewritten to 502 by the proxy path; body text must win over
 	// bare 5xx classification.
 	if isEmptyModelOutputText(low) || isEmptyModelOutputCode(codeFromJSON) {
-		// Default 4 minutes — long enough for admin chips, short enough that empty-storms do not shrink the pool.
+		// Default 15 minutes so a persistently hollow account/model pair does not
+		// re-enter rotation during the same upstream incident.
 		// Override via GROK2API_EMPTY_OUTPUT_BLOCK_SEC (30–86400).
-		blockSec := 4 * 60
-		if v := strings.TrimSpace(os.Getenv("GROK2API_EMPTY_OUTPUT_BLOCK_SEC")); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 30 && n <= 24*3600 {
-				blockSec = n
+		blockSec := int(configuredEmptyOutputBlockSec.Load())
+		if blockSec <= 0 {
+			blockSec = 15 * 60
+		}
+		if configuredEmptyOutputBlockSec.Load() == 0 {
+			v := strings.TrimSpace(os.Getenv("GROK2API_EMPTY_OUTPUT_BLOCK_SEC"))
+			if v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n >= 30 && n <= 24*3600 {
+					blockSec = n
+				}
 			}
 		}
 		until := time.Now().Add(time.Duration(blockSec) * time.Second)
