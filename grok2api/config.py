@@ -199,8 +199,7 @@ OIDC_TOKEN_URL = os.getenv(
 )
 OIDC_SCOPES = os.getenv(
     "GROK2API_OIDC_SCOPES",
-    "openid profile email offline_access grok-cli:access api:access "
-    "conversations:read conversations:write",
+    "openid profile email offline_access grok-cli:access api:access",
 )
 # Email-assisted account registration.
 XAI_ACCOUNTS_URL = os.getenv("GROK2API_XAI_ACCOUNTS_URL", "https://accounts.x.ai/")

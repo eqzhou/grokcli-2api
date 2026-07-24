@@ -52,8 +52,7 @@ except Exception:  # pragma: no cover - standalone fallback
     OIDC_ISSUER = os.getenv("GROK2API_OIDC_ISSUER", "https://auth.x.ai")
     OIDC_SCOPES = os.getenv(
         "GROK2API_OIDC_SCOPES",
-        "openid profile email offline_access grok-cli:access "
-        "api:access conversations:read conversations:write",
+        "openid profile email offline_access grok-cli:access api:access",
     )
 
 AUTH_KEY = f"{OIDC_ISSUER}::{GROK_CLI_CLIENT_ID}"
